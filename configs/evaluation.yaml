@@ -1,0 +1,54 @@
+# 基线算法评估配置
+
+# 评估参数
+evaluation:
+  num_episodes: 100
+  max_steps_per_episode: 200
+  num_runs: 5
+  scenarios:
+    - earthquake
+    - flood
+    - hurricane
+  severities:
+    - low
+    - medium
+    - high
+
+# 算法配置
+algorithms:
+  egt_marl:
+    enabled: true
+    model_path: null  # 如果提供，加载预训练模型
+  
+  qmix:
+    enabled: true
+    model_path: null
+  
+  maddpg:
+    enabled: false
+    model_path: null
+  
+  mappo:
+    enabled: false
+    model_path: null
+  
+  fcfs:
+    enabled: true  # 先到先服务
+  
+  priority:
+    enabled: true  # 优先级调度
+
+# 环境参数
+environment:
+  map_size: [100, 100]
+  num_agents: 5
+  num_victims: 20
+  num_resources: 10
+  num_hospitals: 3
+
+# 输出设置
+output:
+  directory: evaluation_results
+  save_detailed_results: true
+  generate_comparison_charts: true
+  save_summary_tables: true

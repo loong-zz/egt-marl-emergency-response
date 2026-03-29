@@ -1,0 +1,222 @@
+# Training Configuration
+# Configuration for training the EGT-MARL algorithm
+
+# Experiment setup
+experiment:
+  name: "egt_marl_disaster_v1"
+  description: "Training EGT-MARL for disaster medical resource allocation"
+  seed: 42
+  device: "cuda"  # or "cpu"
+  num_workers: 4  # For data loading
+  
+# Training schedule
+schedule:
+  phases:
+    - name: "warmup"
+      episodes: 1000
+      learning_rate: 0.00005
+      exploration_rate: 1.0
+      difficulty: 0.3
+      
+    - name: "main_training"
+      episodes: 7000
+      learning_rate: 0.0001
+      exploration_rate: 0.1
+      difficulty: 0.7
+      
+    - name: "fine_tuning"
+      episodes: 2000
+      learning_rate: 0.00001
+      exploration_rate: 0.01
+      difficulty: 1.0
+  
+  # Learning rate scheduling
+  lr_schedule:
+    type: "cosine"
+    warmup_episodes: 100
+    min_lr: 1e-6
+    max_lr: 0.0001
+    
+  # Exploration schedule
+  exploration_schedule:
+    type: "exponential"
+    start: 1.0
+    end: 0.01
+    decay: 0.995
+
+# Environment configuration
+environment:
+  scenario: "earthquake_standard"
+  render: false
+  render_frequency: 100  # Render every N episodes
+  save_replays: true
+  replay_frequency: 500  # Save replay every N episodes
+  
+  # Environment variations for robustness
+  variations:
+    enabled: true
+    types:
+      - "resource_scarcity"
+      - "communication_failure"
+      - "agent_failure"
+      - "dynamic_tasks"
+    probability: 0.1  # Probability of variation per episode
+
+# Evaluation configuration
+evaluation:
+  frequency: 100  # Evaluate every N episodes
+  num_evaluation_episodes: 10
+  scenarios:
+    - "earthquake_standard"
+    - "flood_moderate"
+    - "hurricane_severe"
+    
+  # Baseline comparisons
+  baselines:
+    - name: "FCFS"
+      type: "first_come_first_served"
+      
+    - name: "Priority"
+      type: "priority_based"
+      priority_weights:
+        urgency: 0.6
+        distance: 0.3
+        resources: 0.1
+        
+    - name: "QMIX"
+      type: "standard_qmix"
+      
+    - name: "MADDPG"
+      type: "maddpg"
+  
+  # Metrics for evaluation
+  metrics:
+    primary:
+      - "total_survivors"
+      - "gini_coefficient"
+      - "mean_response_time"
+      
+    secondary:
+      - "resource_utilization"
+      - "communication_overhead"
+      - "decision_time"
+      - "robustness_score"
+
+# Model saving and checkpointing
+checkpoint:
+  enabled: true
+  frequency: 500  # Save checkpoint every N episodes
+  keep_last: 10  # Keep last N checkpoints
+  
+  # What to save
+  save:
+    - "model_state"
+    - "optimizer_state"
+    - "training_metrics"
+    - "configuration"
+    - "replay_buffer"  # Optional, large file
+    
+  # Checkpoint directory structure
+  directory: "checkpoints/{experiment_name}/{timestamp}"
+  format: "checkpoint_{episode:06d}.pt"
+
+# Logging and visualization
+logging:
+  # Console logging
+  console:
+    enabled: true
+    level: "INFO"
+    format: "[{asctime}] [{levelname}] {message}"
+    
+  # File logging
+  file:
+    enabled: true
+    level: "DEBUG"
+    directory: "logs/{experiment_name}"
+    max_files: 10
+    max_file_size: "10MB"
+    
+  # TensorBoard logging
+  tensorboard:
+    enabled: true
+    log_dir: "runs/{experiment_name}"
+    update_frequency: 10  # Log every N steps
+    
+  # Weights & Biases logging
+  wandb:
+    enabled: true
+    project: "egt-marl-disaster"
+    entity: "research-team"
+    tags: ["disaster", "marl", "egt", "resource-allocation"]
+    notes: "Training EGT-MARL for dynamic medical resource allocation"
+
+# Hyperparameter search (optional)
+hyperparameter_search:
+  enabled: false
+  method: "random"  # "grid", "random", "bayesian"
+  num_trials: 20
+  
+  # Parameters to search
+  parameters:
+    learning_rate:
+      type: "log_uniform"
+      min: 1e-5
+      max: 1e-3
+      
+    gamma:
+      type: "uniform"
+      min: 0.9
+      max: 0.999
+      
+    batch_size:
+      type: "categorical"
+      values: [16, 32, 64, 128]
+      
+    hidden_dim:
+      type: "categorical"
+      values: [64, 128, 256]
+
+# Distributed training (optional)
+distributed:
+  enabled: false
+  backend: "nccl"  # "gloo" for CPU, "nccl" for GPU
+  world_size: 4  # Number of processes
+  master_addr: "localhost"
+  master_port: "29500"
+
+# Resource monitoring
+monitoring:
+  enabled: true
+  metrics:
+    - "gpu_utilization"
+    - "gpu_memory"
+    - "cpu_utilization"
+    - "memory_usage"
+    - "disk_io"
+    
+  alert_thresholds:
+    gpu_memory: 0.9  # Alert at 90% GPU memory usage
+    cpu_utilization: 0.8  # Alert at 80% CPU usage
+    memory_usage: 0.85  # Alert at 85% RAM usage
+
+# Post-training analysis
+analysis:
+  enabled: true
+  generate_report: true
+  report_format: "html"  # "html", "pdf", "markdown"
+  
+  # Analysis to perform
+  analyses:
+    - "learning_curves"
+    - "policy_visualization"
+    - "attention_maps"
+    - "fairness_analysis"
+    - "robustness_testing"
+    - "ablation_study"
+    
+  # Visualization settings
+  visualization:
+    figsize: [12, 8]
+    dpi: 150
+    style: "seaborn"
+    color_palette: "viridis"

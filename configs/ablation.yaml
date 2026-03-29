@@ -1,0 +1,53 @@
+# 消融研究配置
+
+# 消融研究参数
+ablation:
+  num_episodes: 50
+  max_steps_per_episode: 200
+  num_runs: 3
+  scenario: earthquake
+  severity: medium
+  
+  # 要研究的组件
+  components:
+    egt_layer:
+      enabled: true
+      ablation_values: [0.0, 0.3, 0.5, 0.7, 1.0]  # EGT lambda值
+    
+    anti_spoofing:
+      enabled: true
+      ablation_values: [false, true]  # 启用/禁用抗欺骗
+    
+    dynamic_frontier:
+      enabled: true
+      ablation_values: [false, true]  # 启用/禁用动态前沿
+    
+    attention_heads:
+      enabled: true
+      ablation_values: [1, 2, 4, 8]  # 注意力头数
+    
+    mixing_network:
+      enabled: true
+      ablation_values: ['standard', 'attention', 'hierarchical']  # 混合网络类型
+
+# 环境参数
+environment:
+  map_size: [100, 100]
+  num_agents: 5
+  num_victims: 20
+  num_resources: 10
+  num_hospitals: 3
+
+# 算法基础配置
+algorithm:
+  hidden_dim: 128
+  mixing_hidden_dim: 64
+  learning_rate: 0.001
+  gamma: 0.99
+
+# 输出设置
+output:
+  directory: ablation_results
+  save_variant_results: true
+  generate_component_analysis: true
+  save_visualizations: true
