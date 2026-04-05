@@ -16,7 +16,7 @@ sys.path.insert(0, str(project_root))
 
 from utils.metrics import MetricsCollector
 from utils.fairness import FairnessMetrics
-from utils.visualization import DisasterVisualizer
+from environments.visualization import DisasterVisualizer
 
 
 class TestMetricsCollector(unittest.TestCase):

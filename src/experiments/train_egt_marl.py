@@ -27,7 +27,7 @@ from algorithms.egt_marl import EGTMARL
 from algorithms.qmix_improved import QMIXImproved
 from algorithms.dynamic_frontier import DynamicParetoFrontier
 from utils.metrics import MetricsCollector
-from utils.visualization import DisasterVisualizer
+from environments.visualization import DisasterVisualizer
 import logging
 
 # 配置日志

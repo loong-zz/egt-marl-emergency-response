@@ -25,7 +25,7 @@ sys.path.insert(0, str(project_root))
 from environments.disaster_sim import DisasterSim
 from algorithms.egt_marl import EGTMARL
 from utils.metrics import MetricsCollector
-from utils.visualization import DisasterVisualizer
+from environments.visualization import DisasterVisualizer
 import logging
 
 # 配置日志

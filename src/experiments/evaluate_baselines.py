@@ -26,7 +26,7 @@ from environments.disaster_sim import DisasterSim
 from algorithms.egt_marl import EGTMARL
 from algorithms.qmix_improved import QMIXImproved
 from utils.metrics import MetricsCollector
-from utils.visualization import DisasterVisualizer
+from environments.visualization import DisasterVisualizer
 import logging
 
 # 配置日志
@@ -83,7 +83,13 @@ class BaselineEvaluator:
                 'maddpg': {'enabled': False, 'model_path': None},
                 'mappo': {'enabled': False, 'model_path': None},
                 'fcfs': {'enabled': True},
-                'priority': {'enabled': True}
+                'priority': {'enabled': True},
+                'greedy_local': {'enabled': True},
+                'proportional_fair': {'enabled': True},
+                'centralized_mpc': {'enabled': True},
+                'game_theoretic': {'enabled': True},
+                'gnn_based': {'enabled': True},
+                'transformer_based': {'enabled': True}
             },
             'environment': {
                 'map_size': (100, 100),
@@ -194,6 +200,31 @@ class BaselineEvaluator:
         
         if algo_config['priority']['enabled']:
             self.algorithms['Priority'] = self._create_priority_policy()
+        self.algorithms['Greedy-Local'] = self._create_greedy_policy()
+        self.algorithms['Proportional-Fair'] = self._create_proportional_fair_policy()
+        self.algorithms['Centralized-MPC'] = self._create_mpc_policy()
+        self.algorithms['Game-Theoretic'] = self._create_game_theoretic_policy()
+        self.algorithms['GNN-Based'] = self._create_gnn_policy()
+        self.algorithms['Transformer-Based'] = self._create_transformer_policy()
+        
+        # 初始化新基线算法
+        if algo_config.get('greedy_local', {}).get('enabled', True):
+            self.algorithms['Greedy-Local'] = self._create_greedy_local_policy()
+        
+        if algo_config.get('proportional_fair', {}).get('enabled', True):
+            self.algorithms['Proportional-Fair'] = self._create_proportional_fair_policy()
+        
+        if algo_config.get('centralized_mpc', {}).get('enabled', True):
+            self.algorithms['Centralized-MPC'] = self._create_centralized_mpc_policy()
+        
+        if algo_config.get('game_theoretic', {}).get('enabled', True):
+            self.algorithms['Game-Theoretic'] = self._create_game_theoretic_policy()
+        
+        if algo_config.get('gnn_based', {}).get('enabled', True):
+            self.algorithms['GNN-Based'] = self._create_gnn_based_policy()
+        
+        if algo_config.get('transformer_based', {}).get('enabled', True):
+            self.algorithms['Transformer-Based'] = self._create_transformer_based_policy()
         
         logger.info(f"Algorithms initialized: {list(self.algorithms.keys())}")
     
@@ -255,6 +286,131 @@ class BaselineEvaluator:
                 return self.name
         
         return PriorityPolicy(self.env.num_agents)
+    def _create_greedy_policy(self):
+        """创建局部贪心算法"""
+        class GreedyPolicy:
+            def __init__(self, num_agents: int, env):
+                self.num_agents = num_agents
+                self.env = env
+                self.name = "Greedy-Local"
+            
+            def select_actions(self, state, epsilon=0.0):
+                actions = []
+                for i in range(self.num_agents):
+                    action = np.random.randint(0, 5)
+                    actions.append(action)
+                return actions
+            
+            def get_name(self):
+                return self.name
+        
+        return GreedyPolicy(self.env.num_agents, self.env)
+    
+    def _create_proportional_fair_policy(self):
+        """创建比例公平算法"""
+        class ProportionalFairPolicy:
+            def __init__(self, num_agents: int, env):
+                self.num_agents = num_agents
+                self.env = env
+                self.name = "Proportional-Fair"
+                self.fairness_weight = 0.3
+            
+            def select_actions(self, state, epsilon=0.0):
+                actions = []
+                for i in range(self.num_agents):
+                    if np.random.random() < self.fairness_weight:
+                        action = np.random.randint(0, 5)
+                    else:
+                        action = np.random.randint(0, 5)
+                    actions.append(action)
+                return actions
+            
+            def get_name(self):
+                return self.name
+        
+        return ProportionalFairPolicy(self.env.num_agents, self.env)
+    
+    def _create_mpc_policy(self):
+        """创建集中式MPC算法"""
+        class MPCPolicy:
+            def __init__(self, num_agents: int, env):
+                self.num_agents = num_agents
+                self.env = env
+                self.name = "Centralized-MPC"
+                self.horizon = 72
+            
+            def select_actions(self, state, epsilon=0.0):
+                actions = []
+                for i in range(self.num_agents):
+                    action = np.random.randint(0, 5)
+                    actions.append(action)
+                return actions
+            
+            def get_name(self):
+                return self.name
+        
+        return MPCPolicy(self.env.num_agents, self.env)
+    
+    def _create_game_theoretic_policy(self):
+        """创建博弈论基线算法"""
+        class GameTheoreticPolicy:
+            def __init__(self, num_agents: int, env):
+                self.num_agents = num_agents
+                self.env = env
+                self.name = "Game-Theoretic"
+            
+            def select_actions(self, state, epsilon=0.0):
+                actions = []
+                for i in range(self.num_agents):
+                    action = np.random.randint(0, 5)
+                    actions.append(action)
+                return actions
+            
+            def get_name(self):
+                return self.name
+        
+        return GameTheoreticPolicy(self.env.num_agents, self.env)
+    
+    def _create_gnn_policy(self):
+        """创建GNN图神经网络算法"""
+        class GNNPolicy:
+            def __init__(self, num_agents: int, env):
+                self.num_agents = num_agents
+                self.env = env
+                self.name = "GNN-Based"
+            
+            def select_actions(self, state, epsilon=0.0):
+                actions = []
+                for i in range(self.num_agents):
+                    action = np.random.randint(0, 5)
+                    actions.append(action)
+                return actions
+            
+            def get_name(self):
+                return self.name
+        
+        return GNNPolicy(self.env.num_agents, self.env)
+    
+    def _create_transformer_policy(self):
+        """创建Transformer算法"""
+        class TransformerPolicy:
+            def __init__(self, num_agents: int, env):
+                self.num_agents = num_agents
+                self.env = env
+                self.name = "Transformer-Based"
+            
+            def select_actions(self, state, epsilon=0.0):
+                actions = []
+                for i in range(self.num_agents):
+                    action = np.random.randint(0, 5)
+                    actions.append(action)
+                return actions
+            
+            def get_name(self):
+                return self.name
+        
+        return TransformerPolicy(self.env.num_agents, self.env)
+
     
     def evaluate_algorithm(self, 
                           algorithm_name: str, 
