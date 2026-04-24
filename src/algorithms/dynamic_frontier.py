@@ -889,3 +889,7 @@ if __name__ == "__main__":
     metrics = frontier.get_frontier_metrics()
     print(f"Frontier metrics: Hypervolume={metrics.hypervolume:.3f}, "
           f"Spread={metrics.spread:.3f}, Cardinality={metrics.cardinality}")
+
+
+# Alias for backward compatibility
+DynamicFrontier = DynamicParetoFrontier

@@ -6,12 +6,12 @@ EGT-MARL 测试套件
 
 from .test_environment import TestDisasterSim
 from .test_algorithms import TestEGTMARL
-from .test_metrics import TestMetrics
+from .test_metrics import TestMetricsCollector
 
 __all__ = [
     'TestDisasterSim',
     'TestEGTMARL',
-    'TestMetrics'
+    'TestMetricsCollector'
 ]
 
 __version__ = '1.0.0'

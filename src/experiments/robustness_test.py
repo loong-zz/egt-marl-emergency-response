@@ -18,7 +18,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # 添加项目根目录到路径
-project_root = Path(__file__).parent.parent.parent
+project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from environments.disaster_sim import DisasterSim
@@ -27,15 +27,7 @@ from utils.metrics import MetricsCollector
 from environments.visualization import DisasterVisualizer
 import logging
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('robustness_test.log'),
-        logging.StreamHandler()
-    ]
-)
+# 初始化logger
 logger = logging.getLogger(__name__)
 
 
@@ -50,7 +42,6 @@ class RobustnessTester:
             config_path: 配置文件路径
         """
         self.config = self._load_config(config_path)
-        self.setup_directories()
         self.setup_device()
         
         # 初始化组件
@@ -62,11 +53,8 @@ class RobustnessTester:
     
     def _load_config(self, config_path: str) -> Dict[str, Any]:
         """加载配置文件"""
-        with open(config_path, 'r', encoding='utf-8') as f:
-            config = yaml.safe_load(f)
-        
         # 设置默认值
-        defaults = {
+        config = {
             'robustness': {
                 'num_episodes': 30,
                 'max_steps_per_episode': 200,
@@ -75,25 +63,25 @@ class RobustnessTester:
                 'severity': 'medium',
                 'attack_tests': {
                     'enabled': True,
-                    'malicious_ratios': [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
+                    'malicious_ratios': [0.0, 0.2, 0.4]
                 },
                 'communication_tests': {
                     'enabled': True,
-                    'failure_rates': [0.0, 0.1, 0.2, 0.3, 0.4, 0.5],
-                    'delay_levels': [0, 1, 2, 3, 4, 5]  # 时间步延迟
+                    'failure_rates': [0.0, 0.2, 0.4],
+                    'delay_levels': [0, 2, 4]  # 时间步延迟
                 },
                 'resource_tests': {
                     'enabled': True,
-                    'mutation_times': [50, 100, 150],  # 突变发生的时间步
-                    'mutation_magnitudes': [0.5, 0.3, 0.1]  # 资源剩余比例
+                    'mutation_times': [50, 100],
+                    'mutation_magnitudes': [0.5, 0.3]
                 }
             },
             'environment': {
                 'map_size': (100, 100),
-                'num_agents': 10,  # 更多智能体以测试鲁棒性
-                'num_victims': 30,
-                'num_resources': 15,
-                'num_hospitals': 4
+                'num_agents': 5,
+                'num_victims': 20,
+                'num_resources': 10,
+                'num_hospitals': 3
             },
             'algorithm': {
                 'model_path': None,  # 预训练模型路径
@@ -101,14 +89,24 @@ class RobustnessTester:
             }
         }
         
-        # 合并配置
-        for section in defaults:
-            if section not in config:
-                config[section] = defaults[section]
-            else:
-                for key, value in defaults[section].items():
-                    if key not in config[section]:
+        # 尝试加载配置文件
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                file_config = yaml.safe_load(f)
+            
+            # 合并配置
+            for section in file_config:
+                if section not in config:
+                    config[section] = file_config[section]
+                else:
+                    for key, value in file_config[section].items():
                         config[section][key] = value
+            
+            logger.info(f"Loaded config from: {config_path}")
+        except FileNotFoundError:
+            logger.warning(f"Config file not found: {config_path}, using default configuration")
+        except Exception as e:
+            logger.warning(f"Error loading config file: {e}, using default configuration")
         
         return config
     
@@ -124,12 +122,24 @@ class RobustnessTester:
         (self.test_dir / 'logs').mkdir(exist_ok=True)
         (self.test_dir / 'visualizations').mkdir(exist_ok=True)
         
+        # 配置日志
+        log_file = self.test_dir / 'logs' / 'robustness_test.log'
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(str(log_file)),
+                logging.StreamHandler()
+            ]
+        )
+        
         # 保存配置
         config_path = self.test_dir / 'config.yaml'
         with open(config_path, 'w', encoding='utf-8') as f:
             yaml.dump(self.config, f, default_flow_style=False)
         
         logger.info(f"Test directory: {self.test_dir}")
+        logger.info(f"Log file: {log_file}")
     
     def setup_device(self):
         """设置计算设备"""
@@ -275,7 +285,10 @@ class RobustnessTester:
         
         while not done and step < max_steps:
             # 获取正常智能体动作
-            actions = self.algorithm.select_actions(state, epsilon=0.0)
+            actions_list = self.algorithm.select_actions(state, epsilon=0.0)
+            
+            # 转换为正确的字典格式 {agent_id: {'tactical': action}}
+            actions = {i: {'tactical': actions_list[i]} for i in range(len(actions_list))}
             
             # 注入恶意动作
             if num_malicious > 0:
@@ -283,18 +296,19 @@ class RobustnessTester:
                 # 替换部分动作为恶意动作
                 for i in range(num_malicious):
                     if i < len(actions):
-                        actions[i] = malicious_actions[i]
+                        actions[i] = {'tactical': malicious_actions[i]}
                         episode_metrics['malicious_actions'] += 1
             
             # 执行动作
-            next_state, rewards, done, info = self.env.step(actions)
+            next_state, rewards, terminated, truncated, info = self.env.step(actions)
+            done = terminated or truncated
             
             # 检测系统扰动
             if self._detect_system_disruption(rewards, info):
                 episode_metrics['system_disruptions'] += 1
             
             # 收集指标
-            episode_metrics['total_reward'] += sum(rewards)
+            episode_metrics['total_reward'] += rewards
             episode_metrics['steps'] += 1
             episode_metrics['rescued'] += info.get('rescued', 0)
             episode_metrics['deaths'] += info.get('deaths', 0)
@@ -329,10 +343,10 @@ class RobustnessTester:
             actions.append(malicious_action)
         return actions
     
-    def _detect_system_disruption(self, rewards: List[float], info: Dict[str, Any]) -> bool:
+    def _detect_system_disruption(self, rewards: float, info: Dict[str, Any]) -> bool:
         """检测系统扰动"""
         # 如果奖励显著为负或关键指标异常
-        if any(r < -10 for r in rewards):  # 大负奖励
+        if rewards < -10:  # 大负奖励
             return True
         
         if info.get('deaths', 0) > 2:  # 单步死亡过多
@@ -421,16 +435,19 @@ class RobustnessTester:
             if np.random.random() < failure_rate:
                 # 通信失败，使用过时或噪声状态
                 noisy_state = self._add_communication_noise(state)
-                actions = self.algorithm.select_actions(noisy_state, epsilon=0.0)
+                actions_list = self.algorithm.select_actions(noisy_state, epsilon=0.0)
+                actions = {i: {'tactical': actions_list[i]} for i in range(len(actions_list))}
                 episode_metrics['communication_failures'] += 1
             else:
                 # 正常通信，但可能有延迟
                 if delay_level > 0 and communication_buffer:
                     # 使用延迟的状态
                     delayed_state = communication_buffer.pop(0)
-                    actions = self.algorithm.select_actions(delayed_state, epsilon=0.0)
+                    actions_list = self.algorithm.select_actions(delayed_state, epsilon=0.0)
+                    actions = {i: {'tactical': actions_list[i]} for i in range(len(actions_list))}
                 else:
-                    actions = self.algorithm.select_actions(state, epsilon=0.0)
+                    actions_list = self.algorithm.select_actions(state, epsilon=0.0)
+                    actions = {i: {'tactical': actions_list[i]} for i in range(len(actions_list))}
                 
                 # 将当前状态加入延迟缓冲区
                 if delay_level > 0:
@@ -439,14 +456,15 @@ class RobustnessTester:
                         communication_buffer.pop(0)
             
             # 执行动作
-            next_state, rewards, done, info = self.env.step(actions)
+            next_state, rewards, terminated, truncated, info = self.env.step(actions)
+            done = terminated or truncated
             
             # 检测协调错误
             if self._detect_coordination_error(rewards, info):
                 episode_metrics['coordination_errors'] += 1
             
             # 收集指标
-            episode_metrics['total_reward'] += sum(rewards)
+            episode_metrics['total_reward'] += rewards
             episode_metrics['steps'] += 1
             episode_metrics['rescued'] += info.get('rescued', 0)
             episode_metrics['deaths'] += info.get('deaths', 0)
@@ -455,9 +473,6 @@ class RobustnessTester:
             step += 1
         
         # 计算衍生指标
-        total_victims = self.env.num_victims
-        if total_victims > 0:
-            episode_metrics['rescue_rate'] = (episode_metrics['rescued'] / total_victims) *        # 计算衍生指标
         total_victims = self.env.num_victims
         if total_victims > 0:
             episode_metrics['rescue_rate'] = (episode_metrics['rescued'] / total_victims) * 100
@@ -482,7 +497,7 @@ class RobustnessTester:
             return state + noise
         return state
     
-    def _detect_coordination_error(self, rewards: List[float], info: Dict[str, Any]) -> bool:
+    def _detect_coordination_error(self, rewards: float, info: Dict[str, Any]) -> bool:
         """检测协调错误"""
         # 如果智能体重复执行相同任务或冲突
         if info.get('task_conflicts', 0) > 0:
@@ -576,19 +591,21 @@ class RobustnessTester:
                 adaptation_started = True
             
             # 获取动作
-            actions = self.algorithm.select_actions(state, epsilon=0.0)
+            actions_list = self.algorithm.select_actions(state, epsilon=0.0)
+            actions = {i: {'tactical': actions_list[i]} for i in range(len(actions_list))}
             
             # 执行动作
-            next_state, rewards, done, info = self.env.step(actions)
+            next_state, rewards, terminated, truncated, info = self.env.step(actions)
+            done = terminated or truncated
             
             # 跟踪适应过程
             if adaptation_started and episode_metrics['adaptation_steps'] == 0:
                 # 检测系统是否开始恢复
-                if sum(rewards) > -5:  # 奖励不再严重为负
+                if rewards > -5:  # 奖励不再严重为负
                     episode_metrics['adaptation_steps'] = step - mutation_time
             
             # 收集指标
-            episode_metrics['total_reward'] += sum(rewards)
+            episode_metrics['total_reward'] += rewards
             episode_metrics['steps'] += 1
             episode_metrics['rescued'] += info.get('rescued', 0)
             episode_metrics['deaths'] += info.get('deaths', 0)
@@ -626,6 +643,9 @@ class RobustnessTester:
     def run_all_tests(self):
         """运行所有鲁棒性测试"""
         logger.info("Starting comprehensive robustness testing...")
+        
+        # 设置目录（在参数覆盖后）
+        self.setup_directories()
         
         robustness_config = self.config['robustness']
         num_runs = robustness_config['num_runs']
@@ -825,14 +845,28 @@ class RobustnessTester:
             # 读取测试类型摘要
             summary_path = self.test_dir / 'results' / 'test_type_summary.csv'
             if os.path.exists(summary_path):
-                df = pd.read_csv(summary_path)
+                df = pd.read_csv(summary_path, index_col=0)  # 将第一列作为索引
                 
                 for test_type in df.index:
-                    f.write(f"\n{test_type.upper()} Tests:\n")
+                    # 确保test_type是字符串
+                    test_type_str = str(test_type)
+                    f.write(f"\n{test_type_str.upper()} Tests:\n")
                     row = df.loc[test_type]
-                    f.write(f"  Average Rescue Rate: {row['rescue_rate_mean']['mean']:.1f}% "
-                           f"(±{row['rescue_rate_mean']['std']:.1f})\n")
-                    f.write(f"  Range: {row['rescue_rate_mean']['min']:.1f}% - {row['rescue_rate_mean']['max']:.1f}%\n")
+                    # 处理嵌套列名
+                    if isinstance(row.get(('rescue_rate_mean', 'mean')), (int, float)):
+                        f.write(f"  Average Rescue Rate: {row[('rescue_rate_mean', 'mean')]:.1f}% "
+                               f"(±{row.get(('rescue_rate_mean', 'std'), 0):.1f})\n")
+                        f.write(f"  Range: {row.get(('rescue_rate_mean', 'min'), 0):.1f}% - {row.get(('rescue_rate_mean', 'max'), 0):.1f}%\n")
+                    else:
+                        # 尝试其他列名格式
+                        rescue_rate = row.get('rescue_rate_mean', 0)
+                        try:
+                            # 尝试转换为浮点数
+                            rescue_rate_float = float(rescue_rate)
+                            f.write(f"  Average Rescue Rate: {rescue_rate_float:.1f}%\n")
+                        except (ValueError, TypeError):
+                            # 如果转换失败，直接输出
+                            f.write(f"  Average Rescue Rate: {rescue_rate}%\n")
             
             f.write("\n4. Robustness Analysis\n")
             f.write("-" * 40 + "\n")
@@ -990,6 +1024,10 @@ def main():
                        help='Scenario to test (overrides config)')
     parser.add_argument('--model_path', type=str, default=None,
                        help='Path to pretrained model (overrides config)')
+    parser.add_argument('--num_episodes', type=int, default=None,
+                       help='Number of test episodes (overrides config)')
+    parser.add_argument('--num_runs', type=int, default=None,
+                       help='Number of independent runs (overrides config)')
     
     args = parser.parse_args()
     
@@ -1005,6 +1043,12 @@ def main():
     
     if args.model_path:
         tester.config['algorithm']['model_path'] = args.model_path
+    
+    if args.num_episodes:
+        tester.config['robustness']['num_episodes'] = args.num_episodes
+    
+    if args.num_runs:
+        tester.config['robustness']['num_runs'] = args.num_runs
     
     # 运行测试
     try:

@@ -421,4 +421,57 @@ class HurricaneScenario(DisasterScenario):
                 'fuel': 0.2,
                 'generators': 0.4
             }),
-            weather_conditions=
+            weather_conditions=weather_conditions
+        )
+
+
+class DisasterScenarioFactory:
+    """Disaster scenario factory for creating predefined scenarios."""
+    
+    def __init__(self):
+        """Initialize the scenario factory."""
+        self.predefined_scenarios = {
+            'earthquake_standard': {
+                'disaster_type': 'earthquake',
+                'severity': 'medium',
+                'map_size': (50, 50)
+            },
+            'flood_standard': {
+                'disaster_type': 'flood',
+                'severity': 'medium',
+                'map_size': (50, 50)
+            },
+            'hurricane_standard': {
+                'disaster_type': 'hurricane',
+                'severity': 'medium',
+                'map_size': (50, 50)
+            }
+        }
+    
+    def create_scenario(self, disaster_type: str, severity: str, map_size: Tuple[int, int]):
+        """Create a disaster scenario."""
+        class Scenario:
+            def __init__(self, disaster_type, severity, map_size):
+                self.disaster_type = disaster_type
+                self.severity = severity
+                self.map_size = map_size
+                self.params = {
+                    'epicenter': (map_size[0]//2, map_size[1]//2),
+                    'radius': min(map_size) // 4,
+                    'intensity': self._get_intensity(severity)
+                }
+            
+            def _get_intensity(self, severity):
+                severity_map = {
+                    'low': 0.3,
+                    'medium': 0.6,
+                    'high': 0.8,
+                    'critical': 0.95
+                }
+                return severity_map.get(severity, 0.5)
+        
+        return Scenario(disaster_type, severity, map_size)
+    
+    def get_predefined_scenarios(self):
+        """Get predefined scenarios."""
+        return self.predefined_scenarios

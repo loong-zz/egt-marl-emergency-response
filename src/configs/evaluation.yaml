@@ -1,0 +1,68 @@
+# Evaluation Configuration
+# =======================
+
+# Evaluation settings
+evaluation:
+  num_episodes: 100          # Number of episodes per run
+  max_steps_per_episode: 200  # Maximum steps per episode
+  num_runs: 5                # Number of independent runs
+  scenarios:                  # Scenarios to evaluate
+    - earthquake
+    - flood
+    - hurricane
+  severities:                 # Disaster severities
+    - low
+    - medium
+    - high
+
+# Algorithm settings
+algorithms:
+  egt_marl:
+    enabled: true
+    model_path: null
+  qmix:
+    enabled: true
+    model_path: null
+  maddpg:
+    enabled: false
+    model_path: null
+  mappo:
+    enabled: false
+    model_path: null
+  fcfs:
+    enabled: true
+  priority:
+    enabled: true
+  greedy_local:
+    enabled: true
+  proportional_fair:
+    enabled: true
+  centralized_mpc:
+    enabled: true
+  game_theoretic:
+    enabled: true
+  gnn_based:
+    enabled: true
+  transformer_based:
+    enabled: true
+
+# Environment settings
+environment:
+  map_size: [100, 100]
+  num_agents: 5
+  num_victims: 100
+  num_resources: 50
+  disaster_duration: 100
+  time_step: 1
+
+# Output settings
+output_dir: evaluation_results
+visualization:
+  enabled: true
+  plot_format: png
+  dpi: 300
+
+# Logging settings
+logging:
+  level: info
+  format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'

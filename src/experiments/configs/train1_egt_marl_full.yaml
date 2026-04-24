@@ -1,0 +1,42 @@
+# 训练1：EGT-MARL完整功能验证配置
+
+# 训练参数
+training:
+  num_episodes: 300          # 300个episodes
+  max_steps_per_episode: 800  # 延长每轮步数
+  batch_size: 32
+  buffer_size: 10000          # 增大经验回放缓冲区
+  gamma: 0.99
+  tau: 0.01
+  learning_rate: 0.0005       # 降低学习率
+  epsilon_start: 1.0
+  epsilon_end: 0.01
+  epsilon_decay: 0.99
+  target_update_interval: 50   # 加快目标网络更新
+  checkpoint_interval: 100
+  eval_interval: 50
+  num_eval_episodes: 10
+  save_best_model: true
+  update_frequency: 10
+
+# 环境参数
+environment:
+  map_size: [1500, 1500]      # 增大地图
+  num_agents: 25              # 增加智能体数量
+  num_victims: 250            # 增加受害者数量
+  num_resources: 12            # 增加资源种类
+  num_hospitals: 4             # 增加医院数量
+  disaster_type: earthquake
+  severity: medium
+
+# 算法参数
+algorithm:
+  hidden_dim: 256              # 增大隐藏层维度
+  mixing_hidden_dim: 128       # 增大混合网络维度
+  attention_heads: 4
+  egt_lambda: 0.5
+  pareto_weight_alpha: 0.3
+  pareto_weight_beta: 0.4
+  pareto_weight_gamma: 0.3
+  anti_spoofing_enabled: true  # 启用抗欺骗模块
+  egt_enabled: true            # 启用EGT层

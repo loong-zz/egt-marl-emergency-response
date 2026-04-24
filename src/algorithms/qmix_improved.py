@@ -386,7 +386,7 @@ class AttentionMixingNetwork(nn.Module):
         self.hyper_w1 = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, num_agents * hidden_dim)
+            nn.Linear(hidden_dim, hidden_dim * hidden_dim)
         )
         
         self.hyper_w2 = nn.Sequential(
@@ -439,7 +439,7 @@ class AttentionMixingNetwork(nn.Module):
         
         # Get mixing weights from hypernetworks
         w1 = torch.abs(self.hyper_w1(state_emb))
-        w1 = w1.view(batch_size, self.num_agents, self.hidden_dim)
+        w1 = w1.view(batch_size, self.hidden_dim, self.hidden_dim)
         
         b1 = self.hyper_b1(state_emb).view(batch_size, 1, self.hidden_dim)
         
@@ -449,12 +449,13 @@ class AttentionMixingNetwork(nn.Module):
         b2 = self.hyper_b2(state_emb).view(batch_size, 1, 1)
         
         # First mixing layer
-        hidden = F.elu(torch.bmm(agent_qs_reshaped, w1) + b1)
+        hidden = F.elu(torch.bmm(x, w1) + b1)
         
         # Second mixing layer
         q_total = torch.bmm(hidden, w2) + b2
         
-        return q_total.squeeze(-1)
+        # Sum over agents to get total Q value
+        return q_total.sum(dim=1)
     
     def compute_attention_weights(self,
                                  agent_qs: torch.Tensor,

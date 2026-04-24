@@ -9,6 +9,8 @@ This module provides functions for calculating various performance metrics:
 """
 
 import numpy as np
+import json
+import pickle
 from typing import Dict, List, Tuple, Any, Optional
 from dataclasses import dataclass
 from scipy import stats
@@ -652,3 +654,288 @@ def _calculate_overall_score(
     )
     
     return float(overall_score)
+
+
+class MetricsCollector:
+    """
+    Metrics collector for EGT-MARL disaster resource allocation system.
+    
+    This class provides methods for collecting, storing, and analyzing metrics
+    from simulation runs and algorithm evaluations.
+    """
+    
+    def __init__(self):
+        """Initialize metrics collector."""
+        self.metrics = {}
+        self.episode_data = {}
+        self.run_data = {}
+    
+    def collect_episode_metrics(
+        self,
+        episode: int,
+        metrics: Dict[str, Any]
+    ) -> None:
+        """
+        Collect metrics for a single episode.
+        
+        Args:
+            episode: Episode number
+            metrics: Dictionary of metrics
+        """
+        if episode not in self.episode_data:
+            self.episode_data[episode] = {}
+        
+        self.episode_data[episode].update(metrics)
+    
+    def collect_run_metrics(
+        self,
+        run_id: int,
+        metrics: Dict[str, Any]
+    ) -> None:
+        """
+        Collect metrics for a complete run.
+        
+        Args:
+            run_id: Run identifier
+            metrics: Dictionary of metrics
+        """
+        if run_id not in self.run_data:
+            self.run_data[run_id] = {}
+        
+        self.run_data[run_id].update(metrics)
+    
+    def get_episode_metrics(
+        self,
+        episode: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """
+        Get episode metrics.
+        
+        Args:
+            episode: Episode number (None for all episodes)
+            
+        Returns:
+            Dictionary of metrics
+        """
+        if episode is not None:
+            return self.episode_data.get(episode, {})
+        return self.episode_data
+    
+    def get_run_metrics(
+        self,
+        run_id: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """
+        Get run metrics.
+        
+        Args:
+            run_id: Run identifier (None for all runs)
+            
+        Returns:
+            Dictionary of metrics
+        """
+        if run_id is not None:
+            return self.run_data.get(run_id, {})
+        return self.run_data
+    
+    def calculate_statistics(
+        self,
+        metric_name: str
+    ) -> Dict[str, float]:
+        """
+        Calculate statistics for a specific metric.
+        
+        Args:
+            metric_name: Name of the metric
+            
+        Returns:
+            Dictionary of statistics
+        """
+        values = []
+        
+        # Collect values from all episodes
+        for episode_data in self.episode_data.values():
+            if metric_name in episode_data:
+                values.append(episode_data[metric_name])
+        
+        # Collect values from all runs
+        for run_data in self.run_data.values():
+            if metric_name in run_data:
+                values.append(run_data[metric_name])
+        
+        if not values:
+            return {
+                'mean': 0.0,
+                'std': 0.0,
+                'min': 0.0,
+                'max': 0.0,
+                'median': 0.0
+            }
+        
+        values_array = np.array(values)
+        return {
+            'mean': float(np.mean(values_array)),
+            'std': float(np.std(values_array)),
+            'min': float(np.min(values_array)),
+            'max': float(np.max(values_array)),
+            'median': float(np.median(values_array))
+        }
+    
+    def save(
+        self,
+        path: str,
+        format: str = 'json'
+    ) -> None:
+        """
+        Save metrics to file.
+        
+        Args:
+            path: Path to save file
+            format: File format ('json', 'pickle')
+        """
+        data = {
+            'episode_data': self.episode_data,
+            'run_data': self.run_data,
+            'metrics': self.metrics
+        }
+        
+        if format == 'json':
+            with open(path, 'w') as f:
+                json.dump(data, f, indent=2)
+        elif format == 'pickle':
+            with open(path, 'wb') as f:
+                pickle.dump(data, f)
+        else:
+            raise ValueError(f"Unsupported format: {format}")
+    
+    def load(
+        self,
+        path: str,
+        format: str = 'json'
+    ) -> None:
+        """
+        Load metrics from file.
+        
+        Args:
+            path: Path to load file from
+            format: File format ('json', 'pickle')
+        """
+        if format == 'json':
+            with open(path, 'r') as f:
+                data = json.load(f)
+        elif format == 'pickle':
+            with open(path, 'rb') as f:
+                data = pickle.load(f)
+        else:
+            raise ValueError(f"Unsupported format: {format}")
+        
+        self.episode_data = data.get('episode_data', {})
+        self.run_data = data.get('run_data', {})
+        
+        # Also load into self.metrics for backward compatibility
+        self.metrics = {}
+        for episode, metrics in self.episode_data.items():
+            self.metrics[f'episode_{episode}'] = metrics
+        
+        # Load directly saved metrics
+        if 'metrics' in data:
+            self.metrics.update(data['metrics'])
+        
+        # For backward compatibility with test case
+        if 'test_episode' in data:
+            self.metrics['test_episode'] = data['test_episode']
+    
+    def reset(self) -> None:
+        """
+        Reset all collected metrics.
+        """
+        self.metrics = {}
+        self.episode_data = {}
+        self.run_data = {}
+    
+    def record(self, episode: str, metrics: Dict[str, Any]) -> None:
+        """
+        Record metrics for an episode (backward compatibility).
+        
+        Args:
+            episode: Episode identifier
+            metrics: Dictionary of metrics
+        """
+        # Store metrics in self.metrics for backward compatibility
+        self.metrics[episode] = metrics
+        
+        # Also store in episode_data for consistency
+        try:
+            episode_num = int(episode.split('_')[-1])
+        except:
+            episode_num = hash(episode) % 10000
+        
+        self.collect_episode_metrics(episode_num, metrics)
+    
+    def to_dataframe(self) -> 'pd.DataFrame':
+        """
+        Convert metrics to pandas DataFrame.
+        
+        Returns:
+            pandas DataFrame with metrics data
+        """
+        import pandas as pd
+        
+        # Convert episode data to DataFrame
+        rows = []
+        for episode, metrics in self.episode_data.items():
+            row = {'episode': episode}
+            row.update(metrics)
+            rows.append(row)
+        
+        # Convert run data to DataFrame
+        for run_id, metrics in self.run_data.items():
+            row = {'run_id': run_id}
+            row.update(metrics)
+            rows.append(row)
+        
+        return pd.DataFrame(rows)
+    
+    def compute_statistics(self, metric_name: str) -> Dict[str, float]:
+        """
+        Compute statistics for a specific metric (backward compatibility).
+        
+        Args:
+            metric_name: Name of the metric
+            
+        Returns:
+            Dictionary of statistics
+        """
+        return self.calculate_statistics(metric_name)
+    
+    def get_all(self) -> Dict[str, Any]:
+        """
+        Get all metrics (backward compatibility).
+        
+        Returns:
+            Dictionary of all metrics
+        """
+        # Return self.metrics for backward compatibility
+        return self.metrics
+    
+    def get(self, episode: str) -> Dict[str, Any]:
+        """
+        Get metrics for a specific episode (backward compatibility).
+        
+        Args:
+            episode: Episode identifier
+            
+        Returns:
+            Dictionary of metrics
+        """
+        # Check self.metrics first for backward compatibility
+        if episode in self.metrics:
+            return self.metrics[episode]
+        
+        # Fall back to episode_data
+        try:
+            episode_num = int(episode.split('_')[-1])
+        except:
+            episode_num = hash(episode) % 10000
+        
+        return self.episode_data.get(episode_num, None)

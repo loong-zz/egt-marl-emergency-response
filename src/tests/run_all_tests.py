@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 
 # 添加项目根目录到路径
-project_root = Path(__file__).parent.parent.parent
+project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 def run_comprehensive_test_suite():
@@ -20,31 +20,41 @@ def run_comprehensive_test_suite():
     print("Testing the complete DisasterSim-2026 system with EGT-MARL algorithm")
     print("\n")
     
-    # 导入测试模块
-    from tests.test_environment import run_environment_tests
-    from tests.test_algorithms import run_algorithm_tests
-    from tests.test_metrics import run_metrics_tests
-    
     results = []
     
     # 1. 运行环境测试
     print("\n" + "-"*80)
     print("Phase 1: Environment Tests")
     print("-"*80)
+    from tests.test_environment import run_environment_tests
     env_result = run_environment_tests()
     results.append(("Environment", env_result))
+    
+    # 清理模块，避免状态冲突
+    import importlib
+    import sys
+    if 'tests.test_environment' in sys.modules:
+        del sys.modules['tests.test_environment']
     
     # 2. 运行算法测试
     print("\n" + "-"*80)
     print("Phase 2: Algorithm Tests")
     print("-"*80)
-    algo_result = run_algorithm_tests()
+    # 使用子进程运行算法测试，以完全隔离测试环境
+    import subprocess
+    import sys
+    result = subprocess.run([sys.executable, 'tests/test_algorithms.py'], capture_output=True, text=True)
+    print(result.stdout)
+    if result.stderr:
+        print("Errors:", result.stderr)
+    algo_result = result.returncode == 0
     results.append(("Algorithms", algo_result))
     
     # 3. 运行指标测试
     print("\n" + "-"*80)
     print("Phase 3: Metrics Tests")
     print("-"*80)
+    from tests.test_metrics import run_metrics_tests
     metrics_result = run_metrics_tests()
     results.append(("Metrics", metrics_result))
     
@@ -55,21 +65,21 @@ def run_comprehensive_test_suite():
     
     all_passed = True
     for module_name, passed in results:
-        status = "✓ PASSED" if passed else "✗ FAILED"
+        status = "[OK] PASSED" if passed else "[FAIL] FAILED"
         print(f"{module_name:15} {status}")
         if not passed:
             all_passed = False
     
     print("\n" + "-"*80)
     if all_passed:
-        print("🎉 SUCCESS: All tests passed! The system is ready for deployment.")
+        print("[SUCCESS] All tests passed! The system is ready for deployment.")
         print("\nNext steps:")
         print("1. Run training: python experiments/train_egt_marl.py")
         print("2. Evaluate baselines: python experiments/evaluate_baselines.py")
         print("3. Run ablation study: python experiments/ablation_study.py")
         print("4. Test robustness: python experiments/robustness_test.py")
     else:
-        print("⚠ WARNING: Some tests failed. Please review the failures above.")
+        print("[WARNING] Some tests failed. Please review the failures above.")
         print("\nRecommended actions:")
         print("1. Check the specific test failures")
         print("2. Fix the issues in the corresponding modules")
@@ -123,9 +133,9 @@ def run_quick_test():
     print(f"Errors: {len(result.errors)}")
     
     if result.wasSuccessful():
-        print("✓ Quick test passed! Basic functionality is working.")
+        print("[OK] Quick test passed! Basic functionality is working.")
     else:
-        print("✗ Quick test failed. Critical issues found.")
+        print("[FAIL] Quick test failed. Critical issues found.")
     
     return result.wasSuccessful()
 
@@ -154,7 +164,7 @@ def run_integration_test():
             disaster_type='earthquake',
             severity='medium'
         )
-        print("   ✓ Environment created")
+        print("   [OK] Environment created")
         
         print("2. Creating algorithm...")
         algorithm = EGTMARL(
@@ -163,11 +173,11 @@ def run_integration_test():
             num_agents=env.num_agents,
             hidden_dim=32
         )
-        print("   ✓ Algorithm created")
+        print("   [OK] Algorithm created")
         
         print("3. Creating metrics collector...")
         metrics = MetricsCollector()
-        print("   ✓ Metrics collector created")
+        print("   [OK] Metrics collector created")
         
         print("4. Running integration test episode...")
         state = env.reset()
@@ -196,23 +206,23 @@ def run_integration_test():
             if done:
                 break
         
-        print(f"   ✓ Episode completed: {step+1} steps, total reward: {total_reward:.2f}")
+        print(f"   [OK] Episode completed: {step+1} steps, total reward: {total_reward:.2f}")
         
         print("5. Testing algorithm update...")
         if len(algorithm.replay_buffer) >= algorithm.batch_size:
             loss = algorithm.update()
-            print(f"   ✓ Algorithm updated, loss: {loss:.4f}")
+            print(f"   [OK] Algorithm updated, loss: {loss:.4f}")
         else:
-            print("   ⚠ Not enough experience for update (expected)")
+            print("   [WARNING] Not enough experience for update (expected)")
         
         print("6. Testing metrics export...")
         df = metrics.to_dataframe()
-        print(f"   ✓ Metrics exported to DataFrame: {len(df)} records")
+        print(f"   [OK] Metrics exported to DataFrame: {len(df)} records")
         
         print("\n" + "="*80)
         print("INTEGRATION TEST RESULTS")
         print("="*80)
-        print("🎉 SUCCESS: All components integrated successfully!")
+        print("[SUCCESS] All components integrated successfully!")
         print("\nSystem components tested:")
         print("  - Environment (DisasterSim)")
         print("  - Algorithm (EGT-MARL)")
@@ -224,7 +234,7 @@ def run_integration_test():
         return True
         
     except Exception as e:
-        print(f"\n✗ INTEGRATION TEST FAILED: {e}")
+        print(f"\n[FAIL] INTEGRATION TEST FAILED: {e}")
         import traceback
         traceback.print_exc()
         return False
@@ -265,9 +275,9 @@ if __name__ == "__main__":
         print("ALL TESTS COMPLETE")
         print("="*80)
         if success:
-            print("🎉 ALL TEST MODES PASSED!")
+            print("[SUCCESS] ALL TEST MODES PASSED!")
         else:
-            print("⚠ SOME TESTS FAILED")
+            print("[WARNING] SOME TESTS FAILED")
     
     # 设置退出码
     sys.exit(0 if success else 1)

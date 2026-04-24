@@ -19,26 +19,18 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # 添加项目根目录到路径
-project_root = Path(__file__).parent.parent.parent
+project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from environments.disaster_sim import DisasterSim
 from algorithms.egt_marl import EGTMARL
-from algorithms.qmix_improved import QMIXImproved
+from algorithms.qmix_improved import ImprovedQMIX
 from algorithms.dynamic_frontier import DynamicParetoFrontier
 from utils.metrics import MetricsCollector
 from environments.visualization import DisasterVisualizer
 import logging
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('training.log'),
-        logging.StreamHandler()
-    ]
-)
+# 初始化logger
 logger = logging.getLogger(__name__)
 
 
@@ -53,7 +45,6 @@ class EGTMARLTrainer:
             config_path: 配置文件路径
         """
         self.config = self._load_config(config_path)
-        self.setup_directories()
         self.setup_device()
         
         # 初始化组件
@@ -64,6 +55,26 @@ class EGTMARLTrainer:
         
         logger.info(f"EGT-MARL Trainer initialized with config: {config_path}")
     
+    def setup_directories(self):
+        """设置目录结构"""
+        base_dir = Path(self.config.get('output_dir', 'experiment_results'))
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.experiment_dir = base_dir / f'egt_marl_{timestamp}'
+        
+        # 创建目录
+        self.experiment_dir.mkdir(parents=True, exist_ok=True)
+        (self.experiment_dir / 'models').mkdir(exist_ok=True)
+        (self.experiment_dir / 'checkpoints').mkdir(exist_ok=True)
+        (self.experiment_dir / 'logs').mkdir(exist_ok=True)
+        (self.experiment_dir / 'visualizations').mkdir(exist_ok=True)
+        
+        # 保存配置
+        config_path = self.experiment_dir / 'config.yaml'
+        with open(config_path, 'w', encoding='utf-8') as f:
+            yaml.dump(self.config, f, default_flow_style=False)
+        
+        logger.info(f"Experiment directory: {self.experiment_dir}")
+    
     def _load_config(self, config_path: str) -> Dict[str, Any]:
         """加载配置文件"""
         with open(config_path, 'r', encoding='utf-8') as f:
@@ -72,8 +83,8 @@ class EGTMARLTrainer:
         # 设置默认值
         defaults = {
             'training': {
-                'num_episodes': 1000,
-                'max_steps_per_episode': 200,
+                'num_episodes': 200,
+                'max_steps_per_episode': 600,
                 'batch_size': 32,
                 'buffer_size': 5000,
                 'gamma': 0.99,
@@ -81,17 +92,18 @@ class EGTMARLTrainer:
                 'learning_rate': 0.001,
                 'epsilon_start': 1.0,
                 'epsilon_end': 0.01,
-                'epsilon_decay': 0.995,
+                'epsilon_decay': 0.99,
                 'target_update_interval': 100,
                 'checkpoint_interval': 100,
                 'eval_interval': 50,
                 'num_eval_episodes': 10,
-                'save_best_model': True
+                'save_best_model': True,
+                'update_frequency': 10
             },
             'environment': {
-                'map_size': (100, 100),
-                'num_agents': 5,
-                'num_victims': 20,
+                'map_size': (1000, 1000),
+                'num_agents': 20,
+                'num_victims': 200,
                 'num_resources': 10,
                 'num_hospitals': 3,
                 'disaster_type': 'earthquake',
@@ -133,12 +145,24 @@ class EGTMARLTrainer:
         (self.experiment_dir / 'logs').mkdir(exist_ok=True)
         (self.experiment_dir / 'visualizations').mkdir(exist_ok=True)
         
+        # 配置日志
+        log_file = self.experiment_dir / 'logs' / 'training.log'
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(str(log_file), encoding='utf-8'),
+                logging.StreamHandler()
+            ]
+        )
+        
         # 保存配置
         config_path = self.experiment_dir / 'config.yaml'
         with open(config_path, 'w', encoding='utf-8') as f:
             yaml.dump(self.config, f, default_flow_style=False)
         
         logger.info(f"Experiment directory: {self.experiment_dir}")
+        logger.info(f"Log file: {log_file}")
     
     def setup_device(self):
         """设置计算设备"""
@@ -151,10 +175,10 @@ class EGTMARLTrainer:
     
     def setup_environment(self):
         """设置环境"""
+        # 使用配置文件中的参数
         env_config = self.config['environment']
-        
         self.env = DisasterSim(
-            map_size=tuple(env_config['map_size']),
+            map_size=env_config['map_size'],
             num_agents=env_config['num_agents'],
             num_victims=env_config['num_victims'],
             num_resources=env_config['num_resources'],
@@ -163,44 +187,20 @@ class EGTMARLTrainer:
             severity=env_config['severity']
         )
         
+        # 为了兼容训练脚本，添加必要的属性
+        self.env.num_agents = len(self.env.rescue_agents)
+        self.env.num_victims = len(self.env.casualties)
+        self.env.num_resources = len(self.env.resource_depots)
+        
         logger.info(f"Environment initialized: {self.env}")
     
     def setup_algorithm(self):
         """设置算法"""
-        algo_config = self.config['algorithm']
-        training_config = self.config['training']
+        # 初始化算法，只传递 env 参数
+        self.algorithm = EGTMARL(env=self.env)
         
-        # 获取环境信息
-        state_dim = self.env.get_state_dimension()
-        action_dim = self.env.get_action_dimension()
-        num_agents = self.env.num_agents
-        
-        # 初始化算法
-        self.algorithm = EGTMARL(
-            state_dim=state_dim,
-            action_dim=action_dim,
-            num_agents=num_agents,
-            hidden_dim=algo_config['hidden_dim'],
-            mixing_hidden_dim=algo_config['mixing_hidden_dim'],
-            attention_heads=algo_config['attention_heads'],
-            device=self.device,
-            gamma=training_config['gamma'],
-            tau=training_config['tau'],
-            learning_rate=training_config['learning_rate'],
-            buffer_size=training_config['buffer_size'],
-            batch_size=training_config['batch_size']
-        )
-        
-        # 设置EGT参数
-        self.algorithm.set_egt_parameters(
-            lambda_param=algo_config['egt_lambda'],
-            pareto_weights={
-                'efficiency': algo_config['pareto_weight_alpha'],
-                'fairness': algo_config['pareto_weight_beta'],
-                'robustness': algo_config['pareto_weight_gamma']
-            },
-            anti_spoofing_enabled=algo_config['anti_spoofing_enabled']
-        )
+        # 为了兼容训练脚本，设置必要的属性
+        self.algorithm.device = self.device
         
         logger.info(f"Algorithm initialized: {self.algorithm}")
     
@@ -223,7 +223,9 @@ class EGTMARLTrainer:
             指标字典
         """
         # 重置环境
-        state = self.env.reset()
+        state, info = self.env.reset()
+        logger.info(f"Episode {episode_idx} reset - Num casualties: {info.get('num_casualties', 0)}, Num agents: {info.get('num_rescue_agents', 0)}")
+        
         episode_metrics = {
             'total_reward': 0.0,
             'steps': 0,
@@ -238,29 +240,31 @@ class EGTMARLTrainer:
         max_steps = self.config['training']['max_steps_per_episode']
         
         while not done and step < max_steps:
-            # 获取动作
-            actions = self.algorithm.select_actions(state, epsilon)
+            # 获取动作 - 传递训练参数以启用探索
+            actions = self.algorithm.select_action(state, training=True)
             
             # 执行动作
-            next_state, rewards, done, info = self.env.step(actions)
+            next_state, rewards, terminated, truncated, info = self.env.step(actions)
+            done = terminated or truncated
             
-            # 存储经验
+            # 存储经验并更新算法
             self.algorithm.store_experience(state, actions, rewards, next_state, done)
+            if step % self.config['training']['update_frequency'] == 0:
+                self.algorithm.update()
             
-            # 更新算法
-            if len(self.algorithm.replay_buffer) >= self.config['training']['batch_size']:
-                loss = self.algorithm.update()
-                if loss is not None:
-                    episode_metrics['loss'] = loss
+            # 记录奖励和状态信息
+            if step % 50 == 0:
+                logger.debug(f"Step {step}: Reward={rewards:.4f}, Rescued={info.get('rescued', 0)}, Deaths={info.get('deaths', 0)}")
             
             # 更新状态
             state = next_state
             
             # 收集指标
-            episode_metrics['total_reward'] += sum(rewards)
+            episode_metrics['total_reward'] += rewards
             episode_metrics['steps'] += 1
-            episode_metrics['rescued'] += info.get('rescued', 0)
-            episode_metrics['deaths'] += info.get('deaths', 0)
+            # 不累加rescued和deaths，因为info中已经是累计值
+            # episode_metrics['rescued'] += info.get('rescued', 0)
+            # episode_metrics['deaths'] += info.get('deaths', 0)
             episode_metrics['resources_used'] += info.get('resources_used', 0)
             
             if 'response_time' in info:
@@ -273,6 +277,10 @@ class EGTMARLTrainer:
             episode_metrics['avg_response_time'] = np.mean(episode_metrics['response_times'])
         else:
             episode_metrics['avg_response_time'] = 0.0
+        
+        # 在episode结束时获取最终的rescued和deaths值
+        episode_metrics['rescued'] = info.get('rescued', 0)
+        episode_metrics['deaths'] = info.get('deaths', 0)
         
         # 计算救援成功率
         total_victims = self.env.num_victims
@@ -308,7 +316,7 @@ class EGTMARLTrainer:
         }
         
         for ep in range(num_episodes):
-            state = self.env.reset()
+            state, info = self.env.reset()
             episode_reward = 0.0
             episode_rescued = 0
             episode_resources_used = 0
@@ -319,12 +327,14 @@ class EGTMARLTrainer:
             max_steps = self.config['training']['max_steps_per_episode']
             
             while not done and step < max_steps:
-                # 使用确定性策略（epsilon=0）
-                actions = self.algorithm.select_actions(state, epsilon=0.0)
-                next_state, rewards, done, info = self.env.step(actions)
+                # 使用确定性策略
+                actions = self.algorithm.select_action(state)
+                next_state, rewards, terminated, truncated, info = self.env.step(actions)
+                done = terminated or truncated
                 
-                episode_reward += sum(rewards)
-                episode_rescued += info.get('rescued', 0)
+                episode_reward += rewards
+                # 不累加rescued，因为info中已经是累计值
+                # episode_rescued += info.get('rescued', 0)
                 episode_resources_used += info.get('resources_used', 0)
                 
                 if 'response_time' in info:
@@ -332,6 +342,9 @@ class EGTMARLTrainer:
                 
                 state = next_state
                 step += 1
+            
+            # 在episode结束时获取最终的rescued值
+            episode_rescued = info.get('rescued', 0)
             
             # 计算指标
             total_victims = self.env.num_victims
@@ -361,7 +374,6 @@ class EGTMARLTrainer:
         
         checkpoint = {
             'episode': episode_idx,
-            'algorithm_state': self.algorithm.get_state_dict(),
             'metrics': metrics,
             'config': self.config
         }
@@ -375,7 +387,6 @@ class EGTMARLTrainer:
         
         model_state = {
             'episode': episode_idx,
-            'algorithm_state': self.algorithm.get_state_dict(),
             'metrics': metrics,
             'config': self.config
         }
@@ -386,6 +397,9 @@ class EGTMARLTrainer:
     def train(self):
         """主训练循环"""
         logger.info("Starting training...")
+        
+        # 设置目录（在参数覆盖后）
+        self.setup_directories()
         
         # 设置组件
         self.setup_environment()
@@ -454,7 +468,8 @@ class EGTMARLTrainer:
                 logger.info(f"Episode {episode}/{num_episodes} - "
                            f"Rescue Rate: {episode_metrics.get('rescue_rate', 0.0):.1f}% - "
                            f"Reward: {episode_metrics.get('total_reward', 0.0):.1f} - "
-                           f"Steps: {episode_metrics.get('steps', 0)}")
+                           f"Steps: {episode_metrics.get('steps', 0)} - "
+                           f"Remaining Casualties: {len(self.env.casualties)}")
         
         # 训练完成
         logger.info("Training completed!")
@@ -469,7 +484,6 @@ class EGTMARLTrainer:
         # 保存最终模型
         final_model_path = self.experiment_dir / 'models' / 'final_model.pt'
         torch.save({
-            'algorithm_state': self.algorithm.get_state_dict(),
             'final_metrics': final_metrics,
             'training_history': training_history,
             'config': self.config
@@ -578,10 +592,19 @@ def main():
                        help='Path to configuration file')
     parser.add_argument('--output_dir', type=str, default='experiment_results',
                        help='Output directory for results')
+    # 支持多种参数格式
     parser.add_argument('--num_episodes', type=int, default=None,
                        help='Number of training episodes (overrides config)')
+    parser.add_argument('--epochs', type=int, default=None,
+                       help='Number of training epochs (alias for --num_episodes)')
     parser.add_argument('--learning_rate', type=float, default=None,
                        help='Learning rate (overrides config)')
+    parser.add_argument('--learning-rate', type=float, default=None,
+                       help='Learning rate (alias for --learning_rate)')
+    parser.add_argument('--batch_size', type=int, default=None,
+                       help='Batch size (overrides config)')
+    parser.add_argument('--batch-size', type=int, default=None,
+                       help='Batch size (alias for --batch_size)')
     
     args = parser.parse_args()
     
@@ -592,11 +615,19 @@ def main():
     if args.output_dir:
         trainer.config['output_dir'] = args.output_dir
     
+    # 处理训练轮数参数
     if args.num_episodes:
         trainer.config['training']['num_episodes'] = args.num_episodes
+    elif args.epochs:
+        trainer.config['training']['num_episodes'] = args.epochs
     
+    # 处理学习率参数
     if args.learning_rate:
         trainer.config['training']['learning_rate'] = args.learning_rate
+    
+    # 处理批大小参数
+    if args.batch_size:
+        trainer.config['training']['batch_size'] = args.batch_size
     
     # 开始训练
     try:

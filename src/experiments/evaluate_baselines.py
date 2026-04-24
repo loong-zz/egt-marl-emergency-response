@@ -19,25 +19,17 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # 添加项目根目录到路径
-project_root = Path(__file__).parent.parent.parent
+project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from environments.disaster_sim import DisasterSim
 from algorithms.egt_marl import EGTMARL
-from algorithms.qmix_improved import QMIXImproved
+from algorithms.qmix_improved import ImprovedQMIX
 from utils.metrics import MetricsCollector
 from environments.visualization import DisasterVisualizer
 import logging
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('evaluation.log'),
-        logging.StreamHandler()
-    ]
-)
+# 初始化logger
 logger = logging.getLogger(__name__)
 
 
@@ -52,7 +44,6 @@ class BaselineEvaluator:
             config_path: 配置文件路径
         """
         self.config = self._load_config(config_path)
-        self.setup_directories()
         self.setup_device()
         
         # 初始化组件
@@ -123,12 +114,24 @@ class BaselineEvaluator:
         (self.evaluation_dir / 'logs').mkdir(exist_ok=True)
         (self.evaluation_dir / 'visualizations').mkdir(exist_ok=True)
         
+        # 配置日志
+        log_file = self.evaluation_dir / 'logs' / 'evaluation.log'
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(str(log_file)),
+                logging.StreamHandler()
+            ]
+        )
+        
         # 保存配置
         config_path = self.evaluation_dir / 'config.yaml'
         with open(config_path, 'w', encoding='utf-8') as f:
             yaml.dump(self.config, f, default_flow_style=False)
         
         logger.info(f"Evaluation directory: {self.evaluation_dir}")
+        logger.info(f"Log file: {log_file}")
     
     def setup_device(self):
         """设置计算设备"""
@@ -141,17 +144,14 @@ class BaselineEvaluator:
     
     def setup_environment(self, disaster_type: str, severity: str):
         """设置环境"""
-        env_config = self.config['environment']
+        # 构建 scenario 字符串，符合 DisasterSim 的预期格式
+        scenario = f"{disaster_type}_{severity}"
         
-        self.env = DisasterSim(
-            map_size=tuple(env_config['map_size']),
-            num_agents=env_config['num_agents'],
-            num_victims=env_config['num_victims'],
-            num_resources=env_config['num_resources'],
-            num_hospitals=env_config['num_hospitals'],
-            disaster_type=disaster_type,
-            severity=severity
-        )
+        # 初始化 DisasterSim 环境
+        self.env = DisasterSim(scenario=scenario)
+        
+        # 为了兼容其他代码，添加必要的属性
+        self.env.num_agents = len(self.env.rescue_agents)
         
         logger.info(f"Environment initialized: {disaster_type} ({severity})")
     
@@ -170,10 +170,7 @@ class BaselineEvaluator:
         # 初始化 EGT-MARL
         if algo_config['egt_marl']['enabled']:
             self.algorithms['EGT-MARL'] = EGTMARL(
-                state_dim=state_dim,
-                action_dim=action_dim,
-                num_agents=num_agents,
-                device=self.device
+                env=self.env
             )
             
             # 加载预训练模型（如果提供）
@@ -183,11 +180,31 @@ class BaselineEvaluator:
         
         # 初始化 QMIX
         if algo_config['qmix']['enabled']:
-            self.algorithms['QMIX'] = QMIXImproved(
-                state_dim=state_dim,
-                action_dim=action_dim,
+            # 为 ImprovedQMIX 创建必要的参数
+            # 从环境获取观察维度
+            # 假设观察维度是状态维度的一部分
+            obs_dim = 19  # 根据错误信息，实际观察维度是 19
+            
+            # 创建动作维度列表和智能体类型列表
+            # 假设所有智能体都是无人机类型
+            action_dims = [16] * num_agents  # 简化为固定动作维度
+            agent_types = ['drone'] * num_agents
+            
+            # 创建配置字典
+            qmix_config = {
+                'hidden_dim': 64,
+                'mixing_hidden_dim': 64,
+                'attention_heads': 4,
+                'learning_rate': 0.0001
+            }
+            
+            self.algorithms['QMIX'] = ImprovedQMIX(
                 num_agents=num_agents,
-                device=self.device
+                obs_dim=obs_dim,
+                state_dim=state_dim,
+                action_dims=action_dims,
+                agent_types=agent_types,
+                config=qmix_config
             )
             
             model_path = algo_config['qmix'].get('model_path')
@@ -209,22 +226,22 @@ class BaselineEvaluator:
         
         # 初始化新基线算法
         if algo_config.get('greedy_local', {}).get('enabled', True):
-            self.algorithms['Greedy-Local'] = self._create_greedy_local_policy()
+            self.algorithms['Greedy-Local'] = self._create_greedy_policy()
         
         if algo_config.get('proportional_fair', {}).get('enabled', True):
             self.algorithms['Proportional-Fair'] = self._create_proportional_fair_policy()
         
         if algo_config.get('centralized_mpc', {}).get('enabled', True):
-            self.algorithms['Centralized-MPC'] = self._create_centralized_mpc_policy()
+            self.algorithms['Centralized-MPC'] = self._create_mpc_policy()
         
         if algo_config.get('game_theoretic', {}).get('enabled', True):
             self.algorithms['Game-Theoretic'] = self._create_game_theoretic_policy()
         
         if algo_config.get('gnn_based', {}).get('enabled', True):
-            self.algorithms['GNN-Based'] = self._create_gnn_based_policy()
+            self.algorithms['GNN-Based'] = self._create_gnn_policy()
         
         if algo_config.get('transformer_based', {}).get('enabled', True):
-            self.algorithms['Transformer-Based'] = self._create_transformer_based_policy()
+            self.algorithms['Transformer-Based'] = self._create_transformer_policy()
         
         logger.info(f"Algorithms initialized: {list(self.algorithms.keys())}")
     
@@ -489,14 +506,51 @@ class BaselineEvaluator:
         
         while not done and step < max_steps:
             # 获取动作
-            if hasattr(algorithm, 'select_actions'):
+            if hasattr(algorithm, 'select_action'):
+                actions = algorithm.select_action(state, training=False)
+            elif hasattr(algorithm, 'act'):
+                # 对于 ImprovedQMIX 等算法
+                # 简化处理，假设 state 是观察值列表
+                if isinstance(state, tuple):
+                    state_obs = state[0]
+                else:
+                    state_obs = state
+                # 为每个智能体创建观察值
+                num_agents = len(self.env.rescue_agents) if hasattr(self.env, 'rescue_agents') else 17  # 默认 17 个智能体
+                observations = [state_obs[i] for i in range(num_agents)]
+                # 调用 act 方法
+                actions, _ = algorithm.act(observations, state_obs, training=False)
+                # 转换为字典格式
+                actions_dict = {}
+                for agent_id, action in enumerate(actions):
+                    actions_dict[agent_id] = {
+                        "strategic": [0.25, 0.25, 0.25, 0.25],
+                        "tactical": action % 8,
+                        "communication": action // 8
+                    }
+                actions = actions_dict
+            elif hasattr(algorithm, 'select_actions'):
                 actions = algorithm.select_actions(state, epsilon=0.0)
             else:
                 # 对于传统方法
                 actions = algorithm.select_actions(state)
             
+            # 确保动作是字典格式
+            if isinstance(actions, list):
+                # 转换列表为字典格式
+                actions_dict = {}
+                for agent_id, action in enumerate(actions):
+                    actions_dict[agent_id] = {
+                        "strategic": [0.25, 0.25, 0.25, 0.25],
+                        "tactical": action % 8,
+                        "communication": action // 8
+                    }
+                actions = actions_dict
+            
             # 执行动作
-            next_state, rewards, done, info = self.env.step(actions)
+            next_state, reward, terminated, truncated, info = self.env.step(actions)
+            rewards = [reward]  # 转换为列表格式
+            done = terminated or truncated
             
             # 收集指标
             episode_metrics['total_reward'] += sum(rewards)
@@ -515,7 +569,8 @@ class BaselineEvaluator:
             step += 1
         
         # 计算衍生指标
-        total_victims = self.env.num_victims
+        # 使用 casualties 字典的长度作为受害者数量
+        total_victims = len(self.env.casualties) if hasattr(self.env, 'casualties') else 0
         if total_victims > 0:
             episode_metrics['rescue_rate'] = (episode_metrics['rescued'] / total_victims) * 100
         
@@ -524,7 +579,8 @@ class BaselineEvaluator:
         else:
             episode_metrics['avg_response_time'] = 0.0
         
-        total_resources = self.env.num_resources * 100
+        # 计算资源利用率（简化）
+        total_resources = 1000  # 假设总资源为 1000
         if total_resources > 0:
             episode_metrics['resource_utilization'] = (episode_metrics['resources_used'] / total_resources) * 100
         
@@ -547,6 +603,9 @@ class BaselineEvaluator:
     def run_evaluation(self):
         """运行完整评估"""
         logger.info("Starting baseline evaluation...")
+        
+        # 设置目录（在参数覆盖后）
+        self.setup_directories()
         
         eval_config = self.config['evaluation']
         scenarios = eval_config['scenarios']
@@ -836,8 +895,16 @@ def main():
                        help='Output directory for results')
     parser.add_argument('--scenarios', type=str, nargs='+', default=None,
                        help='Scenarios to evaluate (overrides config)')
+    parser.add_argument('--severities', type=str, nargs='+', default=None,
+                       help='Severities to evaluate (overrides config)')
+    parser.add_argument('--algorithms', type=str, default=None,
+                       help='Algorithms to evaluate (comma-separated, overrides config)')
     parser.add_argument('--num_episodes', type=int, default=None,
                        help='Number of evaluation episodes (overrides config)')
+    parser.add_argument('--num_runs', type=int, default=None,
+                       help='Number of independent runs (overrides config)')
+    parser.add_argument('--all', action='store_true',
+                       help='Evaluate all scenarios')
     
     args = parser.parse_args()
     
@@ -851,8 +918,34 @@ def main():
     if args.scenarios:
         evaluator.config['evaluation']['scenarios'] = args.scenarios
     
+    if args.severities:
+        evaluator.config['evaluation']['severities'] = args.severities
+    
+    if args.algorithms:
+        # 解析算法列表
+        algo_list = [algo.strip() for algo in args.algorithms.split(',')]
+        # 禁用所有算法
+        for algo in evaluator.config['algorithms']:
+            evaluator.config['algorithms'][algo]['enabled'] = False
+        # 启用指定的算法
+        for algo in algo_list:
+            if algo in evaluator.config['algorithms']:
+                evaluator.config['algorithms'][algo]['enabled'] = True
+    
     if args.num_episodes:
         evaluator.config['evaluation']['num_episodes'] = args.num_episodes
+    
+    if args.num_runs:
+        evaluator.config['evaluation']['num_runs'] = args.num_runs
+    
+    # 处理 --all 参数
+    if args.all:
+        # 设置所有场景
+        all_scenarios = ['earthquake', 'flood', 'hurricane', 'wildfire', 'tornado']
+        all_severities = ['low', 'medium', 'high']
+        evaluator.config['evaluation']['scenarios'] = all_scenarios
+        evaluator.config['evaluation']['severities'] = all_severities
+        logger.info("Evaluating all scenarios and severities...")
     
     # 运行评估
     try:

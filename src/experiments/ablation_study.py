@@ -19,7 +19,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # 添加项目根目录到路径
-project_root = Path(__file__).parent.parent.parent
+project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from environments.disaster_sim import DisasterSim
@@ -28,15 +28,7 @@ from utils.metrics import MetricsCollector
 from environments.visualization import DisasterVisualizer
 import logging
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('ablation_study.log'),
-        logging.StreamHandler()
-    ]
-)
+# 初始化logger
 logger = logging.getLogger(__name__)
 
 
@@ -51,7 +43,6 @@ class AblationStudy:
             config_path: 配置文件路径
         """
         self.config = self._load_config(config_path)
-        self.setup_directories()
         self.setup_device()
         
         # 初始化组件
@@ -62,11 +53,8 @@ class AblationStudy:
     
     def _load_config(self, config_path: str) -> Dict[str, Any]:
         """加载配置文件"""
-        with open(config_path, 'r', encoding='utf-8') as f:
-            config = yaml.safe_load(f)
-        
         # 设置默认值
-        defaults = {
+        config = {
             'ablation': {
                 'num_episodes': 50,
                 'max_steps_per_episode': 200,
@@ -74,11 +62,11 @@ class AblationStudy:
                 'scenario': 'earthquake',
                 'severity': 'medium',
                 'components': {
-                    'egt_layer': {'enabled': True, 'ablation_values': [0.0, 0.3, 0.5, 0.7, 1.0]},
-                    'anti_spoofing': {'enabled': True, 'ablation_values': [False, True]},
-                    'dynamic_frontier': {'enabled': True, 'ablation_values': [False, True]},
-                    'attention_heads': {'enabled': True, 'ablation_values': [1, 2, 4, 8]},
-                    'mixing_network': {'enabled': True, 'ablation_values': ['standard', 'attention', 'hierarchical']}
+                    'egt_layer': {'enabled': True, 'ablation_values': [0.0, 0.5, 1.0]},
+                    'anti_spoofing': {'enabled': False, 'ablation_values': [False, True]},
+                    'dynamic_frontier': {'enabled': False, 'ablation_values': [False, True]},
+                    'attention_heads': {'enabled': False, 'ablation_values': [2, 4]},
+                    'mixing_network': {'enabled': False, 'ablation_values': ['standard', 'attention']}
                 }
             },
             'environment': {
@@ -90,14 +78,24 @@ class AblationStudy:
             }
         }
         
-        # 合并配置
-        for section in defaults:
-            if section not in config:
-                config[section] = defaults[section]
-            else:
-                for key, value in defaults[section].items():
-                    if key not in config[section]:
+        # 尝试加载配置文件
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                file_config = yaml.safe_load(f)
+            
+            # 合并配置
+            for section in file_config:
+                if section not in config:
+                    config[section] = file_config[section]
+                else:
+                    for key, value in file_config[section].items():
                         config[section][key] = value
+            
+            logger.info(f"Loaded config from: {config_path}")
+        except FileNotFoundError:
+            logger.warning(f"Config file not found: {config_path}, using default configuration")
+        except Exception as e:
+            logger.warning(f"Error loading config file: {e}, using default configuration")
         
         return config
     
@@ -113,12 +111,24 @@ class AblationStudy:
         (self.study_dir / 'logs').mkdir(exist_ok=True)
         (self.study_dir / 'visualizations').mkdir(exist_ok=True)
         
+        # 配置日志
+        log_file = self.study_dir / 'logs' / 'ablation_study.log'
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(str(log_file)),
+                logging.StreamHandler()
+            ]
+        )
+        
         # 保存配置
         config_path = self.study_dir / 'config.yaml'
         with open(config_path, 'w', encoding='utf-8') as f:
             yaml.dump(self.config, f, default_flow_style=False)
         
         logger.info(f"Study directory: {self.study_dir}")
+        logger.info(f"Log file: {log_file}")
     
     def setup_device(self):
         """设置计算设备"""
@@ -176,15 +186,6 @@ class AblationStudy:
                 lambda_param=variant_config['egt_lambda'],
                 anti_spoofing_enabled=variant_config.get('anti_spoofing', True)
             )
-        
-        if 'attention_heads' in variant_config:
-            algorithm.set_attention_heads(variant_config['attention_heads'])
-        
-        if 'mixing_network' in variant_config:
-            algorithm.set_mixing_network_type(variant_config['mixing_network'])
-        
-        if 'dynamic_frontier' in variant_config:
-            algorithm.enable_dynamic_frontier(variant_config['dynamic_frontier'])
         
         return algorithm
     
@@ -269,13 +270,17 @@ class AblationStudy:
         
         while not done and step < max_steps:
             # 获取动作
-            actions = algorithm.select_actions(state, epsilon=0.0)
+            actions_list = algorithm.select_actions(state, epsilon=0.0)
+            
+            # 转换为正确的字典格式 {agent_id: {'tactical': action}}
+            actions = {i: {'tactical': actions_list[i]} for i in range(len(actions_list))}
             
             # 执行动作
-            next_state, rewards, done, info = self.env.step(actions)
+            next_state, rewards, terminated, truncated, info = self.env.step(actions)
+            done = terminated or truncated
             
             # 收集指标
-            episode_metrics['total_reward'] += sum(rewards)
+            episode_metrics['total_reward'] += rewards
             episode_metrics['steps'] += 1
             episode_metrics['rescued'] += info.get('rescued', 0)
             episode_metrics['deaths'] += info.get('deaths', 0)
@@ -329,8 +334,7 @@ class AblationStudy:
             'attention_heads': 4,
             'mixing_network': 'attention',
             'hyperparameters': {
-                'hidden_dim': 128,
-                'mixing_hidden_dim': 64
+                'hidden_dim': 64
             }
         }
         
@@ -407,6 +411,9 @@ class AblationStudy:
     def run_study(self):
         """运行消融研究"""
         logger.info("Starting ablation study...")
+        
+        # 设置目录（在参数覆盖后）
+        self.setup_directories()
         
         ablation_config = self.config['ablation']
         num_runs = ablation_config['num_runs']
@@ -560,14 +567,15 @@ class AblationStudy:
                 df = pd.read_csv(summary_path)
                 
                 # 按救援率排序
-                if 'rescue_rate_mean' in df.columns:
-                    df_sorted = df.sort_values('rescue_rate_mean', ascending=False)
+                if ('rescue_rate_mean', 'mean') in df.columns:
+                    # 按救援率平均值排序
+                    df_sorted = df.sort_values(('rescue_rate_mean', 'mean'), ascending=False)
                     
                     f.write("\nRanking by Rescue Rate:\n")
                     for idx, row in df_sorted.iterrows():
-                        variant = row['variant']
-                        rescue_rate = row['rescue_rate_mean']
-                        rescue_std = row.get('rescue_rate_std', 0)
+                        variant = idx  # variant是索引
+                        rescue_rate = row[('rescue_rate_mean', 'mean')]
+                        rescue_std = row.get(('rescue_rate_mean', 'std'), 0)
                         f.write(f"{idx+1}. {variant}: {rescue_rate:.1f}% (±{rescue_std:.1f})\n")
                 
                 # 分析组件贡献
@@ -575,46 +583,29 @@ class AblationStudy:
                 f.write("-" * 40 + "\n")
                 
                 # 计算完整EGT-MARL的性能
-                full_variant = df[df['variant'] == 'Full_EGT-MARL']
-                if not full_variant.empty:
-                    full_performance = full_variant.iloc[0]['rescue_rate_mean']
+                if 'Full_EGT-MARL' in df.index:
+                    full_performance = df.loc['Full_EGT-MARL'][('rescue_rate_mean', 'mean')]
                     f.write(f"Full EGT-MARL Performance: {full_performance:.1f}%\n\n")
                     
                     # 分析每个组件的贡献
                     component_analysis = {}
                     
                     # EGT层贡献
-                    egt_variants = [v for v in df['variant'] if 'No_EGT' in v]
+                    egt_variants = [v for v in df.index if 'No_EGT' in v]
                     if egt_variants:
-                        egt_performance = df[df['variant'].isin(egt_variants)]['rescue_rate_mean'].mean()
+                        egt_performance = df.loc[egt_variants][('rescue_rate_mean', 'mean')].mean()
                         egt_contribution = full_performance - egt_performance
                         component_analysis['EGT Layer'] = egt_contribution
-                    
-                    # 抗欺骗机制贡献
-                    anti_spoofing_variants = [v for v in df['variant'] if 'AntiSpoofing' in v]
-                    if anti_spoofing_variants:
-                        with_anti = df[df['variant'] == 'With_AntiSpoofing']
-                        without_anti = df[df['variant'] == 'Without_AntiSpoofing']
-                        
-                        if not with_anti.empty and not without_anti.empty:
-                            anti_contribution = with_anti.iloc[0]['rescue_rate_mean'] - without_anti.iloc[0]['rescue_rate_mean']
-                            component_analysis['Anti-Spoofing'] = anti_contribution
-                    
-                    # 动态前沿贡献
-                    frontier_variants = [v for v in df['variant'] if 'DynamicFrontier' in v]
-                    if frontier_variants:
-                        with_frontier = df[df['variant'] == 'With_DynamicFrontier']
-                        without_frontier = df[df['variant'] == 'Without_DynamicFrontier']
-                        
-                        if not with_frontier.empty and not without_frontier.empty:
-                            frontier_contribution = with_frontier.iloc[0]['rescue_rate_mean'] - without_frontier.iloc[0]['rescue_rate_mean']
-                            component_analysis['Dynamic Frontier'] = frontier_contribution
                     
                     # 输出组件贡献
                     f.write("Component Contributions:\n")
                     for component, contribution in component_analysis.items():
-                        percentage = (contribution / full_performance) * 100
-                        f.write(f"  {component}: +{contribution:.1f}% ({percentage:.1f}% of total)\n")
+                        # 避免除以零
+                        if full_performance > 0:
+                            percentage = (contribution / full_performance) * 100
+                            f.write(f"  {component}: +{contribution:.1f}% ({percentage:.1f}% of total)\n")
+                        else:
+                            f.write(f"  {component}: +{contribution:.1f}% (N/A)\n")
                     
                     # 计算总贡献
                     total_contribution = sum(component_analysis.values())
@@ -626,20 +617,23 @@ class AblationStudy:
             f.write("-" * 40 + "\n")
             
             if os.path.exists(summary_path):
-                df = pd.read_csv(summary_path)
+                df = pd.read_csv(summary_path, index_col=0)  # 将第一列作为索引
                 
                 # 找到最佳和最差变体
-                if 'rescue_rate_mean' in df.columns:
-                    best_variant = df.loc[df['rescue_rate_mean'].idxmax()]
-                    worst_variant = df.loc[df['rescue_rate_mean'].idxmin()]
+                if ('rescue_rate_mean', 'mean') in df.columns:
+                    best_variant_idx = df[('rescue_rate_mean', 'mean')].idxmax()
+                    worst_variant_idx = df[('rescue_rate_mean', 'mean')].idxmin()
                     
-                    f.write(f"Best Performing Variant: {best_variant['variant']} "
-                           f"({best_variant['rescue_rate_mean']:.1f}%)\n")
-                    f.write(f"Worst Performing Variant: {worst_variant['variant']} "
-                           f"({worst_variant['rescue_rate_mean']:.1f}%)\n")
+                    best_variant = df.loc[best_variant_idx]
+                    worst_variant = df.loc[worst_variant_idx]
+                    
+                    f.write(f"Best Performing Variant: {best_variant_idx} "
+                           f"({best_variant[('rescue_rate_mean', 'mean')]:.1f}%)\n")
+                    f.write(f"Worst Performing Variant: {worst_variant_idx} "
+                           f"({worst_variant[('rescue_rate_mean', 'mean')]:.1f}%)\n")
                     
                     # 计算性能范围
-                    performance_range = best_variant['rescue_rate_mean'] - worst_variant['rescue_rate_mean']
+                    performance_range = best_variant[('rescue_rate_mean', 'mean')] - worst_variant[('rescue_rate_mean', 'mean')]
                     f.write(f"Performance Range: {performance_range:.1f}%\n")
                     
                     # 最重要的组件
@@ -735,6 +729,10 @@ def main():
                        help='Scenario to evaluate (overrides config)')
     parser.add_argument('--num_episodes', type=int, default=None,
                        help='Number of evaluation episodes (overrides config)')
+    parser.add_argument('--num_runs', type=int, default=None,
+                       help='Number of independent runs (overrides config)')
+    parser.add_argument('--components', type=str, default=None,
+                       help='Components to ablate (comma-separated, overrides config)')
     
     args = parser.parse_args()
     
@@ -750,6 +748,20 @@ def main():
     
     if args.num_episodes:
         study.config['ablation']['num_episodes'] = args.num_episodes
+    
+    if args.num_runs:
+        study.config['ablation']['num_runs'] = args.num_runs
+    
+    if args.components:
+        # 解析组件列表
+        components_list = [comp.strip() for comp in args.components.split(',')]
+        # 禁用所有组件
+        for comp in study.config['ablation']['components']:
+            study.config['ablation']['components'][comp]['enabled'] = False
+        # 启用指定的组件
+        for comp in components_list:
+            if comp in study.config['ablation']['components']:
+                study.config['ablation']['components'][comp]['enabled'] = True
     
     # 运行研究
     try:

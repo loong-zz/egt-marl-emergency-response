@@ -7,7 +7,6 @@ from .disaster_scenarios import (
     EarthquakeScenario,
     FloodScenario,
     HurricaneScenario,
-    CompositeDisasterScenario,
 )
 from .visualization import DisasterVisualizer
 
@@ -16,7 +15,6 @@ __all__ = [
     "EarthquakeScenario",
     "FloodScenario",
     "HurricaneScenario",
-    "CompositeDisasterScenario",
     "DisasterVisualizer",
 ]
 

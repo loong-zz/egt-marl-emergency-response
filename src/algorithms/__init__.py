@@ -7,7 +7,7 @@ This package contains the core algorithms for the EGT-MARL framework:
 - MARLLayer: Multi-agent reinforcement learning layer
 - EGTLayer: Evolutionary game theory layer
 - AntiSpoofing: Anti-spoofing mechanism
-- QMIXImproved: Improved QMIX implementation
+- ImprovedQMIX: Improved QMIX implementation
 - DynamicFrontier: Dynamic Pareto frontier optimization
 """
 
@@ -15,7 +15,7 @@ from .egt_marl import EGTMARL
 from .marl_layer import MARLLayer
 from .egt_layer import EGTLayer
 from .anti_spoofing import AntiSpoofing
-from .qmix_improved import QMIXImproved
+from .qmix_improved import ImprovedQMIX
 from .dynamic_frontier import DynamicFrontier
 
 __all__ = [
@@ -23,6 +23,6 @@ __all__ = [
     'MARLLayer',
     'EGTLayer',
     'AntiSpoofing',
-    'QMIXImproved',
+    'ImprovedQMIX',
     'DynamicFrontier',
 ]
