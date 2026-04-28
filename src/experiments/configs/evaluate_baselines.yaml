@@ -1,0 +1,56 @@
+# 基准算法比较配置文件
+
+output_dir: evaluation_results
+
+# 评估配置
+evaluation:
+  num_episodes: 10  # 减少到10个episodes以加快评估速度
+  max_steps_per_episode: 600  # 减少最大步数
+  num_runs: 1  # 多次运行以减少随机性
+  scenarios:
+    - earthquake
+  severities:
+    - medium  # 与训练5一致
+
+# 环境配置 - 与训练5的超大规模场景保持一致
+environment:
+  map_size: [4500, 4500]  # 超大规模地图
+  num_agents: 100  # 100个智能体
+  num_victims: 1000  # 1000个受害者
+  num_resources: 48  # 与训练5一致
+  num_hospitals: 16  # 与训练5一致
+  disaster_type: earthquake
+  severity: medium
+
+# 算法配置
+algorithms:
+  egt_marl:
+    enabled: true
+    model_path: "E:/studio/workspace/egt-marl-emergency-response/src/experiment_results/egt_marl_20260427_152624/models/best_model.pt"
+  qmix:
+    enabled: true
+    model_path: ""
+    hidden_dim: 128
+    mixing_hidden_dim: 64
+    learning_rate: 0.0001
+  maddpg:
+    enabled: true
+    model_path: ""
+    hidden_dim: 128
+    learning_rate: 0.0001
+  fcfs:
+    enabled: true
+  priority:
+    enabled: true
+  greedy_local:
+    enabled: true
+  proportional_fair:
+    enabled: true
+  centralized_mpc:
+    enabled: true
+  game_theoretic:
+    enabled: true
+  gnn_based:
+    enabled: true
+  transformer_based:
+    enabled: true

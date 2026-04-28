@@ -55,26 +55,7 @@ class EGTMARLTrainer:
         
         logger.info(f"EGT-MARL Trainer initialized with config: {config_path}")
     
-    def setup_directories(self):
-        """设置目录结构"""
-        base_dir = Path(self.config.get('output_dir', 'experiment_results'))
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        self.experiment_dir = base_dir / f'egt_marl_{timestamp}'
-        
-        # 创建目录
-        self.experiment_dir.mkdir(parents=True, exist_ok=True)
-        (self.experiment_dir / 'models').mkdir(exist_ok=True)
-        (self.experiment_dir / 'checkpoints').mkdir(exist_ok=True)
-        (self.experiment_dir / 'logs').mkdir(exist_ok=True)
-        (self.experiment_dir / 'visualizations').mkdir(exist_ok=True)
-        
-        # 保存配置
-        config_path = self.experiment_dir / 'config.yaml'
-        with open(config_path, 'w', encoding='utf-8') as f:
-            yaml.dump(self.config, f, default_flow_style=False)
-        
-        logger.info(f"Experiment directory: {self.experiment_dir}")
-    
+
     def _load_config(self, config_path: str) -> Dict[str, Any]:
         """加载配置文件"""
         with open(config_path, 'r', encoding='utf-8') as f:
@@ -134,7 +115,9 @@ class EGTMARLTrainer:
     
     def setup_directories(self):
         """设置目录结构"""
-        base_dir = Path(self.config.get('output_dir', 'experiment_results'))
+        # 使用项目根目录作为基准，确保结果目录位置一致
+        project_root = Path(__file__).parent.parent
+        base_dir = project_root / self.config.get('output_dir', 'experiment_results')
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         self.experiment_dir = base_dir / f'egt_marl_{timestamp}'
         
@@ -385,14 +368,17 @@ class EGTMARLTrainer:
         """保存最佳模型"""
         best_model_path = self.experiment_dir / 'models' / 'best_model.pt'
         
-        model_state = {
-            'episode': episode_idx,
-            'metrics': metrics,
-            'config': self.config
-        }
-        
-        torch.save(model_state, best_model_path)
+        # 调用EGT-MARL的save_checkpoint方法保存模型权重
+        self.algorithm.save_checkpoint(best_model_path)
         logger.info(f"Best model saved: {best_model_path}")
+    
+    def save_final_model(self, metrics: Dict[str, float]):
+        """保存最终模型"""
+        final_model_path = self.experiment_dir / 'models' / 'final_model.pt'
+        
+        # 调用EGT-MARL的save_checkpoint方法保存模型权重
+        self.algorithm.save_checkpoint(final_model_path)
+        logger.info(f"Final model saved: {final_model_path}")
     
     def train(self):
         """主训练循环"""
@@ -482,13 +468,7 @@ class EGTMARLTrainer:
                    f"Resource Utilization: {final_metrics.get('resource_utilization', 0.0):.1f}%")
         
         # 保存最终模型
-        final_model_path = self.experiment_dir / 'models' / 'final_model.pt'
-        torch.save({
-            'final_metrics': final_metrics,
-            'training_history': training_history,
-            'config': self.config
-        }, final_model_path)
-        logger.info(f"Final model saved: {final_model_path}")
+        self.save_final_model(final_metrics)
         
         # 生成训练报告
         self.generate_training_report(training_history, final_metrics)

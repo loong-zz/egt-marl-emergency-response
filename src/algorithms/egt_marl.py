@@ -30,7 +30,7 @@ class EGTMARL:
     
     def __init__(self, state_dim: int = 22, action_dim: int = 5, num_agents: int = 3, 
                  hidden_dim: int = 64, device: Optional[torch.device] = None, 
-                 env=None, config_path: Optional[str] = None):
+                 env=None, config_path: Optional[str] = None, config: Optional[Dict] = None):
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.num_agents = num_agents
@@ -45,15 +45,22 @@ class EGTMARL:
             device: PyTorch device
             env: Disaster simulation environment
             config_path: Path to configuration file
+            config: Configuration dictionary (takes precedence over config_path)
         """
         self.env = env
         self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         # Load configuration
-        if config_path is None:
+        if config is not None:
+            # Use provided config dictionary
+            self.config = config
+        elif config_path is None:
             config_path = Path(__file__).parent.parent / "configs" / "egt_marl.yaml"
-        with open(config_path, 'r') as f:
-            self.config = yaml.safe_load(f)
+            with open(config_path, 'r') as f:
+                self.config = yaml.safe_load(f)
+        else:
+            with open(config_path, 'r') as f:
+                self.config = yaml.safe_load(f)
         
         # Update configuration with provided parameters
         self.config['marl']['state_dim'] = state_dim
@@ -658,14 +665,28 @@ class EGTMARL:
     
     def save_checkpoint(self, path: str) -> None:
         """Save model checkpoint."""
+        # 保存 AntiSpoofing 中各个网络的状态
+        anti_spoofing_state = {
+            'verifier': self.anti_spoofing.verifier.state_dict() if hasattr(self.anti_spoofing, 'verifier') else None,
+            'spoofing_detector': self.anti_spoofing.spoofing_detector.state_dict() if hasattr(self.anti_spoofing, 'spoofing_detector') else None,
+            'corrector': self.anti_spoofing.corrector.state_dict() if hasattr(self.anti_spoofing, 'corrector') else None,
+            'reputation_system': self.anti_spoofing.reputation_system if hasattr(self.anti_spoofing, 'reputation_system') else None
+        }
+        
+        # 保存 DynamicFrontier 的状态
+        dynamic_frontier_state = {
+            'exploration_frontier': self.dynamic_frontier.exploration_frontier if hasattr(self.dynamic_frontier, 'exploration_frontier') else None,
+            'exploitation_frontier': self.dynamic_frontier.exploitation_frontier if hasattr(self.dynamic_frontier, 'exploitation_frontier') else None
+        }
+        
         checkpoint = {
             'episode': self.episode,
             'total_steps': self.total_steps,
             'best_reward': self.best_reward,
             'marl_layer_state': self.marl_layer.state_dict(),
             'egt_layer_state': self.egt_layer.state_dict(),
-            'anti_spoofing_state': self.anti_spoofing.state_dict(),
-            'dynamic_frontier_state': self.dynamic_frontier.state_dict(),
+            'anti_spoofing_state': anti_spoofing_state,
+            'dynamic_frontier_state': dynamic_frontier_state,
             'marl_optimizer_state': self.marl_optimizer.state_dict(),
             'egt_optimizer_state': self.egt_optimizer.state_dict(),
             'metrics_history': self.metrics_history,
@@ -685,8 +706,26 @@ class EGTMARL:
         
         self.marl_layer.load_state_dict(checkpoint['marl_layer_state'])
         self.egt_layer.load_state_dict(checkpoint['egt_layer_state'])
-        self.anti_spoofing.load_state_dict(checkpoint['anti_spoofing_state'])
-        self.dynamic_frontier.load_state_dict(checkpoint['dynamic_frontier_state'])
+        
+        # 加载 AntiSpoofing 中各个网络的状态
+        if 'anti_spoofing_state' in checkpoint:
+            anti_spoofing_state = checkpoint['anti_spoofing_state']
+            if hasattr(self.anti_spoofing, 'verifier') and anti_spoofing_state.get('verifier') is not None:
+                self.anti_spoofing.verifier.load_state_dict(anti_spoofing_state['verifier'])
+            if hasattr(self.anti_spoofing, 'spoofing_detector') and anti_spoofing_state.get('spoofing_detector') is not None:
+                self.anti_spoofing.spoofing_detector.load_state_dict(anti_spoofing_state['spoofing_detector'])
+            if hasattr(self.anti_spoofing, 'corrector') and anti_spoofing_state.get('corrector') is not None:
+                self.anti_spoofing.corrector.load_state_dict(anti_spoofing_state['corrector'])
+            if hasattr(self.anti_spoofing, 'reputation_system') and anti_spoofing_state.get('reputation_system') is not None:
+                self.anti_spoofing.reputation_system = anti_spoofing_state['reputation_system']
+        
+        # 加载 DynamicFrontier 的状态
+        if 'dynamic_frontier_state' in checkpoint:
+            dynamic_frontier_state = checkpoint['dynamic_frontier_state']
+            if hasattr(self.dynamic_frontier, 'exploration_frontier') and dynamic_frontier_state.get('exploration_frontier') is not None:
+                self.dynamic_frontier.exploration_frontier = dynamic_frontier_state['exploration_frontier']
+            if hasattr(self.dynamic_frontier, 'exploitation_frontier') and dynamic_frontier_state.get('exploitation_frontier') is not None:
+                self.dynamic_frontier.exploitation_frontier = dynamic_frontier_state['exploitation_frontier']
         
         self.marl_optimizer.load_state_dict(checkpoint['marl_optimizer_state'])
         self.egt_optimizer.load_state_dict(checkpoint['egt_optimizer_state'])

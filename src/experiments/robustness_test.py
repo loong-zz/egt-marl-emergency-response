@@ -310,8 +310,9 @@ class RobustnessTester:
             # 收集指标
             episode_metrics['total_reward'] += rewards
             episode_metrics['steps'] += 1
-            episode_metrics['rescued'] += info.get('rescued', 0)
-            episode_metrics['deaths'] += info.get('deaths', 0)
+            # 记录当前累计值（最后会取最终值），不累加
+            episode_metrics['rescued'] = info.get('rescued', 0)
+            episode_metrics['deaths'] = info.get('deaths', 0)
             episode_metrics['resources_used'] += info.get('resources_used', 0)
             
             state = next_state
@@ -466,8 +467,9 @@ class RobustnessTester:
             # 收集指标
             episode_metrics['total_reward'] += rewards
             episode_metrics['steps'] += 1
-            episode_metrics['rescued'] += info.get('rescued', 0)
-            episode_metrics['deaths'] += info.get('deaths', 0)
+            # 记录当前累计值（最后会取最终值），不累加
+            episode_metrics['rescued'] = info.get('rescued', 0)
+            episode_metrics['deaths'] = info.get('deaths', 0)
             
             state = next_state
             step += 1
@@ -607,8 +609,9 @@ class RobustnessTester:
             # 收集指标
             episode_metrics['total_reward'] += rewards
             episode_metrics['steps'] += 1
-            episode_metrics['rescued'] += info.get('rescued', 0)
-            episode_metrics['deaths'] += info.get('deaths', 0)
+            # 记录当前累计值（最后会取最终值），不累加
+            episode_metrics['rescued'] = info.get('rescued', 0)
+            episode_metrics['deaths'] = info.get('deaths', 0)
             
             state = next_state
             step += 1

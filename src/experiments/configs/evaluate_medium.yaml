@@ -1,0 +1,48 @@
+# 中规模评估配置 - 标准评估
+
+output_dir: evaluation_results
+
+# 评估配置
+evaluation:
+  num_episodes: 50           # 中等数量episode
+  max_steps_per_episode: 200 # 标准步数限制
+  num_runs: 3                # 3轮运行取平均
+  scenarios:
+    - earthquake
+    - flood
+  severities:
+    - medium
+
+# 环境配置 - 中等规模场景
+environment:
+  map_size: [200, 200]       # 中等地图
+  num_agents: 20             # 中等数量智能体
+  num_victims: 100           # 中等数量受害者
+  num_resources: 20          # 中等数量资源
+  num_hospitals: 5           # 中等数量医院
+  disaster_type: earthquake
+  severity: medium
+
+# 算法配置
+algorithms:
+  egt_marl:
+    enabled: true
+    model_path: ""
+  qmix:
+    enabled: true
+    model_path: ""
+  maddpg:
+    enabled: true
+    model_path: ""
+  fcfs:
+    enabled: true
+  priority:
+    enabled: true
+  greedy_local:
+    enabled: true
+  proportional_fair:
+    enabled: true
+  centralized_mpc:
+    enabled: true
+  game_theoretic:
+    enabled: true

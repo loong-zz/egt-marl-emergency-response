@@ -53,10 +53,10 @@ class Casualty:
         
         # Survival probability decreases over time based on severity
         severity_factor = {
-            CasualtySeverity.CRITICAL: 0.0002,  # 0.02% per second (5000 seconds = 83 minutes)
-            CasualtySeverity.SEVERE: 0.0001,    # 0.01% per second (10000 seconds = 167 minutes)
-            CasualtySeverity.MODERATE: 0.00005,  # 0.005% per second (20000 seconds = 333 minutes)
-            CasualtySeverity.MILD: 0.00001      # 0.001% per second (100000 seconds = 2778 minutes)
+            CasualtySeverity.CRITICAL: 0.006,  # 0.6% per second (166 seconds = 2.7 minutes)
+            CasualtySeverity.SEVERE: 0.002,    # 0.2% per second (500 seconds = 8.3 minutes)
+            CasualtySeverity.MODERATE: 0.001,  # 0.1% per second (1000 seconds = 16.7 minutes)
+            CasualtySeverity.MILD: 0.0002      # 0.02% per second (5000 seconds = 83.3 minutes)
         }[self.severity]
         
         self.survival_probability = max(
@@ -471,15 +471,15 @@ class DisasterSim:
         # Apply secondary disasters
         if np.random.rand() < self._get_secondary_disaster_probability():
             self._apply_secondary_disaster()
-        
+
         # Update weather
         self._update_weather()
-        
+
+        # Update statistics before calculating reward
+        self._update_statistics()
+
         # Calculate reward
         reward = self._calculate_reward()
-        
-        # Update statistics
-        self._update_statistics()
         
         # Increment time and step count
         self.current_time += self.time_step
@@ -497,6 +497,13 @@ class DisasterSim:
         info['rescued'] = self.statistics.get('total_survivors', 0)
         info['deaths'] = self.statistics.get('total_casualties', 0) - len(self.casualties)
         info['resources_used'] = sum(self.statistics.get('resource_utilization', {}).values())
+        
+        # Calculate and add response time (time steps per rescue)
+        survivors = self.statistics.get('total_survivors', 0)
+        if survivors > 0:
+            info['response_time'] = self.step_count / survivors
+        else:
+            info['response_time'] = 0
         
         return observation, reward, terminated, truncated, info
     
@@ -524,43 +531,33 @@ class DisasterSim:
         
         # Tactical action: movement
         if "tactical" in action:
-            # 检查代理是否有治疗任务
             if agent.current_mission and agent.current_mission.startswith("treat_casualty_"):
-                # 提取受害者ID
                 casualty_id = int(agent.current_mission.split("_")[-1])
-                # 检查受害者是否存在
                 if casualty_id in self.casualties:
                     casualty = self.casualties[casualty_id]
-                    # 向受害者位置移动
-                    direction = casualty.position - agent.position
-                    distance = np.linalg.norm(direction)
-                    if distance > 0:
-                        direction = direction / distance
-                        max_speed = agent.get_max_speed()
-                        target_distance = min(max_speed * self.time_step, distance)
-                        target_position = agent.position + direction * target_distance
-                        
-                        # Clip to map boundaries
-                        target_position = np.clip(target_position, 0, self.map_size)
-                        
-                        # Plan route to target (simple straight line for now)
-                        agent.route = [target_position]
+                    distance = np.linalg.norm(agent.position - casualty.position)
+                    treatment_distance_threshold = 15.0
+
+                    if distance <= treatment_distance_threshold and casualty.treated:
+                        agent.route = []
+                    elif distance > treatment_distance_threshold:
+                        direction = casualty.position - agent.position
+                        if np.linalg.norm(direction) > 0:
+                            direction = direction / np.linalg.norm(direction)
+                            max_speed = agent.get_max_speed()
+                            target_distance = min(max_speed * self.time_step, distance)
+                            target_position = agent.position + direction * target_distance
+                            target_position = np.clip(target_position, 0, self.map_size)
+                            agent.route = [target_position]
             else:
-                # 随机移动
                 direction_idx = action["tactical"]
-                # Convert direction index to vector (8 directions)
                 angles = np.linspace(0, 2*np.pi, 8, endpoint=False)
                 direction = np.array([np.cos(angles[direction_idx]), np.sin(angles[direction_idx])])
-                
-                # Set target position
+
                 max_speed = agent.get_max_speed()
                 target_distance = max_speed * self.time_step
                 target_position = agent.position + direction * target_distance
-                
-                # Clip to map boundaries
                 target_position = np.clip(target_position, 0, self.map_size)
-                
-                # Plan route to target (simple straight line for now)
                 agent.route = [target_position]
         
         # Communication action: information sharing
@@ -624,38 +621,41 @@ class DisasterSim:
     def _update_casualties(self) -> None:
         """Update casualty states and check for deaths."""
         casualties_to_remove = []
-        
-        # 实现基于救援代理位置的真正救援逻辑
+
         for agent in self.rescue_agents.values():
-            # 检查救援代理是否在治疗受害者
             if agent.current_mission and agent.current_mission.startswith("treat_casualty_"):
-                # 继续治疗
-                pass
+                casualty_id = int(agent.current_mission.split("_")[-1])
+                if casualty_id in self.casualties:
+                    casualty = self.casualties[casualty_id]
+                    distance = np.linalg.norm(agent.position - casualty.position)
+                    treatment_distance_threshold = 15.0
+
+                    if distance <= treatment_distance_threshold:
+                        if not casualty.treated:
+                            casualty.treated = True
+                            casualty.treatment_start = self.current_time
+                            print(f"Agent {agent.id} arrived at casualty {casualty_id}, starting treatment")
+                    else:
+                        if casualty.treated:
+                            casualty.treated = False
+                            casualty.treatment_start = None
             else:
-                # 寻找附近的受害者
                 nearest_casualty = None
                 min_distance = float('inf')
-                
+
                 for casualty_id, casualty in self.casualties.items():
-                    if not casualty.treated:
-                        distance = np.linalg.norm(agent.position - casualty.position)
-                        # 根据地图大小调整检测范围，至少100米或地图的15%
-                        map_dimension = self.map_size[0] if isinstance(self.map_size, (tuple, list)) else self.map_size
-                        detection_range = max(100.0, map_dimension * 0.15)  # 至少100米或地图的15%
-                        if distance < detection_range and distance < min_distance:
-                            nearest_casualty = casualty
-                            min_distance = distance
-                
-                # 如果找到附近的受害者，开始治疗
+                    if casualty.treated:
+                        continue
+                    distance = np.linalg.norm(agent.position - casualty.position)
+                    map_dimension = self.map_size[0] if isinstance(self.map_size, (tuple, list)) else self.map_size
+                    detection_range = max(100.0, map_dimension * 0.15)
+                    if distance < detection_range and distance < min_distance:
+                        nearest_casualty = casualty
+                        min_distance = distance
+
                 if nearest_casualty:
-                    nearest_casualty.treated = True
-                    nearest_casualty.treatment_start = self.current_time
                     agent.current_mission = f"treat_casualty_{nearest_casualty.id}"
-                    # 打印调试信息
-                    print(f"Agent {agent.id} started treating casualty {nearest_casualty.id} at position {nearest_casualty.position}")
-                else:
-                    # 打印调试信息
-                    print(f"Agent {agent.id} at position {agent.position} found no casualties nearby")
+                    print(f"Agent {agent.id} assigned to casualty {nearest_casualty.id}")
         
         for casualty_id, casualty in self.casualties.items():
             # Update survival probability
@@ -673,30 +673,30 @@ class DisasterSim:
             # Check if casualty is being treated
             if casualty.treated and casualty.treatment_start is not None:
                 treatment_duration = self.current_time - casualty.treatment_start
-                
+
                 # Check if treatment is complete
                 required_time = {
-                    CasualtySeverity.CRITICAL: 60,  # 1 minute
-                    CasualtySeverity.SEVERE: 30,    # 30 seconds
-                    CasualtySeverity.MODERATE: 15,   # 15 seconds
-                    CasualtySeverity.MILD: 5,       # 5 seconds
+                    CasualtySeverity.CRITICAL: 60,
+                    CasualtySeverity.SEVERE: 30,
+                    CasualtySeverity.MODERATE: 15,
+                    CasualtySeverity.MILD: 5,
                 }[casualty.severity]
-                
+
                 if treatment_duration >= required_time:
                     # Treatment complete, casualty survives
                     self.statistics["total_survivors"] += 1
-                    
+
                     # 找到受害者所在的区域，并更新该区域的幸存者数量
                     for area_id, area in self.affected_areas.items():
                         if casualty in area.casualties:
                             area.survivors += 1
                             break
-                    
+
                     # 移除相关的救援任务
                     for agent in self.rescue_agents.values():
                         if agent.current_mission == f"treat_casualty_{casualty_id}":
                             agent.current_mission = None
-                    
+
                     # 从受害者列表中移除已获救的受害者
                     casualties_to_remove.append(casualty_id)
         

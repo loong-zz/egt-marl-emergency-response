@@ -1,0 +1,40 @@
+# 小规模评估配置 - 快速测试
+
+output_dir: evaluation_results
+
+# 评估配置
+evaluation:
+  num_episodes: 10           # 少量episode，快速完成
+  max_steps_per_episode: 50  # 每个episode步数限制
+  num_runs: 1                # 单轮运行
+  scenarios:
+    - earthquake
+  severities:
+    - low
+
+# 环境配置 - 小规模场景
+environment:
+  map_size: [50, 50]         # 小地图
+  num_agents: 3              # 少量智能体
+  num_victims: 10            # 少量受害者
+  num_resources: 5           # 少量资源
+  num_hospitals: 2           # 少量医院
+  disaster_type: earthquake
+  severity: low
+
+# 算法配置
+algorithms:
+  egt_marl:
+    enabled: true
+    model_path: ""
+  qmix:
+    enabled: true
+    model_path: ""
+  fcfs:
+    enabled: true
+  priority:
+    enabled: true
+  greedy_local:
+    enabled: true
+  proportional_fair:
+    enabled: true

@@ -144,16 +144,24 @@ class BaselineEvaluator:
     
     def setup_environment(self, disaster_type: str, severity: str):
         """设置环境"""
-        # 构建 scenario 字符串，符合 DisasterSim 的预期格式
-        scenario = f"{disaster_type}_{severity}"
+        env_config = self.config['environment']
         
-        # 初始化 DisasterSim 环境
-        self.env = DisasterSim(scenario=scenario)
+        # 初始化 DisasterSim 环境，使用配置文件中的参数
+        self.env = DisasterSim(
+            map_size=tuple(env_config['map_size']),
+            num_agents=env_config['num_agents'],
+            num_victims=env_config['num_victims'],
+            num_resources=env_config['num_resources'],
+            num_hospitals=env_config['num_hospitals'],
+            disaster_type=env_config['disaster_type'],
+            severity=env_config['severity']
+        )
         
         # 为了兼容其他代码，添加必要的属性
         self.env.num_agents = len(self.env.rescue_agents)
+        self.env.num_victims = len(self.env.casualties)
         
-        logger.info(f"Environment initialized: {disaster_type} ({severity})")
+        logger.info(f"Environment initialized: {disaster_type} ({severity}) - Agents: {self.env.num_agents}, Victims: {self.env.num_victims}")
     
     def setup_algorithms(self):
         """设置算法"""
@@ -169,8 +177,50 @@ class BaselineEvaluator:
         
         # 初始化 EGT-MARL
         if algo_config['egt_marl']['enabled']:
+            # 为EGT-MARL创建完整配置
+            egt_config = {
+                'marl': {
+                    'num_agents': num_agents,
+                    'state_dim': state_dim,
+                    'action_dim': action_dim,
+                    'hidden_dim': 64,
+                    'mixing_hidden_dim': 64,
+                    'attention_heads': 4,
+                    'learning_rate': 0.0001,
+                    'epsilon_start': 1.0,
+                    'epsilon_decay': 0.995,
+                    'epsilon_min': 0.01,
+                    'gamma': 0.99,
+                    'tau': 0.005,
+                    'batch_size': 32,
+                    'buffer_size': 10000,
+                    'update_frequency': 4
+                },
+                'egt': {
+                    'fairness_weight': 0.3,
+                    'efficiency_weight': 0.7,
+                    'anti_spoofing_threshold': 0.1,
+                    'num_strategies': 3,
+                    'learning_rate': 0.001,
+                    'mutation_rate': 0.01,
+                    'selection_intensity': 1.0
+                },
+                'anti_spoofing': {
+                    'observation_dim': state_dim,
+                    'detection_threshold': 0.5,
+                    'correction_strength': 0.8
+                },
+                'dynamic_frontier': {
+                    'exploration_weight': 0.3,
+                    'exploitation_weight': 0.7,
+                    'update_interval': 100,
+                    'window_size': 1000
+                }
+            }
+            
             self.algorithms['EGT-MARL'] = EGTMARL(
-                env=self.env
+                env=self.env,
+                config=egt_config
             )
             
             # 加载预训练模型（如果提供）
@@ -248,61 +298,124 @@ class BaselineEvaluator:
     def _load_algorithm_model(self, algorithm_name: str, model_path: str):
         """加载算法模型"""
         try:
-            checkpoint = torch.load(model_path, map_location=self.device)
-            
-            if algorithm_name in self.algorithms:
-                if 'algorithm_state' in checkpoint:
-                    self.algorithms[algorithm_name].load_state_dict(checkpoint['algorithm_state'])
-                    logger.info(f"Loaded model for {algorithm_name} from {model_path}")
-                else:
-                    logger.warning(f"No algorithm state found in {model_path}")
+            if algorithm_name == 'EGT-MARL' and hasattr(self.algorithms[algorithm_name], 'load_checkpoint'):
+                # 使用EGT-MARL的load_checkpoint方法
+                self.algorithms[algorithm_name].load_checkpoint(model_path)
+                logger.info(f"Loaded model for {algorithm_name} from {model_path}")
+            else:
+                # 其他算法的加载逻辑
+                checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
+                
+                if algorithm_name in self.algorithms:
+                    if 'algorithm_state' in checkpoint:
+                        self.algorithms[algorithm_name].load_state_dict(checkpoint['algorithm_state'])
+                        logger.info(f"Loaded model for {algorithm_name} from {model_path}")
+                    else:
+                        logger.warning(f"No algorithm state found in {model_path}")
         except Exception as e:
             logger.error(f"Failed to load model for {algorithm_name}: {e}")
     
     def _create_fcfs_policy(self):
         """创建先到先服务策略"""
         class FCFSPolicy:
-            def __init__(self, num_agents: int):
+            def __init__(self, num_agents: int, env):
                 self.num_agents = num_agents
+                self.env = env
                 self.name = "FCFS"
-            
+                
             def select_actions(self, state, epsilon=0.0):
                 # 简单的FCFS策略：每个智能体选择最近的未处理受害者
                 actions = []
                 for i in range(self.num_agents):
-                    # 随机选择动作（简化实现）
-                    action = np.random.randint(0, 5)  # 假设有5个动作
+                    if hasattr(self.env, 'rescue_agents') and i < len(self.env.rescue_agents):
+                        agent = list(self.env.rescue_agents.values())[i]
+                        nearest_casualty = None
+                        min_distance = float('inf')
+                        
+                        # 找到最近的未处理受害者
+                        for casualty in self.env.casualties.values():
+                            if not casualty.treated:
+                                distance = np.linalg.norm(agent.position - casualty.position)
+                                if distance < min_distance:
+                                    min_distance = distance
+                                    nearest_casualty = casualty
+                        
+                        if nearest_casualty:
+                            # 向受害者移动
+                            direction = nearest_casualty.position - agent.position
+                            if np.linalg.norm(direction) > 0:
+                                direction = direction / np.linalg.norm(direction)
+                                # 转换为8个方向的动作
+                                angle = np.arctan2(direction[1], direction[0])
+                                action = int((angle + np.pi) / (2 * np.pi) * 8) % 8
+                            else:
+                                action = 0  # 停止
+                        else:
+                            action = 0  # 没有受害者，停止
+                    else:
+                        action = 0  # 默认动作
                     actions.append(action)
                 return actions
             
             def get_name(self):
                 return self.name
         
-        return FCFSPolicy(self.env.num_agents)
+        return FCFSPolicy(self.env.num_agents, self.env)
     
     def _create_priority_policy(self):
         """创建优先级调度策略"""
         class PriorityPolicy:
-            def __init__(self, num_agents: int):
+            def __init__(self, num_agents: int, env):
                 self.num_agents = num_agents
+                self.env = env
                 self.name = "Priority"
-            
+                
             def select_actions(self, state, epsilon=0.0):
                 # 优先级策略：优先处理严重受害者
                 actions = []
                 for i in range(self.num_agents):
-                    # 随机选择动作，但偏向严重情况（简化实现）
-                    if np.random.random() < 0.7:  # 70%概率选择救援动作
-                        action = 1  # 救援动作
+                    if hasattr(self.env, 'rescue_agents') and i < len(self.env.rescue_agents):
+                        agent = list(self.env.rescue_agents.values())[i]
+                        priority_casualty = None
+                        highest_priority = -1
+                        
+                        # 找到优先级最高的未处理受害者
+                        for casualty in self.env.casualties.values():
+                            if not casualty.treated:
+                                # 严重程度作为优先级（数字越大越严重）
+                                # 将严重程度字符串转换为数字优先级
+                                severity_to_priority = {
+                                    'critical': 4,
+                                    'severe': 3,
+                                    'moderate': 2,
+                                    'mild': 1
+                                }
+                                priority = severity_to_priority.get(casualty.severity.value, 0)
+                                if priority > highest_priority:
+                                    highest_priority = priority
+                                    priority_casualty = casualty
+                        
+                        if priority_casualty:
+                            # 向受害者移动
+                            direction = priority_casualty.position - agent.position
+                            if np.linalg.norm(direction) > 0:
+                                direction = direction / np.linalg.norm(direction)
+                                # 转换为8个方向的动作
+                                angle = np.arctan2(direction[1], direction[0])
+                                action = int((angle + np.pi) / (2 * np.pi) * 8) % 8
+                            else:
+                                action = 0  # 停止
+                        else:
+                            action = 0  # 没有受害者，停止
                     else:
-                        action = np.random.randint(0, 5)
+                        action = 0  # 默认动作
                     actions.append(action)
                 return actions
             
             def get_name(self):
                 return self.name
         
-        return PriorityPolicy(self.env.num_agents)
+        return PriorityPolicy(self.env.num_agents, self.env)
     def _create_greedy_policy(self):
         """创建局部贪心算法"""
         class GreedyPolicy:
@@ -516,7 +629,7 @@ class BaselineEvaluator:
                 else:
                     state_obs = state
                 # 为每个智能体创建观察值
-                num_agents = len(self.env.rescue_agents) if hasattr(self.env, 'rescue_agents') else 17  # 默认 17 个智能体
+                num_agents = len(self.env.rescue_agents) if hasattr(self.env, 'rescue_agents') else 5  # 默认 5 个智能体
                 observations = [state_obs[i] for i in range(num_agents)]
                 # 调用 act 方法
                 actions, _ = algorithm.act(observations, state_obs, training=False)
@@ -525,7 +638,7 @@ class BaselineEvaluator:
                 for agent_id, action in enumerate(actions):
                     actions_dict[agent_id] = {
                         "strategic": [0.25, 0.25, 0.25, 0.25],
-                        "tactical": action % 8,
+                        "tactical": action % 8,  # 8个方向
                         "communication": action // 8
                     }
                 actions = actions_dict
@@ -555,8 +668,9 @@ class BaselineEvaluator:
             # 收集指标
             episode_metrics['total_reward'] += sum(rewards)
             episode_metrics['steps'] += 1
-            episode_metrics['rescued'] += info.get('rescued', 0)
-            episode_metrics['deaths'] += info.get('deaths', 0)
+            # 直接记录当前救援人数（最后会取最终值），不累加
+            episode_metrics['rescued'] = info.get('rescued', 0)
+            episode_metrics['deaths'] = info.get('deaths', 0)
             episode_metrics['resources_used'] += info.get('resources_used', 0)
             
             if 'response_time' in info:
@@ -569,8 +683,8 @@ class BaselineEvaluator:
             step += 1
         
         # 计算衍生指标
-        # 使用 casualties 字典的长度作为受害者数量
-        total_victims = len(self.env.casualties) if hasattr(self.env, 'casualties') else 0
+        # 使用初始受害者数量（从环境的num_victims属性获取，已在setup_environment中设置）
+        total_victims = getattr(self.env, 'num_victims', 0) or len(self.env.casualties) if hasattr(self.env, 'casualties') else 0
         if total_victims > 0:
             episode_metrics['rescue_rate'] = (episode_metrics['rescued'] / total_victims) * 100
         

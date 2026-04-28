@@ -1,0 +1,60 @@
+# 大规模评估配置 - 扩展性测试
+
+output_dir: evaluation_results
+
+# 评估配置
+evaluation:
+  num_episodes: 100          # 完整数量episode
+  max_steps_per_episode: 600 # 更多步数
+  num_runs: 5                # 5轮运行取平均
+  scenarios:
+    - earthquake
+    - flood
+    - hurricane
+  severities:
+    - low
+    - medium
+    - high
+
+# 环境配置 - 超大规模场景
+environment:
+  map_size: [4500, 4500]     # 超大规模地图
+  num_agents: 100            # 大量智能体
+  num_victims: 1000          # 大量受害者
+  num_resources: 48          # 大量资源
+  num_hospitals: 16          # 大量医院
+  disaster_type: earthquake
+  severity: medium
+
+# 算法配置
+algorithms:
+  egt_marl:
+    enabled: true
+    model_path: "E:/studio/workspace/egt-marl-emergency-response/src/experiment_results/egt_marl_20260427_152624/models/best_model.pt"
+  qmix:
+    enabled: true
+    model_path: ""
+    hidden_dim: 128
+    mixing_hidden_dim: 64
+    learning_rate: 0.0001
+  maddpg:
+    enabled: true
+    model_path: ""
+    hidden_dim: 128
+    learning_rate: 0.0001
+  fcfs:
+    enabled: true
+  priority:
+    enabled: true
+  greedy_local:
+    enabled: true
+  proportional_fair:
+    enabled: true
+  centralized_mpc:
+    enabled: true
+  game_theoretic:
+    enabled: true
+  gnn_based:
+    enabled: true
+  transformer_based:
+    enabled: true
