@@ -28,7 +28,7 @@ class EGTMARL:
     2. Macro-layer (EGT): Dynamic fairness-efficiency trade-off regulation
     """
     
-    def __init__(self, state_dim: int = 22, action_dim: int = 5, num_agents: int = 3, 
+    def __init__(self, state_dim: int = 22, action_dim: int = 32, num_agents: int = 3, 
                  hidden_dim: int = 64, device: Optional[torch.device] = None, 
                  env=None, config_path: Optional[str] = None, config: Optional[Dict] = None):
         self.state_dim = state_dim
@@ -62,11 +62,16 @@ class EGTMARL:
             with open(config_path, 'r') as f:
                 self.config = yaml.safe_load(f)
         
-        # Update configuration with provided parameters
-        self.config['marl']['state_dim'] = state_dim
-        self.config['marl']['action_dim'] = action_dim
-        self.config['marl']['num_agents'] = num_agents
-        self.config['marl']['hidden_dim'] = hidden_dim
+        # Update configuration with provided parameters (only if not already set)
+        if 'state_dim' not in self.config['marl'] or state_dim != 22:
+            self.config['marl']['state_dim'] = state_dim
+        # Action space: 8 tactical (movement) * 4 communication = 32 possible actions
+        if 'action_dim' not in self.config['marl'] or action_dim != 32:
+            self.config['marl']['action_dim'] = action_dim
+        if 'num_agents' not in self.config['marl'] or num_agents != 3:
+            self.config['marl']['num_agents'] = num_agents
+        if 'hidden_dim' not in self.config['marl'] or hidden_dim != 64:
+            self.config['marl']['hidden_dim'] = hidden_dim
         
         # Get actual state dimension and num_agents from environment if provided
         if env is not None:
@@ -98,8 +103,8 @@ class EGTMARL:
         
         # Replay buffer for testing
         self.replay_buffer = []
-        self.batch_size = 32
-        self.buffer_size = 10000  # Default buffer size
+        self.batch_size = self.config['marl'].get('batch_size', 32)
+        self.buffer_size = self.config['marl'].get('buffer_size', 10000)
     
     def _initialize_components(self) -> None:
         """Initialize all algorithm components."""
@@ -132,11 +137,15 @@ class EGTMARL:
             config=self.config['dynamic_frontier']
         )
         
-        # Optimizers
+        # Optimizers - Note: marl_layer uses its own hardcoded optimizer internally,
+        # so we need to replace it with our configured optimizer
         self.marl_optimizer = optim.Adam(
             self.marl_layer.parameters(),
             lr=self.config['marl']['learning_rate']
         )
+        # Replace marl_layer's hardcoded optimizer with our configured one
+        self.marl_layer.optimizer = self.marl_optimizer
+        
         self.egt_optimizer = optim.Adam(
             self.egt_layer.parameters(),
             lr=self.config['egt']['learning_rate']
@@ -156,13 +165,14 @@ class EGTMARL:
         
         return payoff_matrix.to(self.device)
     
-    def select_action(self, state, training: bool = True) -> Dict[int, Dict[str, Any]]:
+    def select_action(self, state, training: bool = True, epsilon: float = None) -> Dict[int, Dict[str, Any]]:
         """
         Select actions for all agents.
         
         Args:
             state: Current environment state
             training: Whether in training mode
+            epsilon: Exploration rate (if None, use MARL layer's internal epsilon)
             
         Returns:
             Dictionary of actions for each agent
@@ -181,8 +191,9 @@ class EGTMARL:
         
         # Get MARL actions (micro-level decisions)
         # Use deterministic actions when not training
+        # Pass epsilon explicitly to ensure training parameter is used
         try:
-            marl_actions = self.marl_layer.select_actions(state_tensor, deterministic=not training)
+            marl_actions = self.marl_layer.select_actions(state_tensor, deterministic=not training, epsilon=epsilon)
         except Exception:
             # Fallback to random actions if marl_layer fails
             marl_actions = torch.randint(0, self.config['marl']['action_dim'], 
@@ -201,10 +212,24 @@ class EGTMARL:
                 action_idx = 0
             
             # Convert action index to hierarchical action format expected by DisasterSim
+            # Action space: 8 tactical (movement) * 4 communication = 32 possible actions
+            # For backward compatibility with action_dim=5, we map 0-4 to valid actions
+            num_tactical = 8
+            num_communication = 4
+            
+            # Proper mapping for action_dim=32 (8*4)
+            if self.config['marl']['action_dim'] >= 32:
+                tactical_action = action_idx % num_tactical
+                communication_action = action_idx // num_tactical
+            else:
+                # For smaller action spaces, map to valid ranges
+                tactical_action = action_idx % num_tactical
+                communication_action = min(action_idx // num_tactical, num_communication - 1)
+            
             actions_dict[agent_id] = {
                 "strategic": [0.25, 0.25, 0.25, 0.25],  # Example: equal resource allocation
-                "tactical": action_idx % 8,  # Movement direction (0-7)
-                "communication": action_idx // 8  # Communication action (0-1)
+                "tactical": tactical_action,  # Movement direction (0-7)
+                "communication": communication_action  # Communication action (0-3)
             }
         
         return actions_dict
@@ -275,8 +300,7 @@ class EGTMARL:
         self.replay_buffer.append(experience)
         
         # Limit buffer size
-        max_buffer_size = 10000
-        if len(self.replay_buffer) > max_buffer_size:
+        if len(self.replay_buffer) > self.buffer_size:
             self.replay_buffer.pop(0)
     
     def update_parameters(self):
@@ -684,6 +708,7 @@ class EGTMARL:
             'total_steps': self.total_steps,
             'best_reward': self.best_reward,
             'marl_layer_state': self.marl_layer.state_dict(),
+            'marl_layer_epsilon': self.marl_layer.epsilon,
             'egt_layer_state': self.egt_layer.state_dict(),
             'anti_spoofing_state': anti_spoofing_state,
             'dynamic_frontier_state': dynamic_frontier_state,
@@ -692,7 +717,7 @@ class EGTMARL:
             'metrics_history': self.metrics_history,
             'config': self.config
         }
-        
+
         torch.save(checkpoint, path)
         print(f"Checkpoint saved to {path}")
     
@@ -706,7 +731,12 @@ class EGTMARL:
         
         self.marl_layer.load_state_dict(checkpoint['marl_layer_state'])
         self.egt_layer.load_state_dict(checkpoint['egt_layer_state'])
-        
+
+        if 'marl_layer_epsilon' in checkpoint:
+            self.marl_layer.epsilon = checkpoint['marl_layer_epsilon']
+        elif 'epsilon' in checkpoint.get('marl_layer_state', {}):
+            self.marl_layer.epsilon = checkpoint['marl_layer_state']['epsilon']
+
         # 加载 AntiSpoofing 中各个网络的状态
         if 'anti_spoofing_state' in checkpoint:
             anti_spoofing_state = checkpoint['anti_spoofing_state']

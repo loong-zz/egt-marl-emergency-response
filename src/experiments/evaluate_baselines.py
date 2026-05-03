@@ -177,15 +177,15 @@ class BaselineEvaluator:
         
         # 初始化 EGT-MARL
         if algo_config['egt_marl']['enabled']:
-            # 为EGT-MARL创建完整配置
+            # 为EGT-MARL创建完整配置 - 使用与训练相同的参数（从checkpoint推断）
             egt_config = {
                 'marl': {
                     'num_agents': num_agents,
                     'state_dim': state_dim,
                     'action_dim': action_dim,
-                    'hidden_dim': 64,
-                    'mixing_hidden_dim': 64,
-                    'attention_heads': 4,
+                    'hidden_dim': 64,       # 与训练一致（从checkpoint推断）
+                    'mixing_hidden_dim': 64, # 与训练一致（从checkpoint推断）
+                    'attention_heads': 4,    # 与训练一致（从checkpoint推断）
                     'learning_rate': 0.0001,
                     'epsilon_start': 1.0,
                     'epsilon_decay': 0.995,
@@ -200,21 +200,36 @@ class BaselineEvaluator:
                     'fairness_weight': 0.3,
                     'efficiency_weight': 0.7,
                     'anti_spoofing_threshold': 0.1,
-                    'num_strategies': 3,
+                    'num_strategies': 5,  # 与训练一致
                     'learning_rate': 0.001,
                     'mutation_rate': 0.01,
-                    'selection_intensity': 1.0
+                    'selection_intensity': 1.0,
+                    'egt_lambda': 0.5
                 },
                 'anti_spoofing': {
-                    'observation_dim': state_dim,
-                    'detection_threshold': 0.5,
-                    'correction_strength': 0.8
+                    'observation_dim': 128,  # 与训练一致（注意：这是内部观察维度，不是环境state_dim）
+                    'hidden_dim': 64,         # 与训练一致
+                    'detection_threshold': 0.8,  # 与训练一致
+                    'prior_belief': 0.5,
+                    'evidence_strength': 0.7,
+                    'reputation_decay': 0.99,
+                    'min_reputation': 0.1,
+                    'max_reputation': 1.0,
+                    'reputation_weight': 0.3,
+                    'false_report_penalty': -0.5,
+                    'malicious_action_penalty': -1.0,
+                    'detection_reward': 0.2
                 },
                 'dynamic_frontier': {
-                    'exploration_weight': 0.3,
-                    'exploitation_weight': 0.7,
-                    'update_interval': 100,
-                    'window_size': 1000
+                    'num_objectives': 3,           # 与训练一致
+                    'frontier_size': 50,           # 与训练一致
+                    'update_frequency': 100,        # 与训练一致
+                    'weight_adaptation_rate': 0.05,  # 与训练一致
+                    'min_weight': 0.1,             # 与训练一致
+                    'max_weight': 0.8,             # 与训练一致
+                    'mutation_strength': 0.1,       # 与训练一致
+                    'crossover_rate': 0.7,         # 与训练一致
+                    'elitism_rate': 0.1            # 与训练一致
                 }
             }
             
@@ -313,7 +328,9 @@ class BaselineEvaluator:
                     else:
                         logger.warning(f"No algorithm state found in {model_path}")
         except Exception as e:
+            import traceback
             logger.error(f"Failed to load model for {algorithm_name}: {e}")
+            logger.error(f"Full traceback:\n{traceback.format_exc()}")
     
     def _create_fcfs_policy(self):
         """创建先到先服务策略"""

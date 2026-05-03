@@ -10,12 +10,14 @@ This module implements the main simulation environment with:
 """
 
 import numpy as np
+import logging
 from typing import Dict, List, Tuple, Any, Optional
 from dataclasses import dataclass
 import networkx as nx
 from scipy.spatial.distance import cdist
 from gymnasium import spaces
 from enum import Enum
+logger = logging.getLogger(__name__)
 
 
 class CasualtySeverity(Enum):
@@ -42,31 +44,46 @@ class Casualty:
     severity: CasualtySeverity
     injury_time: float
     resources_needed: Dict[ResourceType, float]
-    
+
     treated: bool = False
     treatment_start: Optional[float] = None
+    treating_agent_id: Optional[int] = None
+    grace_period_end: Optional[float] = None
     survival_probability: float = 1.0
-    
+    _last_update_time: float = 0.0
+
     def update_survival_probability(self, current_time: float) -> None:
-        """Update survival probability based on time since injury."""
-        time_elapsed = current_time - self.injury_time
+        """Update survival probability based on time since injury or treatment.
         
-        # Survival probability decreases over time based on severity
-        severity_factor = {
-            CasualtySeverity.CRITICAL: 0.006,  # 0.6% per second (166 seconds = 2.7 minutes)
-            CasualtySeverity.SEVERE: 0.002,    # 0.2% per second (500 seconds = 8.3 minutes)
-            CasualtySeverity.MODERATE: 0.001,  # 0.1% per second (1000 seconds = 16.7 minutes)
-            CasualtySeverity.MILD: 0.0002      # 0.02% per second (5000 seconds = 83.3 minutes)
-        }[self.severity]
-        
-        self.survival_probability = max(
-            0.0,
-            self.survival_probability - severity_factor * time_elapsed
-        )
-    
+        If treated: survival probability INCREASES towards 1.0 (recovery)
+        If not treated: survival probability DECREASES over time (deterioration)
+        """
+        time_delta = current_time - self._last_update_time
+        if time_delta <= 0:
+            return
+            
+        if self.treated and self.treatment_start is not None:
+            treatment_duration = current_time - self.treatment_start
+            recovery_rate = {
+                CasualtySeverity.CRITICAL: 0.030,
+                CasualtySeverity.SEVERE: 0.040,
+                CasualtySeverity.MODERATE: 0.050,
+                CasualtySeverity.MILD: 0.080
+            }[self.severity]
+            self.survival_probability = min(1.0, self.survival_probability + recovery_rate * time_delta)
+        else:
+            deterioration_rate = {
+                CasualtySeverity.CRITICAL: 0.0025,
+                CasualtySeverity.SEVERE: 0.0015,
+                CasualtySeverity.MODERATE: 0.0008,
+                CasualtySeverity.MILD: 0.0004
+            }[self.severity]
+            self.survival_probability = max(0.0, self.survival_probability - deterioration_rate * time_delta)
+            
+        self._last_update_time = current_time
+
     def is_alive(self, current_time: float) -> bool:
         """Check if casualty is still alive."""
-        self.update_survival_probability(current_time)
         return self.survival_probability > 0.0
 
 
@@ -118,16 +135,12 @@ class RescueAgent:
         self.current_mission = None
         self.connected_agents = []
         self.map_size = map_size
-        self.route = []  # 初始化route属性
+        self.route = []
+        self.known_casualties = {}
     
     def get_max_speed(self) -> float:
-        """Get maximum speed of the agent."""
-        # 根据地图大小调整最大速度，确保智能体能够在合理时间内覆盖地图
-        # 假设地图大小在100-10000之间，速度在5-10米/秒（18-36公里/小时），符合真实救援人员移动速度
-        if self.map_size is not None:
-            map_size_value = self.map_size[0] if isinstance(self.map_size, (tuple, list)) else self.map_size
-            return max(5.0, min(10.0, map_size_value * 0.001))  # 调整为更合理的速度
-        return 5.0  # Default speed
+        """Get maximum speed of the agent in m/s."""
+        return 8.0
     
     def move(self, time_step: float) -> None:
         """Move the agent based on velocity."""
@@ -170,6 +183,7 @@ class DisasterSim:
         # Components
         self.affected_areas: Dict[int, AffectedArea] = {}
         self.resource_depots: Dict[int, ResourceDepot] = {}
+        self.initial_resources: Dict[int, Dict[ResourceType, float]] = {}
         self.rescue_agents: Dict[int, RescueAgent] = {}
         self.casualties: Dict[int, Casualty] = {}
         self.road_network = nx.Graph()
@@ -188,24 +202,22 @@ class DisasterSim:
     
     def _initialize_affected_areas(self) -> None:
         """Initialize affected areas based on scenario."""
-        # Simple earthquake scenario for demonstration
         self.affected_areas = {}
-        
-        # Create 5 affected areas in a circular pattern
-        for i in range(5):
-            angle = 2 * np.pi * i / 5
-            # 使用地图大小的1/4作为半径，确保在地图范围内
-            radius = self.map_size[0] * 0.25 if isinstance(self.map_size, (tuple, list)) else self.map_size * 0.25
+
+        num_areas = max(3, self.num_hospitals)
+        for i in range(num_areas):
+            angle = 2 * np.pi * i / num_areas
+            radius = self.map_size[0] * 0.15 if isinstance(self.map_size, (tuple, list)) else self.map_size * 0.15
             map_size = self.map_size[0] if isinstance(self.map_size, (tuple, list)) else self.map_size
             position = np.array([
                 map_size / 2 + radius * np.cos(angle),
                 map_size / 2 + radius * np.sin(angle)
             ])
-            
+
             area = AffectedArea(
                 id=i,
                 position=position,
-                size=self.map_size[0] * 0.1 if isinstance(self.map_size, (tuple, list)) else self.map_size * 0.1,
+                size=self.map_size[0] * 0.35 if isinstance(self.map_size, (tuple, list)) else self.map_size * 0.35,
                 population=1000 + i * 200,
                 building_damage=0.3 + i * 0.1,
                 road_accessibility=0.8 - i * 0.1
@@ -215,6 +227,7 @@ class DisasterSim:
     def _initialize_resource_depots(self) -> None:
         """Initialize resource depots."""
         self.resource_depots = {}
+        self.initial_resources = {}
         
         # Create 2 resource depots，位置在地图范围内
         map_size = self.map_size[0] if isinstance(self.map_size, (tuple, list)) else self.map_size
@@ -234,9 +247,10 @@ class DisasterSim:
             depot = ResourceDepot(
                 id=i,
                 position=position,
-                resources=resources
+                resources=resources.copy()
             )
             self.resource_depots[i] = depot
+            self.initial_resources[i] = resources.copy()
     
     def _initialize_rescue_agents(self) -> None:
         """Initialize rescue agents."""
@@ -428,11 +442,22 @@ class DisasterSim:
         # Reset statistics
         self.statistics = {
             "total_survivors": 0,
+            "total_deaths": 0,
             "total_casualties": len(self.casualties),
+            "total_treated": 0,
+            "total_rescued": 0,
             "resource_utilization": {rt: 0.0 for rt in ResourceType},
             "response_times": [],
             "fairness_metrics": {"gini": [], "theil": [], "max_min": []},
         }
+
+        self._last_currently_treating = 0
+        self._last_min_survival = 1.0
+        self._last_max_survival = 1.0
+        
+        # Reset reward state tracking
+        self._last_survivors = 0
+        self._last_casualties = len(self.casualties)
         
         # Get initial observation and info
         observation = self._get_observation()
@@ -467,6 +492,19 @@ class DisasterSim:
         
         # Update communication network
         self._update_communication()
+
+        if self.step_count % 50 == 0:
+            total_initial_resources = sum(sum(r.values()) for r in self.initial_resources.values())
+            total_current_resources = sum(sum(d.resources.values()) for d in self.resource_depots.values())
+            total_agent_resources = sum(sum(a.capacity.values()) for a in self.rescue_agents.values())
+            resource_consumed = total_initial_resources - total_current_resources - total_agent_resources
+
+            num_agents = len(self.rescue_agents)
+            num_connected = sum(len(a.connected_agents) for a in self.rescue_agents.values())
+            max_possible_connections = num_agents * (num_agents - 1) if num_agents > 1 else 1
+            comm_coverage = (num_connected / max_possible_connections * 100) if max_possible_connections > 0 else 0
+
+            logger.info(f"[STEP {self.step_count}] Alive: {len(self.casualties)} | Treating: {self._last_currently_treating} | Rescued: {self.statistics.get('total_rescued', 0)} | Deaths: {self.statistics.get('total_deaths', 0)} | Treated: {self.statistics.get('total_treated', 0)} | Survival: [{self._last_min_survival:.4f}, {self._last_max_survival:.4f}] | Resources: {total_current_resources:.1f}/{total_initial_resources:.1f} ({resource_consumed:.1f}) | Comm: {num_connected}/{max_possible_connections} ({comm_coverage:.1f}%) | CommStatus: {self.communication_status:.2f}")
         
         # Apply secondary disasters
         if np.random.rand() < self._get_secondary_disaster_probability():
@@ -495,8 +533,16 @@ class DisasterSim:
         
         # Add required info fields for compatibility
         info['rescued'] = self.statistics.get('total_survivors', 0)
-        info['deaths'] = self.statistics.get('total_casualties', 0) - len(self.casualties)
-        info['resources_used'] = sum(self.statistics.get('resource_utilization', {}).values())
+        info['deaths'] = self.statistics.get('total_deaths', 0)
+        
+        # Calculate actual resources used
+        total_used = 0.0
+        for depot_id, depot in self.resource_depots.items():
+            initial_depot = self.initial_resources[depot_id]
+            for rt in ResourceType:
+                used = initial_depot[rt] - max(0.0, depot.resources.get(rt, 0.0))
+                total_used += max(0.0, used)
+        info['resources_used'] = total_used
         
         # Calculate and add response time (time steps per rescue)
         survivors = self.statistics.get('total_survivors', 0)
@@ -510,7 +556,20 @@ class DisasterSim:
     def _apply_action(self, agent_id: int, action: Dict[str, Any]) -> None:
         """Apply action to a specific agent."""
         agent = self.rescue_agents[agent_id]
-        
+
+        mission = getattr(agent, 'current_mission', None)
+        is_treating = False
+        if mission and mission.startswith("treat_casualty_"):
+            casualty_id_str = mission.replace("treat_casualty_", "")
+            try:
+                casualty_id = int(casualty_id_str)
+                if casualty_id in self.casualties:
+                    casualty = self.casualties[casualty_id]
+                    if casualty.treated and casualty.treatment_start is not None:
+                        is_treating = True
+            except ValueError:
+                pass
+
         # Strategic action: resource allocation
         if "strategic" in action:
             allocation = action["strategic"]
@@ -531,58 +590,65 @@ class DisasterSim:
         
         # Tactical action: movement
         if "tactical" in action:
-            if agent.current_mission and agent.current_mission.startswith("treat_casualty_"):
-                casualty_id = int(agent.current_mission.split("_")[-1])
-                if casualty_id in self.casualties:
-                    casualty = self.casualties[casualty_id]
-                    distance = np.linalg.norm(agent.position - casualty.position)
-                    treatment_distance_threshold = 15.0
+            direction_idx = action["tactical"]
+            angles = np.linspace(0, 2*np.pi, 8, endpoint=False)
+            direction = np.array([np.cos(angles[direction_idx]), np.sin(angles[direction_idx])])
 
-                    if distance <= treatment_distance_threshold and casualty.treated:
-                        agent.route = []
-                    elif distance > treatment_distance_threshold:
-                        direction = casualty.position - agent.position
-                        if np.linalg.norm(direction) > 0:
-                            direction = direction / np.linalg.norm(direction)
-                            max_speed = agent.get_max_speed()
-                            target_distance = min(max_speed * self.time_step, distance)
-                            target_position = agent.position + direction * target_distance
-                            target_position = np.clip(target_position, 0, self.map_size)
-                            agent.route = [target_position]
-            else:
-                direction_idx = action["tactical"]
-                angles = np.linspace(0, 2*np.pi, 8, endpoint=False)
-                direction = np.array([np.cos(angles[direction_idx]), np.sin(angles[direction_idx])])
+            max_speed = agent.get_max_speed()
+            target_distance = max_speed * self.time_step
+            target_position = agent.position + direction * target_distance
+            target_position = np.clip(target_position, 0, self.map_size)
+            agent.route = [target_position]
 
-                max_speed = agent.get_max_speed()
-                target_distance = max_speed * self.time_step
-                target_position = agent.position + direction * target_distance
-                target_position = np.clip(target_position, 0, self.map_size)
-                agent.route = [target_position]
-        
-        # Communication action: information sharing
         if "communication" in action:
             comm_action = action["communication"]
-            # Implement communication strategy
-            pass  # Implementation depends on communication protocol
-        
-        # Move agent
-        if hasattr(agent, 'route') and agent.route:
-            # Move towards the first waypoint in the route
-            target_position = agent.route[0]
-            direction = target_position - agent.position
-            distance = np.linalg.norm(direction)
-            if distance > 0:
-                direction = direction / distance
-                max_speed = agent.get_max_speed()
-                move_distance = min(max_speed * self.time_step, distance)
-                agent.position += direction * move_distance
-                
-                # Remove the waypoint if we've reached it
-                if np.linalg.norm(agent.position - target_position) < 1.0:
-                    agent.route.pop(0)
         else:
-            agent.move(self.time_step)
+            comm_action = 0
+
+        if agent.connected_agents:
+            for other_agent_id in agent.connected_agents:
+                other_agent = self.rescue_agents[other_agent_id]
+                for casualty_id, info in agent.known_casualties.items():
+                    if casualty_id not in other_agent.known_casualties:
+                        other_agent.known_casualties[casualty_id] = info.copy()
+
+        moved_towards_target = False
+        if is_treating:
+            pass
+        elif agent.known_casualties:
+            untreated = [(cid, info) for cid, info in agent.known_casualties.items()
+                       if cid in self.casualties and not self.casualties[cid].treated]
+            if untreated:
+                target_cid, target_info = min(untreated, key=lambda x: x[1]['distance'])
+                target_position = target_info['position']
+                direction = target_position - agent.position
+                distance = np.linalg.norm(direction)
+                if distance > 1.0:
+                    direction = direction / distance
+                    max_speed = agent.get_max_speed()
+                    agent.position += direction * max_speed * self.time_step
+                    agent.position = np.clip(agent.position, 0, self.map_size)
+                    moved_towards_target = True
+
+        if not moved_towards_target and not is_treating:
+            if hasattr(agent, 'route') and agent.route:
+                target_position = agent.route[0]
+                direction = target_position - agent.position
+                distance = np.linalg.norm(direction)
+                if distance > 0:
+                    direction = direction / distance
+                    max_speed = agent.get_max_speed()
+                    move_distance = min(max_speed * self.time_step, distance)
+                    agent.position += direction * move_distance
+                    if np.linalg.norm(agent.position - target_position) < 1.0:
+                        agent.route.pop(0)
+            else:
+                angles = np.linspace(0, 2*np.pi, 8, endpoint=False)
+                direction_idx = np.random.randint(0, 8)
+                direction = np.array([np.cos(angles[direction_idx]), np.sin(angles[direction_idx])])
+                max_speed = agent.get_max_speed()
+                agent.position += direction * max_speed * self.time_step
+                agent.position = np.clip(agent.position, 0, self.map_size)
     
     def _update_dynamics(self) -> None:
         """Update dynamic factors in the environment."""
@@ -617,118 +683,255 @@ class DisasterSim:
             # If not at depot, endurance decreases normally
             if not at_depot:
                 agent.endurance = max(agent.endurance - self.time_step, 0.0)
-    
+
+    def _can_treat_casualty(self, agent: 'RescueAgent', casualty: 'Casualty') -> bool:
+        """Check if agent has sufficient resources to treat casualty."""
+        if not hasattr(casualty, 'resources_needed') or not casualty.resources_needed:
+            return True
+
+        for resource_type, amount_needed in casualty.resources_needed.items():
+            if agent.capacity.get(resource_type, 0.0) < amount_needed * 0.5:
+                return False
+        return True
+
+    def _get_treatment_priority(self, casualty: 'Casualty', agent_distance: float) -> float:
+        """
+        Calculate treatment priority for a casualty.
+        Higher priority = more urgent.
+
+        Priority factors:
+        - Survival probability: lower = more urgent (higher priority)
+        - Severity: higher severity = higher priority
+        - Distance: closer = higher priority (less travel time)
+
+        Formula based on paper principle: efficiency first (utilitarian),
+        save those with higher survival probability first (less resource investment).
+        """
+        alpha, beta, gamma = 0.5, 0.3, 0.2
+
+        severity_weight = {
+            CasualtySeverity.CRITICAL: 4,
+            CasualtySeverity.SEVERE: 3,
+            CasualtySeverity.MODERATE: 2,
+            CasualtySeverity.MILD: 1
+        }[casualty.severity]
+
+        priority = (
+            alpha * (1 - casualty.survival_probability) +
+            beta * severity_weight / 4 +
+            gamma * (1 - agent_distance / 15.0)
+        )
+        return priority
+
+    def _consume_resources_for_treatment(self, agent: 'RescueAgent', casualty: 'Casualty') -> None:
+        """Consume resources from agent when treating casualty."""
+        if not hasattr(casualty, 'resources_needed') or not casualty.resources_needed:
+            return
+
+        consumption_rate = {
+            CasualtySeverity.CRITICAL: 0.15,
+            CasualtySeverity.SEVERE: 0.10,
+            CasualtySeverity.MODERATE: 0.06,
+            CasualtySeverity.MILD: 0.03
+        }[casualty.severity]
+
+        for resource_type, amount_needed in casualty.resources_needed.items():
+            consumption = amount_needed * consumption_rate * self.time_step
+            agent.capacity[resource_type] = max(0.0, agent.capacity.get(resource_type, 0.0) - consumption)
+
     def _update_casualties(self) -> None:
-        """Update casualty states and check for deaths."""
+        """Update casualty states and check for deaths.
+
+        Rules:
+        1. Only the nearest agent within 15m can treat a casualty
+        2. Agent must have sufficient medical resources to treat
+        3. Treatment takes time (severity-dependent) and resources are consumed
+        4. Casualty can only be rescued if survival_probability >= 0.8 after treatment time
+        """
         casualties_to_remove = []
 
-        for agent in self.rescue_agents.values():
-            if agent.current_mission and agent.current_mission.startswith("treat_casualty_"):
-                casualty_id = int(agent.current_mission.split("_")[-1])
-                if casualty_id in self.casualties:
+        agent_ids = list(self.rescue_agents.keys())
+        casualty_ids = list(self.casualties.keys())
+
+        currently_treating = 0
+        min_survival = 1.0
+        max_survival = 0.0
+
+        if len(agent_ids) > 0 and len(casualty_ids) > 0:
+            agent_positions = np.array([self.rescue_agents[aid].position for aid in agent_ids])
+            casualty_positions = np.array([self.casualties[cid].position for cid in casualty_ids])
+
+            distances = np.sqrt(np.sum((agent_positions[:, np.newaxis, :] - casualty_positions[np.newaxis, :, :]) ** 2, axis=2))
+
+            treatment_distance_threshold = 100.0
+            close_matrix = distances <= treatment_distance_threshold
+
+            for i, agent_id in enumerate(agent_ids):
+                agent = self.rescue_agents[agent_id]
+                nearby_casualty_ids = np.where(close_matrix[i, :])[0]
+                for j in nearby_casualty_ids:
+                    casualty_id = casualty_ids[j]
                     casualty = self.casualties[casualty_id]
-                    distance = np.linalg.norm(agent.position - casualty.position)
-                    treatment_distance_threshold = 15.0
-
-                    if distance <= treatment_distance_threshold:
-                        if not casualty.treated:
-                            casualty.treated = True
-                            casualty.treatment_start = self.current_time
-                            print(f"Agent {agent.id} arrived at casualty {casualty_id}, starting treatment")
+                    if casualty_id not in agent.known_casualties:
+                        agent.known_casualties[casualty_id] = {
+                            'position': casualty.position.copy(),
+                            'severity': casualty.severity,
+                            'survival_probability': casualty.survival_probability,
+                            'distance': distances[i, j],
+                            'treated': casualty.treated
+                        }
                     else:
-                        if casualty.treated:
-                            casualty.treated = False
-                            casualty.treatment_start = None
-            else:
-                nearest_casualty = None
-                min_distance = float('inf')
+                        agent.known_casualties[casualty_id]['distance'] = distances[i, j]
+                        agent.known_casualties[casualty_id]['treated'] = casualty.treated
+                        agent.known_casualties[casualty_id]['survival_probability'] = casualty.survival_probability
 
-                for casualty_id, casualty in self.casualties.items():
-                    if casualty.treated:
-                        continue
-                    distance = np.linalg.norm(agent.position - casualty.position)
-                    map_dimension = self.map_size[0] if isinstance(self.map_size, (tuple, list)) else self.map_size
-                    detection_range = max(100.0, map_dimension * 0.15)
-                    if distance < detection_range and distance < min_distance:
-                        nearest_casualty = casualty
-                        min_distance = distance
+            occupied_agents = set()
+            for agent_id, agent in self.rescue_agents.items():
+                mission = getattr(agent, 'current_mission', None)
+                if mission and mission.startswith("treat_casualty_"):
+                    occupied_agents.add(agent_id)
 
-                if nearest_casualty:
-                    agent.current_mission = f"treat_casualty_{nearest_casualty.id}"
-                    print(f"Agent {agent.id} assigned to casualty {nearest_casualty.id}")
-        
+            candidates = []
+            for j, casualty_id in enumerate(casualty_ids):
+                casualty = self.casualties[casualty_id]
+
+                if not casualty.treated:
+                    close_agents = np.where(close_matrix[:, j])[0]
+
+                    available_agents = [a for a in close_agents if agent_ids[a] not in occupied_agents]
+
+                    if len(available_agents) > 0:
+                        close_distances = distances[available_agents, j]
+                        nearest_agent_idx = available_agents[np.argmin(close_distances)]
+                        nearest_agent_id = agent_ids[nearest_agent_idx]
+                        nearest_agent = self.rescue_agents[nearest_agent_id]
+                        nearest_distance = distances[nearest_agent_idx, j]
+
+                        if self._can_treat_casualty(nearest_agent, casualty):
+                            priority = self._get_treatment_priority(casualty, nearest_distance)
+                            candidates.append((priority, casualty_id, nearest_agent_id, nearest_distance))
+                            occupied_agents.add(nearest_agent_id)
+
+            candidates.sort(key=lambda x: x[0], reverse=True)
+
+            for priority, casualty_id, nearest_agent_id, nearest_distance in candidates:
+                casualty = self.casualties[casualty_id]
+                nearest_agent = self.rescue_agents[nearest_agent_id]
+
+                if self._can_treat_casualty(nearest_agent, casualty):
+                    casualty.treated = True
+                    if casualty.treatment_start is None:
+                        casualty.treatment_start = self.current_time
+                        casualty.treating_agent_id = nearest_agent_id
+                        self.statistics["total_treated"] = self.statistics.get("total_treated", 0) + 1
+                        nearest_agent.current_mission = f"treat_casualty_{casualty_id}"
+                else:
+                    if self.step_count % 50 == 0:
+                        logger.debug(f"[TREATMENT BLOCKED] Agent {nearest_agent_id} lacks resources for casualty {casualty_id}")
+
         for casualty_id, casualty in self.casualties.items():
-            # Update survival probability
             casualty.update_survival_probability(self.current_time)
-            
-            # Check if casualty dies
+            min_survival = min(min_survival, casualty.survival_probability)
+            max_survival = max(max_survival, casualty.survival_probability)
+
+            if casualty.treated and casualty.treatment_start is not None:
+                currently_treating += 1
+
+                treating_agent_id = getattr(casualty, 'treating_agent_id', None)
+                if treating_agent_id is not None and treating_agent_id in self.rescue_agents:
+                    treating_agent = self.rescue_agents[treating_agent_id]
+                    consumption_rate = {
+                        CasualtySeverity.CRITICAL: 0.15,
+                        CasualtySeverity.SEVERE: 0.10,
+                        CasualtySeverity.MODERATE: 0.06,
+                        CasualtySeverity.MILD: 0.03
+                    }[casualty.severity]
+
+                    for resource_type, amount_needed in casualty.resources_needed.items():
+                        consumption = amount_needed * consumption_rate * self.time_step
+                        treating_agent.capacity[resource_type] = max(0.0, treating_agent.capacity.get(resource_type, 0.0) - consumption)
+
             if not casualty.is_alive(self.current_time):
                 casualties_to_remove.append(casualty_id)
-                # 移除相关的救援任务
+                self.statistics["total_deaths"] = self.statistics.get("total_deaths", 0) + 1
+
+                was_being_treated = casualty.treated and casualty.treatment_start is not None
+                treatment_duration = self.current_time - casualty.treatment_start if casualty.treatment_start else 0
+
+                if was_being_treated:
+                    logger.warning(f"[DEATH DURING TREATMENT] ID={casualty_id}, Severity={casualty.severity.name}, Survival={casualty.survival_probability:.4f}, TreatedFor={treatment_duration:.1f}s, Time={self.current_time}")
+                else:
+                    logger.info(f"[CASUALTY DEATH] ID={casualty_id}, Severity={casualty.severity.name}, Survival={casualty.survival_probability:.4f}, Time={self.current_time}")
+
                 for agent in self.rescue_agents.values():
                     if agent.current_mission == f"treat_casualty_{casualty_id}":
                         agent.current_mission = None
                 continue
-            
-            # Check if casualty is being treated
+
             if casualty.treated and casualty.treatment_start is not None:
                 treatment_duration = self.current_time - casualty.treatment_start
 
-                # Check if treatment is complete
                 required_time = {
-                    CasualtySeverity.CRITICAL: 60,
-                    CasualtySeverity.SEVERE: 30,
-                    CasualtySeverity.MODERATE: 15,
-                    CasualtySeverity.MILD: 5,
+                    CasualtySeverity.CRITICAL: 30,
+                    CasualtySeverity.SEVERE: 20,
+                    CasualtySeverity.MODERATE: 10,
+                    CasualtySeverity.MILD: 3,
                 }[casualty.severity]
 
-                if treatment_duration >= required_time:
-                    # Treatment complete, casualty survives
+                if treatment_duration >= required_time and casualty.survival_probability >= 0.8:
                     self.statistics["total_survivors"] += 1
+                    self.statistics["total_rescued"] = self.statistics.get("total_rescued", 0) + 1
+                    logger.info(f"[CASUALTY RESCUED] ID={casualty_id}, Severity={casualty.severity.name}, Survival={casualty.survival_probability:.4f}, TreatmentTime={treatment_duration:.1f}s")
 
-                    # 找到受害者所在的区域，并更新该区域的幸存者数量
                     for area_id, area in self.affected_areas.items():
                         if casualty in area.casualties:
                             area.survivors += 1
                             break
 
-                    # 移除相关的救援任务
                     for agent in self.rescue_agents.values():
                         if agent.current_mission == f"treat_casualty_{casualty_id}":
                             agent.current_mission = None
 
-                    # 从受害者列表中移除已获救的受害者
                     casualties_to_remove.append(casualty_id)
-        
-        # Remove dead casualties
+
+        self._last_currently_treating = currently_treating
+        self._last_min_survival = min_survival
+        self._last_max_survival = max_survival
+
         for casualty_id in casualties_to_remove:
             casualty = self.casualties.pop(casualty_id)
-            # Remove from affected area
             for area in self.affected_areas.values():
                 if casualty in area.casualties:
                     area.casualties.remove(casualty)
                     break
+            for agent in self.rescue_agents.values():
+                if casualty_id in agent.known_casualties:
+                    del agent.known_casualties[casualty_id]
     
     def _update_communication(self) -> None:
-        """Update communication network between agents."""
-        # Reset connections
+        """Update communication network between agents. Optimized with vectorized operations."""
         for agent in self.rescue_agents.values():
             agent.connected_agents = []
-        
-        # Establish new connections based on distance and communication status
+
         agent_ids = list(self.rescue_agents.keys())
-        
-        for i in range(len(agent_ids)):
-            for j in range(i + 1, len(agent_ids)):
-                agent_i = self.rescue_agents[agent_ids[i]]
-                agent_j = self.rescue_agents[agent_ids[j]]
-                
-                # Check if agents can communicate
-                if agent_i.can_communicate(agent_j.position):
-                    # Apply communication status (weather, interference)
-                    if np.random.rand() < self.communication_status:
-                        agent_i.connected_agents.append(agent_j.id)
-                        agent_j.connected_agents.append(agent_i.id)
+
+        if len(agent_ids) > 1:
+            agent_positions = np.array([self.rescue_agents[aid].position for aid in agent_ids])
+
+            distances = np.sqrt(np.sum((agent_positions[:, np.newaxis, :] - agent_positions[np.newaxis, :, :]) ** 2, axis=2))
+
+            communication_range = 1000.0
+            can_communicate_matrix = distances < communication_range
+
+            np.fill_diagonal(can_communicate_matrix, False)
+
+            if self.communication_status < 1.0:
+                random_matrix = np.random.rand(*can_communicate_matrix.shape) < self.communication_status
+                can_communicate_matrix = can_communicate_matrix & random_matrix
+
+            for i, agent_id_i in enumerate(agent_ids):
+                connected = np.where(can_communicate_matrix[i])[0]
+                self.rescue_agents[agent_id_i].connected_agents = [agent_ids[j] for j in connected]
     
     def _get_secondary_disaster_probability(self) -> float:
         """Calculate probability of secondary disaster."""
@@ -790,56 +993,84 @@ class DisasterSim:
             self.communication_status = 0.7
     
     def _calculate_reward(self) -> float:
-        """Calculate total reward for the current step."""
+        """Calculate total reward for the current step with STRONG incentives for rescue."""
         reward = 0.0
+
+        # 1. 记录上一步的幸存者数量，以便计算救援成功的奖励
+        if not hasattr(self, '_last_survivors'):
+            self._last_survivors = 0
         
-        # 1. Individual efficiency: casualties being treated
-        for agent in self.rescue_agents.values():
-            if agent.current_mission is not None:
-                if agent.current_mission.startswith("treat_casualty_"):
-                    # 提取受害者ID并获取受害者信息
-                    try:
-                        casualty_id = int(agent.current_mission.split("_")[-1])
-                        if casualty_id in self.casualties:
-                            casualty = self.casualties[casualty_id]
-                            # 根据严重程度给予不同奖励
-                            severity_bonus = {
-                                CasualtySeverity.CRITICAL: 2.0,
-                                CasualtySeverity.SEVERE: 1.5,
-                                CasualtySeverity.MODERATE: 1.0,
-                                CasualtySeverity.MILD: 0.5
-                            }[casualty.severity]
-                            reward += severity_bonus  # 提高每步治疗奖励
-                    except (ValueError, IndexError):
-                        reward += 1.0  # 默认奖励
+        new_survivors = self.statistics["total_survivors"] - self._last_survivors
+        if new_survivors > 0:
+            # 救援成功给大幅奖励
+            reward += 100.0 * new_survivors
+        self._last_survivors = self.statistics["total_survivors"]
+
+        # 2. 每个智能体接近受害者给奖励（密度更高的奖励）- Vectorized version
+        treatment_distance_threshold = 100.0
+
+        if len(self.rescue_agents) > 0 and len(self.casualties) > 0:
+            agent_ids = list(self.rescue_agents.keys())
+            agent_positions = np.array([self.rescue_agents[aid].position for aid in agent_ids])
+
+            untreated_casualty_ids = [cid for cid, c in self.casualties.items() if not c.treated]
+
+            if len(untreated_casualty_ids) > 0:
+                casualty_positions = np.array([self.casualties[cid].position for cid in untreated_casualty_ids])
+                severity_map = {CasualtySeverity.CRITICAL: 3.0, CasualtySeverity.SEVERE: 2.0,
+                               CasualtySeverity.MODERATE: 1.5, CasualtySeverity.MILD: 1.0}
+                survival_probs = np.array([self.casualties[cid].survival_probability for cid in untreated_casualty_ids])
+                severities = np.array([severity_map[self.casualties[cid].severity] for cid in untreated_casualty_ids])
+
+                distances = np.sqrt(np.sum((agent_positions[:, np.newaxis, :] - casualty_positions[np.newaxis, :, :]) ** 2, axis=2))
+
+                min_distances = distances.min(axis=1)
+                min_indices = distances.argmin(axis=1)
+
+                max_range = 500.0
+                valid_mask = min_distances < max_range
+
+                for i, valid in enumerate(valid_mask):
+                    if valid:
+                        min_distance = min_distances[i]
+                        idx = min_indices[i]
+                        severity_scale = severities[idx]
+                        survival_prob = survival_probs[idx]
+
+                        distance_reward = (1.0 - min_distance / max_range) ** 2
+                        reward += 0.5 * severity_scale * distance_reward * survival_prob
+
+                        if min_distance <= treatment_distance_threshold:
+                            reward += 5.0 * severity_scale * survival_prob
+
+        # 3. 正在接受治疗的受害者给持续奖励
+        for casualty in self.casualties.values():
+            if casualty.treated and casualty.survival_probability < 1.0:
+                severity_scale = {
+                    CasualtySeverity.CRITICAL: 2.0,
+                    CasualtySeverity.SEVERE: 1.5,
+                    CasualtySeverity.MODERATE: 1.0,
+                    CasualtySeverity.MILD: 0.5
+                }[casualty.severity]
+                reward += severity_scale
+
+        # 4. 伤亡死亡的负奖励（惩罚智能体）
+        if not hasattr(self, '_last_casualties'):
+            self._last_casualties = len(self.casualties) + self.statistics["total_survivors"]
         
-        # 2. Global efficiency: total survivors (提高奖励倍数)
-        reward += 5.0 * self.statistics["total_survivors"]
-        
-        # 3. Cooperation bonus: connected agents (提高权重)
+        current_casualties = len(self.casualties) + self.statistics["total_survivors"]
+        deaths = self._last_casualties - current_casualties
+        if deaths > 0:
+            reward -= 50.0 * deaths
+        self._last_casualties = current_casualties
+
+        # 5. 协作奖励（简单但更直接）
         total_connections = sum(len(agent.connected_agents) for agent in self.rescue_agents.values())
-        reward += 0.1 * total_connections
-        
-        # 4. Coverage bonus: agents covering different areas
-        covered_areas = set()
-        for agent in self.rescue_agents.values():
-            nearest = self._get_nearest_affected_area(agent.position)
-            if nearest:
-                covered_areas.add(nearest.id)
-        reward += 0.5 * len(covered_areas)  # 鼓励覆盖更多区域
-        
-        # 5. Fairness penalty: based on Gini coefficient (提高惩罚)
-        survival_rates = [area.survival_rate for area in self.affected_areas.values()]
-        if survival_rates:
-            gini = self._calculate_gini(survival_rates)
-            reward -= 0.5 * gini
-        
-        # 6. Time efficiency penalty: penalize if few agents are active
-        active_agents = sum(1 for agent in self.rescue_agents.values() if agent.current_mission is not None)
-        if len(self.rescue_agents) > 0:
-            inactivity_rate = 1.0 - (active_agents / len(self.rescue_agents))
-            reward -= 0.1 * inactivity_rate  # 惩罚不活跃的智能体
-        
+        num_agents = len(self.rescue_agents)
+        if num_agents > 1:
+            max_connections = num_agents * (num_agents - 1)
+            reward += 2.0 * (total_connections / max_connections)
+
         return reward
     
     def _calculate_gini(self, values: List[float]) -> float:
@@ -861,12 +1092,8 @@ class DisasterSim:
     
     def _update_statistics(self) -> None:
         """Update simulation statistics."""
-        # Calculate fairness metrics
         survival_rates = [area.survival_rate for area in self.affected_areas.values()]
-        
-        # 打印生存利率列表，以便调试
-        print(f"生存利率列表: {survival_rates}")
-        
+
         if survival_rates and any(rate > 0 for rate in survival_rates):
             # Gini coefficient
             gini = self._calculate_gini(survival_rates)
@@ -898,19 +1125,23 @@ class DisasterSim:
                 response_time = np.random.uniform(100, 300)
                 self.statistics["response_times"].append(response_time)
         
-        # 计算资源利用率
-        total_resources = 0.0
-        used_resources = 0.0
-        for depot in self.resource_depots.values():
-            for resource_type, amount in depot.resources.items():
-                # 假设每个资源库的初始资源量为 1000.0
-                total_resources += 1000.0
-                used_resources += 1000.0 - amount
+        # Calculate total initial resources and used resources per type
+        initial_total = {rt: 0.0 for rt in ResourceType}
+        used_total = {rt: 0.0 for rt in ResourceType}
         
-        if total_resources > 0:
-            utilization = used_resources / total_resources
-            for resource_type in ResourceType:
-                self.statistics["resource_utilization"][resource_type] = utilization
+        for depot_id, depot in self.resource_depots.items():
+            initial_depot = self.initial_resources[depot_id]
+            for rt in ResourceType:
+                initial_total[rt] += initial_depot[rt]
+                used = initial_depot[rt] - max(0.0, depot.resources.get(rt, 0.0))
+                used_total[rt] += max(0.0, used)
+        
+        # Calculate utilization per type
+        for rt in ResourceType:
+            if initial_total[rt] > 0:
+                self.statistics["resource_utilization"][rt] = used_total[rt] / initial_total[rt]
+            else:
+                self.statistics["resource_utilization"][rt] = 0.0
     
     def _check_termination(self) -> bool:
         """Check if episode should terminate."""
@@ -938,6 +1169,19 @@ class DisasterSim:
         obs.extend([agent.capacity[rt] / agent.max_capacity[rt] for rt in ResourceType])  # Resource levels
         obs.append(agent.endurance / agent.max_endurance)  # Normalized endurance
         obs.append(1.0 if agent.current_mission is not None else 0.0)  # Mission status
+        
+        # Nearest untreated casualty info (6 features)
+        nearest_casualty = self._get_nearest_untreated_casualty(agent.position)
+        if nearest_casualty:
+            obs.extend(nearest_casualty.position / self.map_size)  # 2 features
+            severity_map = {"critical": 3, "severe": 2, "moderate": 1, "mild": 0}
+            obs.append(severity_map.get(nearest_casualty.severity.value, 0) / 3.0)  # Normalized severity
+            distance = np.linalg.norm(agent.position - nearest_casualty.position)
+            obs.append(distance / self.map_size[0] if isinstance(self.map_size, (tuple, list)) else distance / self.map_size)  # Normalized distance
+            obs.append(1.0 if nearest_casualty.treated else 0.0)  # Treatment status
+            obs.append(nearest_casualty.survival_probability)  # Survival probability
+        else:
+            obs.extend([0.0] * 6)  # No untreated casualties
         
         # Nearest affected area info (8 features)
         nearest_area = self._get_nearest_affected_area(agent.position)
@@ -979,8 +1223,34 @@ class DisasterSim:
         
         return nearest_area
     
+    def _get_nearest_untreated_casualty(self, position: np.ndarray) -> Optional[Casualty]:
+        """Get nearest untreated casualty to a position."""
+        if not self.casualties:
+            return None
+        
+        nearest_casualty = None
+        min_distance = float('inf')
+        
+        for casualty in self.casualties.values():
+            if casualty.treated:
+                continue
+            distance = np.linalg.norm(position - casualty.position)
+            if distance < min_distance:
+                min_distance = distance
+                nearest_casualty = casualty
+        
+        return nearest_casualty
+    
     def _get_info(self) -> Dict[str, Any]:
         """Get additional information about the environment."""
+        # Calculate actual resources used
+        total_used = 0.0
+        for depot_id, depot in self.resource_depots.items():
+            initial_depot = self.initial_resources[depot_id]
+            for rt in ResourceType:
+                used = initial_depot[rt] - max(0.0, depot.resources.get(rt, 0.0))
+                total_used += max(0.0, used)
+        
         info = {
             "current_time": self.current_time,
             "step_count": self.step_count,
@@ -994,7 +1264,7 @@ class DisasterSim:
             "num_resource_depots": len(self.resource_depots),
             "rescued": self.statistics.get("total_survivors", 0),
             "deaths": self.statistics.get("total_deaths", 0),
-            "resources_used": sum(self.statistics.get("resource_utilization", {}).values())
+            "resources_used": total_used
         }
         return info
     

@@ -50,7 +50,7 @@ class MARLLayer(nn.Module):
         self.target_agent_networks = nn.ModuleList()
         
         for _ in range(num_agents):
-            # Agent Q-network
+            # Agent Q-network (shared architecture, separate instances for exploration diversity)
             agent_net = nn.Sequential(
                 nn.Linear(state_dim, hidden_dim),
                 nn.ReLU(),
@@ -58,7 +58,7 @@ class MARLLayer(nn.Module):
                 nn.ReLU(),
                 nn.Linear(hidden_dim, action_dim)
             ).to(device)
-            
+
             # Target network
             target_agent_net = nn.Sequential(
                 nn.Linear(state_dim, hidden_dim),
@@ -67,12 +67,31 @@ class MARLLayer(nn.Module):
                 nn.ReLU(),
                 nn.Linear(hidden_dim, action_dim)
             ).to(device)
-            
+
             # Initialize target network with same weights
             target_agent_net.load_state_dict(agent_net.state_dict())
-            
+
             self.agent_networks.append(agent_net)
             self.target_agent_networks.append(target_agent_net)
+
+        # Shared agent network for batch processing (parameter sharing for efficiency)
+        self.shared_agent_net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, action_dim)
+        ).to(device)
+
+        # Shared target network
+        self.shared_target_agent_net = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, action_dim)
+        ).to(device)
+        self.shared_target_agent_net.load_state_dict(self.shared_agent_net.state_dict())
         
         # Mixing network for centralized Q-value
         self.mixing_network = nn.Sequential(
@@ -108,26 +127,34 @@ class MARLLayer(nn.Module):
         self.optimizer = optim.Adam(self.parameters(), lr=0.001)
     
     def forward(self, states: torch.Tensor) -> torch.Tensor:
-        """Forward pass for MARL layer."""
-        q_values = []
-        for i, agent_net in enumerate(self.agent_networks):
-            q_values.append(agent_net(states))
-        return torch.stack(q_values, dim=1)
+        """Forward pass for MARL layer. Optimized batch processing using shared network."""
+        batch_size, num_agents, state_dim = states.shape
+
+        states_flat = states.view(batch_size * num_agents, state_dim)
+
+        q_values_flat = self.shared_agent_net(states_flat)
+
+        q_values = q_values_flat.view(batch_size, num_agents, self.action_dim)
+
+        return q_values
     
-    def select_actions(self, states: torch.Tensor, deterministic: bool = False) -> torch.Tensor:
+    def select_actions(self, states: torch.Tensor, deterministic: bool = False, epsilon: float = None) -> torch.Tensor:
         """Select actions for all agents."""
-        if deterministic or np.random.rand() > self.epsilon:
+        # Use provided epsilon or fall back to internal epsilon
+        current_epsilon = epsilon if epsilon is not None else self.epsilon
+        
+        if deterministic or np.random.rand() > current_epsilon:
             with torch.no_grad():
                 q_values = self.forward(states)
+                # Q-values shape: (batch_size, num_agents, action_dim)
                 actions = q_values.argmax(dim=2)
         else:
-            # Random exploration
-            actions = torch.randint(0, self.action_dim, 
+            actions = torch.randint(0, self.action_dim,
                                    (states.shape[0], self.num_agents),
                                    device=self.device)
         
-        # Decay epsilon
-        if not deterministic:
+        # Decay epsilon if not using external epsilon
+        if not deterministic and epsilon is None:
             self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
         
         return actions
@@ -139,29 +166,48 @@ class MARLLayer(nn.Module):
         # Get current Q-values
         current_qs = self.forward(batch_states)
         
-        # Get action indices
+        # Get action indices and selected Q-values
         action_indices = batch_actions.long().unsqueeze(2)
-        joint_q = current_qs.gather(2, action_indices).squeeze(2)
+        selected_qs = current_qs.gather(2, action_indices).squeeze(2)
         
-        # Get next Q-values from target networks
+        # Compute global state by averaging agent observations
+        global_state = batch_states.mean(dim=1)  # Shape: (batch_size, state_dim)
+        
+        # Expand selected Q-values for mixing network input
+        selected_qs_expanded = selected_qs.unsqueeze(2).repeat(1, 1, self.action_dim).flatten(start_dim=1)
+        
+        # Get current joint Q-value using mixing network
+        current_mixing_input = torch.cat([global_state, selected_qs_expanded], dim=1)
+        current_joint_q = self.mixing_network(current_mixing_input).squeeze()
+        
+        # Get next Q-values from target networks (optimized batch processing)
         with torch.no_grad():
-            next_qs = []
-            for i, target_net in enumerate(self.target_agent_networks):
-                next_qs.append(target_net(batch_next_states))
-            next_qs = torch.stack(next_qs, dim=1)
-            
-            # Get max next Q-values
+            batch_size, num_agents, state_dim = batch_next_states.shape
+
+            next_states_flat = batch_next_states.view(batch_size * num_agents, state_dim)
+
+            next_qs_flat = self.shared_target_agent_net(next_states_flat)
+
+            next_qs = next_qs_flat.view(batch_size, num_agents, self.action_dim)
+
             max_next_qs = next_qs.max(dim=2)[0]
             
             # Get target joint Q-value
-            target_joint_q = self.target_mixing_network(torch.cat([batch_next_states, max_next_qs], dim=1))
+            # Compute global state for next states
+            next_global_state = batch_next_states.mean(dim=1)  # Shape: (batch_size, state_dim)
+            
+            # Expand max Q-values for mixing network input
+            max_next_qs_expanded = max_next_qs.unsqueeze(2).repeat(1, 1, self.action_dim).flatten(start_dim=1)
+            
+            next_mixing_input = torch.cat([next_global_state, max_next_qs_expanded], dim=1)
+            target_joint_q = self.target_mixing_network(next_mixing_input).squeeze()
             
             # Compute target
-            target = batch_rewards + self.gamma * target_joint_q.squeeze() * (1 - batch_dones.float())
+            target = batch_rewards + self.gamma * target_joint_q * (1 - batch_dones.float())
         
         # Compute loss
         loss_fn = nn.MSELoss()
-        loss = loss_fn(joint_q, target)
+        loss = loss_fn(current_joint_q, target)
         
         # Optimize
         self.optimizer.zero_grad()
@@ -181,7 +227,12 @@ class MARLLayer(nn.Module):
             for target_param, param in zip(self.target_agent_networks[i].parameters(),
                                          self.agent_networks[i].parameters()):
                 target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
-        
+
+        # Update shared target network
+        for target_param, param in zip(self.shared_target_agent_net.parameters(),
+                                     self.shared_agent_net.parameters()):
+            target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
+
         # Update mixing target network
         for target_param, param in zip(self.target_mixing_network.parameters(),
                                      self.mixing_network.parameters()):

@@ -179,8 +179,41 @@ class EGTMARLTrainer:
     
     def setup_algorithm(self):
         """设置算法"""
-        # 初始化算法，只传递 env 参数
-        self.algorithm = EGTMARL(env=self.env)
+        # 构建算法配置
+        algo_config = {
+            'marl': {
+                'state_dim': self.env.get_state_dimension(),
+                'action_dim': 32,  # 8 tactical * 4 communication
+                'num_agents': self.env.num_agents,
+                'hidden_dim': self.config['algorithm'].get('hidden_dim', 64),
+                'mixing_hidden_dim': self.config['algorithm'].get('mixing_hidden_dim', 64),
+                'attention_heads': self.config['algorithm'].get('attention_heads', 4),
+                'learning_rate': self.config['training']['learning_rate'],
+                'batch_size': self.config['training'].get('batch_size', 32),
+                'buffer_size': self.config['training'].get('buffer_size', 10000)
+            },
+
+            'egt': {
+                'num_strategies': 3,
+                'learning_rate': 0.01
+            },
+            'anti_spoofing': {
+                'observation_dim': self.env.get_state_dimension(),
+                'action_dim': 32
+            },
+            'dynamic_frontier': {
+                'alpha': self.config['algorithm'].get('pareto_weight_alpha', 0.3),
+                'beta': self.config['algorithm'].get('pareto_weight_beta', 0.4),
+                'gamma': self.config['algorithm'].get('pareto_weight_gamma', 0.3)
+            }
+        }
+        
+        # 初始化算法，传递环境和配置
+        self.algorithm = EGTMARL(
+            env=self.env,
+            config=algo_config,
+            hidden_dim=self.config['algorithm'].get('hidden_dim', 64)
+        )
         
         # 为了兼容训练脚本，设置必要的属性
         self.algorithm.device = self.device
@@ -223,8 +256,8 @@ class EGTMARLTrainer:
         max_steps = self.config['training']['max_steps_per_episode']
         
         while not done and step < max_steps:
-            # 获取动作 - 传递训练参数以启用探索
-            actions = self.algorithm.select_action(state, training=True)
+            # 获取动作 - 传递训练参数和epsilon以启用探索
+            actions = self.algorithm.select_action(state, training=True, epsilon=epsilon)
             
             # 执行动作
             next_state, rewards, terminated, truncated, info = self.env.step(actions)
@@ -273,9 +306,13 @@ class EGTMARLTrainer:
             episode_metrics['rescue_rate'] = 0.0
         
         # 计算资源利用率
-        total_resources = self.env.num_resources * 100  # 假设每个资源点容量为100
-        if total_resources > 0:
-            episode_metrics['resource_utilization'] = (episode_metrics['resources_used'] / total_resources) * 100
+        # Calculate total initial resources across all depots
+        total_initial = 0.0
+        for initial_depot in self.env.initial_resources.values():
+            total_initial += sum(initial_depot.values())
+        
+        if total_initial > 0:
+            episode_metrics['resource_utilization'] = (episode_metrics['resources_used'] / total_initial) * 100
         else:
             episode_metrics['resource_utilization'] = 0.0
         
@@ -335,8 +372,12 @@ class EGTMARLTrainer:
             
             avg_response_time = np.mean(response_times) if response_times else 0.0
             
-            total_resources = self.env.num_resources * 100
-            resource_utilization = (episode_resources_used / total_resources * 100) if total_resources > 0 else 0.0
+            # Calculate total initial resources across all depots
+            total_initial = 0.0
+            for initial_depot in self.env.initial_resources.values():
+                total_initial += sum(initial_depot.values())
+            
+            resource_utilization = (episode_resources_used / total_initial * 100) if total_initial > 0 else 0.0
             
             eval_metrics['rescue_rate'].append(rescue_rate)
             eval_metrics['avg_response_time'].append(avg_response_time)
@@ -449,13 +490,20 @@ class EGTMARLTrainer:
             if episode % checkpoint_interval == 0:
                 self.save_checkpoint(episode, episode_metrics)
             
-            # 定期打印进度
-            if episode % 10 == 0:
+            # 每5个episode打印详细进度（增加频率）
+            if episode % 5 == 0:
                 logger.info(f"Episode {episode}/{num_episodes} - "
+                           f"Epsilon: {epsilon:.3f} - "
                            f"Rescue Rate: {episode_metrics.get('rescue_rate', 0.0):.1f}% - "
-                           f"Reward: {episode_metrics.get('total_reward', 0.0):.1f} - "
+                           f"Survivors: {episode_metrics.get('rescued', 0)}/{episode_metrics.get('total_casualties', 0)} - "
+                           f"Reward: {episode_metrics.get('total_reward', 0.0):.2f} - "
                            f"Steps: {episode_metrics.get('steps', 0)} - "
-                           f"Remaining Casualties: {len(self.env.casualties)}")
+                           f"Response Time: {episode_metrics.get('avg_response_time', 0.0):.1f}s")
+            
+            # 每个episode都打印简要的救援率信息（确保能看到每个episode的救援率）
+            if episode % 1 == 0:
+                logger.info(f"Episode {episode} | Rescue Rate: {episode_metrics.get('rescue_rate', 0.0):.1f}% | "
+                           f"Rescued: {episode_metrics.get('rescued', 0)} | Deaths: {episode_metrics.get('deaths', 0)}")
         
         # 训练完成
         logger.info("Training completed!")
@@ -563,6 +611,38 @@ class EGTMARLTrainer:
             
         except Exception as e:
             logger.warning(f"Failed to generate visualizations: {e}")
+
+
+def train_egt_marl(config_path: str = 'configs/training.yaml', **kwargs):
+    """
+    训练EGT-MARL算法的入口函数
+    
+    Args:
+        config_path: 配置文件路径
+        **kwargs: 额外参数（用于覆盖配置）
+    
+    Returns:
+        training_history: 训练历史数据
+        final_metrics: 最终评估指标
+    """
+    # 创建训练器
+    trainer = EGTMARLTrainer(config_path)
+    
+    # 应用额外参数覆盖
+    for key, value in kwargs.items():
+        if key == 'output_dir':
+            trainer.config['output_dir'] = value
+        elif key == 'num_episodes':
+            trainer.config['training']['num_episodes'] = value
+        elif key == 'learning_rate':
+            trainer.config['training']['learning_rate'] = value
+        elif key == 'batch_size':
+            trainer.config['training']['batch_size'] = value
+    
+    # 开始训练
+    training_history, final_metrics = trainer.train()
+    
+    return training_history, final_metrics
 
 
 def main():

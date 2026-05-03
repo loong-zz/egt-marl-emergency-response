@@ -8,7 +8,9 @@ from .disaster_scenarios import (
     FloodScenario,
     HurricaneScenario,
 )
-from .visualization import DisasterVisualizer
+
+# Delay import of DisasterVisualizer to speed up initial import
+# Import it only when needed using: from environments import DisasterVisualizer
 
 __all__ = [
     "DisasterSim",
@@ -19,3 +21,9 @@ __all__ = [
 ]
 
 __version__ = "1.0.0"
+
+def __getattr__(name):
+    if name == "DisasterVisualizer":
+        from .visualization import DisasterVisualizer
+        return DisasterVisualizer
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

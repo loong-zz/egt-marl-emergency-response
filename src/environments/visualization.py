@@ -679,12 +679,14 @@ class DisasterVisualizer:
         Returns:
             matplotlib图形对象
         """
-        fig, ax = plt.subplots(figsize=(12, 8))
-        
-        # 颜色调色板
-        colors = plt.cm.Set3(np.linspace(0, 1, len(algorithms_data)))
-        
-        # 绘制每个算法的指标曲线
+        fig, ax = plt.subplots(figsize=(16, 10))
+
+        num_algorithms = len(algorithms_data)
+        colors = plt.cm.tab20(np.linspace(0, 1, min(num_algorithms, 20)))
+        if num_algorithms > 20:
+            additional_colors = plt.cm.Set3(np.linspace(0, 1, num_algorithms - 20))
+            colors = np.vstack([colors, additional_colors])
+
         for i, (algo_name, algo_data) in enumerate(algorithms_data.items()):
             if metric in algo_data:
                 values = algo_data[metric]
@@ -710,17 +712,18 @@ class DisasterVisualizer:
         ax.set_xlabel('Episode', fontsize=12)
         ax.set_ylabel(metric.replace('_', ' ').title(), fontsize=12)
         ax.grid(True, alpha=0.3)
-        ax.legend(fontsize=11, loc='best')
-        
-        # 添加统计信息
-        stats_text = "Statistics (Final Episode):\n"
-        for algo_name, algo_data in algorithms_data.items():
+        ax.legend(fontsize=9, loc='upper left', bbox_to_anchor=(1.02, 1), borderaxespad=0)
+
+        sorted_items = sorted(algorithms_data.items(), key=lambda x: x[1].get(metric, [0])[-1] if metric in x[1] else 0, reverse=True)
+        stats_text = "Top 5 Performers (Final):\n"
+        for algo_name, algo_data in sorted_items[:5]:
             if metric in algo_data:
                 values = algo_data[metric]
                 if values:
                     final_value = values[-1]
-                    stats_text += f"{algo_name}: {final_value:.2f}\n"
-        
+                    short_name = algo_name[:25] + '...' if len(algo_name) > 25 else algo_name
+                    stats_text += f"{short_name}: {final_value:.2f}\n"
+
         ax.text(0.02, 0.98, stats_text,
                transform=ax.transAxes,
                fontsize=10,
