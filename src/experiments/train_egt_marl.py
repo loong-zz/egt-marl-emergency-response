@@ -130,8 +130,10 @@ class EGTMARLTrainer:
         
         # 配置日志
         log_file = self.experiment_dir / 'logs' / 'training.log'
+        log_level_str = self.config.get('logging', {}).get('level', 'INFO')
+        log_level = getattr(logging, log_level_str.upper(), logging.INFO)
         logging.basicConfig(
-            level=logging.INFO,
+            level=log_level,
             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
             handlers=[
                 logging.FileHandler(str(log_file), encoding='utf-8'),
@@ -278,10 +280,6 @@ class EGTMARLTrainer:
             # 收集指标
             episode_metrics['total_reward'] += rewards
             episode_metrics['steps'] += 1
-            # 不累加rescued和deaths，因为info中已经是累计值
-            # episode_metrics['rescued'] += info.get('rescued', 0)
-            # episode_metrics['deaths'] += info.get('deaths', 0)
-            episode_metrics['resources_used'] += info.get('resources_used', 0)
             
             if 'response_time' in info:
                 episode_metrics['response_times'].append(info['response_time'])
@@ -297,6 +295,7 @@ class EGTMARLTrainer:
         # 在episode结束时获取最终的rescued和deaths值
         episode_metrics['rescued'] = info.get('rescued', 0)
         episode_metrics['deaths'] = info.get('deaths', 0)
+        episode_metrics['resources_used'] = info.get('resources_used', 0)
         
         # 计算救援成功率
         total_victims = self.env.num_victims
