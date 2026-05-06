@@ -338,27 +338,22 @@ class EGTMARLTrainer:
             state, info = self.env.reset()
             episode_reward = 0.0
             episode_rescued = 0
-            episode_resources_used = 0
             response_times = []
-            
+
             done = False
             step = 0
             max_steps = self.config['training']['max_steps_per_episode']
-            
+
             while not done and step < max_steps:
-                # 使用确定性策略
                 actions = self.algorithm.select_action(state)
                 next_state, rewards, terminated, truncated, info = self.env.step(actions)
                 done = terminated or truncated
-                
+
                 episode_reward += rewards
-                # 不累加rescued，因为info中已经是累计值
-                # episode_rescued += info.get('rescued', 0)
-                episode_resources_used += info.get('resources_used', 0)
-                
+
                 if 'response_time' in info:
                     response_times.append(info['response_time'])
-                
+
                 state = next_state
                 step += 1
             
@@ -368,16 +363,11 @@ class EGTMARLTrainer:
             # 计算指标
             total_victims = self.env.num_victims
             rescue_rate = (episode_rescued / total_victims * 100) if total_victims > 0 else 0.0
-            
+
             avg_response_time = np.mean(response_times) if response_times else 0.0
-            
-            # Calculate total initial resources across all depots
-            total_initial = 0.0
-            for initial_depot in self.env.initial_resources.values():
-                total_initial += sum(initial_depot.values())
-            
-            resource_utilization = (episode_resources_used / total_initial * 100) if total_initial > 0 else 0.0
-            
+
+            resource_utilization = info.get('resource_utilization', 0.0)
+
             eval_metrics['rescue_rate'].append(rescue_rate)
             eval_metrics['avg_response_time'].append(avg_response_time)
             eval_metrics['resource_utilization'].append(resource_utilization)
