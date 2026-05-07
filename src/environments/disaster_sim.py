@@ -59,6 +59,7 @@ class Casualty:
     treated: bool = False
     treatment_start: Optional[float] = None
     treating_agent_id: Optional[int] = None
+    original_treating_agent_id: Optional[int] = None  # 保存最初治疗的agent
     grace_period_end: Optional[float] = None
     survival_probability: float = 1.0
     _last_update_time: float = 0.0
@@ -151,8 +152,20 @@ class RescueAgent:
         self.position = position
         self.agent_type = agent_type
         self.velocity = np.zeros(2)
-        self.capacity = {rt: 10.0 for rt in ResourceType}
-        self.max_capacity = {rt: 10.0 for rt in ResourceType}
+        
+        # 根据agent类型设置不同的资源容量（更符合实际场景）
+        # VEHICLE > PERSONNEL > DRONE
+        if agent_type == AgentType.VEHICLE:
+            resource_capacity = 20.0  # 车辆容量最大，可携带大量物资
+        elif agent_type == AgentType.PERSONNEL:
+            resource_capacity = 8.0   # 人员容量中等，携带背包物资
+        elif agent_type == AgentType.DRONE:
+            resource_capacity = 3.0   # 无人机容量最小，只能携带少量急救物资
+        else:
+            resource_capacity = 8.0
+        
+        self.capacity = {rt: resource_capacity for rt in ResourceType}
+        self.max_capacity = {rt: resource_capacity for rt in ResourceType}
         self.endurance = 100.0
         self.max_endurance = 100.0
         self.current_mission = None
@@ -311,6 +324,9 @@ class DisasterSim:
                 agent_type=agent_types[i]
             )
             self.rescue_agents[i] = agent
+        
+        # 计算初始agent资源总量
+        self.initial_agent_resources = sum(sum(a.capacity.values()) for a in self.rescue_agents.values())
     
     def _initialize_casualties(self) -> None:
         """Initialize casualties in affected areas."""
@@ -434,6 +450,50 @@ class DisasterSim:
                 # Add edge with weight = distance
                 self.road_network.add_edge(node_i, node_j, weight=distance)
     
+    def _initial_casualty_discovery(self) -> None:
+        """
+        Initial casualty discovery at episode start.
+        Agents discover casualties in their detection range before any actions are taken.
+        This ensures that casualties are marked as discovered before agents start treating them.
+        """
+        agent_ids = list(self.rescue_agents.keys())
+        casualty_ids = list(self.casualties.keys())
+        
+        if len(agent_ids) == 0 or len(casualty_ids) == 0:
+            return
+        
+        agent_positions = np.array([self.rescue_agents[aid].position for aid in agent_ids])
+        casualty_positions = np.array([self.casualties[cid].position for cid in casualty_ids])
+        
+        # Calculate distances between all agents and casualties
+        distances = np.sqrt(np.sum((agent_positions[:, np.newaxis, :] - casualty_positions[np.newaxis, :, :]) ** 2, axis=2))
+        
+        # Discover casualties in detection range
+        for i, agent_id in enumerate(agent_ids):
+            agent = self.rescue_agents[agent_id]
+            detection_range = agent.get_detection_range()
+            nearby_casualty_indices = np.where(distances[i, :] <= detection_range)[0]
+            
+            for j in nearby_casualty_indices:
+                casualty_id = casualty_ids[j]
+                casualty = self.casualties[casualty_id]
+                
+                # Mark casualty as discovered by this agent
+                if casualty_id not in agent.known_casualties:
+                    agent.known_casualties[casualty_id] = {
+                        'position': casualty.position.copy(),
+                        'severity': casualty.severity,
+                        'survival_probability': casualty.survival_probability,
+                        'distance': distances[i, j],
+                        'treated': casualty.treated
+                    }
+                    logger.debug(f"[CASUALTY FOUND] Agent={agent_id}, CasualtyID={casualty_id}, Severity={casualty.severity.name}, Position=[{casualty.position[0]:.1f}, {casualty.position[1]:.1f}], Distance={distances[i,j]:.1f}m, Time={self.current_time:.0f}")
+                else:
+                    # Update existing knowledge
+                    agent.known_casualties[casualty_id]['distance'] = distances[i, j]
+                    agent.known_casualties[casualty_id]['treated'] = casualty.treated
+                    agent.known_casualties[casualty_id]['survival_probability'] = casualty.survival_probability
+    
     def _define_spaces(self) -> None:
         """Define observation and action spaces."""
         # Observation space per agent
@@ -502,6 +562,19 @@ class DisasterSim:
         self._last_survivors = 0
         self._last_casualties = len(self.casualties)
         
+        # Log initial environment information
+        logger.info(f"[ENVIRONMENT INIT] Affected Areas: {len(self.affected_areas)}")
+        for area_id, area in self.affected_areas.items():
+            logger.info(f"  Area {area_id}: Position=[{area.position[0]:.1f}, {area.position[1]:.1f}], Size={area.size:.1f}, Damage={area.building_damage:.2f}, Population={area.population:.0f}")
+        
+        logger.info(f"[ENVIRONMENT INIT] Resource Depots: {len(self.resource_depots)}")
+        for depot_id, depot in self.resource_depots.items():
+            total_resources = sum(depot.resources.values())
+            logger.info(f"  Depot {depot_id}: Position=[{depot.position[0]:.1f}, {depot.position[1]:.1f}], TotalResources={total_resources:.1f}")
+        
+        # Initial casualty discovery - agents discover casualties in their detection range at episode start
+        self._initial_casualty_discovery()
+        
         # Get initial observation and info
         observation = self._get_observation()
         info = self._get_info()
@@ -537,17 +610,17 @@ class DisasterSim:
         self._update_communication()
 
         if self.step_count % 50 == 0:
-            total_initial_resources = sum(sum(r.values()) for r in self.initial_resources.values())
+            total_initial_resources = sum(sum(r.values()) for r in self.initial_resources.values()) + self.initial_agent_resources
             total_current_resources = sum(sum(d.resources.values()) for d in self.resource_depots.values())
             total_agent_resources = sum(sum(a.capacity.values()) for a in self.rescue_agents.values())
-            resource_consumed = total_initial_resources - total_current_resources - total_agent_resources
+            resource_consumed = max(0, total_initial_resources - total_current_resources - total_agent_resources)
 
             num_agents = len(self.rescue_agents)
             num_connected = sum(len(a.connected_agents) for a in self.rescue_agents.values())
             max_possible_connections = num_agents * (num_agents - 1) if num_agents > 1 else 1
             comm_coverage = (num_connected / max_possible_connections * 100) if max_possible_connections > 0 else 0
 
-            logger.info(f"[STEP {self.step_count}] Alive: {len(self.casualties)} | Treating: {self._last_currently_treating} | Rescued: {self.statistics.get('total_rescued', 0)} | Deaths: {self.statistics.get('total_deaths', 0)} | Treated: {self.statistics.get('total_treated', 0)} | Resources: {total_current_resources:.1f}/{total_initial_resources:.1f} ({resource_consumed:.1f}) | Comm: {num_connected}/{max_possible_connections} ({comm_coverage:.1f}%)")
+            logger.info(f"[STEP {self.step_count}] Alive: {len(self.casualties)} | Treating: {self._last_currently_treating} | Rescued: {self.statistics.get('total_rescued', 0)} | Deaths: {self.statistics.get('total_deaths', 0)} | Treated: {self.statistics.get('total_treated', 0)} | Resources: Depot={total_current_resources:.1f}, Agents={total_agent_resources:.1f}, Used={resource_consumed:.1f}/{total_initial_resources:.1f} | Comm: {num_connected}/{max_possible_connections} ({comm_coverage:.1f}%)")
 
             for agent in self.rescue_agents.values():
                 mission = getattr(agent, 'current_mission', None)
@@ -568,7 +641,9 @@ class DisasterSim:
                                 CasualtySeverity.MILD: 3,
                             }[casualty.severity]
                             remaining_time = max(0, required_time - treatment_duration)
-                            status = f"TREATING->Casualty{casualty_id}({remaining_time:.0f}s)"
+                            dist_to_casualty = np.linalg.norm(agent.position - casualty.position)
+                            steps = np.ceil(dist_to_casualty / (agent.get_max_speed() * self.time_step))
+                            status = f"TREATING->Casualty{casualty_id}({dist_to_casualty:.0f}m,{int(steps)} steps,{remaining_time:.0f}s)"
                         else:
                             status = "TREATING->(completed)"
                     except ValueError:
@@ -579,19 +654,22 @@ class DisasterSim:
                         depot = self.resource_depots[int(depot_id)]
                         distance = np.linalg.norm(agent.position - depot.position)
                         steps = np.ceil(distance / (agent.get_max_speed() * self.time_step))
-                        status = f"MOVING_TO_DEPOT{depot_id}({steps:.1f}steps)"
+                        nearest_casualty = self._get_nearest_untreated_casualty(agent.position)
+                        nearest_info = f" | NearestCasualty={nearest_casualty.id}({np.linalg.norm(agent.position - nearest_casualty.position):.0f}m)" if nearest_casualty else ""
+                        status = f"MOVING_TO_DEPOT{depot_id}({distance:.0f}m,{int(steps)} steps){nearest_info}"
                 elif mission == "wait_for_resupply":
                     nearest_casualty = self._get_nearest_untreated_casualty(agent.position)
                     if nearest_casualty:
                         distance = np.linalg.norm(agent.position - nearest_casualty.position)
                         steps = np.ceil(distance / (agent.get_max_speed() * self.time_step))
-                        status = f"WAITING_FOR_RESUPPLY({steps:.1f}steps)"
+                        status = f"WAITING_FOR_RESUPPLY({distance:.0f}m,{int(steps)} steps)"
                     else:
                         status = "WAITING_FOR_RESUPPLY"
                 elif agent.known_casualties:
                     nearest = min(agent.known_casualties.items(), key=lambda x: x[1]['distance'])
-                    status = f"SEARCHING->Casualty{nearest[0]}"
                     nearest_dist = nearest[1]['distance']
+                    steps = np.ceil(nearest_dist / (agent.get_max_speed() * self.time_step))
+                    status = f"SEARCHING->Casualty{nearest[0]}({nearest_dist:.0f}m,{int(steps)} steps)"
                 else:
                     in_area = self._is_in_affected_area(agent.position)
                     if not in_area:
@@ -599,18 +677,19 @@ class DisasterSim:
                         if nearest_area:
                             distance = np.linalg.norm(agent.position - nearest_area.position)
                             steps = np.ceil(distance / (agent.get_max_speed() * self.time_step))
-                            status = f"MOVING_TO_AREA({steps:.1f}steps)"
+                            status = f"MOVING_TO_AREA({distance:.0f}m,{int(steps)} steps)"
                         else:
                             status = "MOVING_TO_AREA"
                     else:
                         status = "SEARCHING(no targets)"
                 
-                resources = {rt.name.split("_")[0][:4]: agent.capacity[rt] for rt in ResourceType}
+                resource_abbr = {'BROAD_SPECTRUM_ANTIBIOTICS': 'ANT', 'BLOOD_PACKS': 'BLD', 'OXYGEN': 'OXY', 'PAIN_MEDICATION': 'PAIN'}
+                resources = {resource_abbr.get(rt.name, rt.name[:4]): round(agent.capacity[rt], 1) for rt in ResourceType}
                 
                 if nearest_dist is not None:
-                    logger.info(f"[AGENT {agent.id}/{agent.agent_type.value}] Status={status} | Position=[{agent.position[0]:.1f}, {agent.position[1]:.1f}] | NearestCasualtyDist={nearest_dist:.1f} | Resources={resources}")
+                    logger.debug(f"[AGENT {agent.id}/{agent.agent_type}] Status={status} | Position=[{agent.position[0]:.1f}, {agent.position[1]:.1f}] | NearestCasualtyDist={nearest_dist:.1f} | Resources={resources}")
                 else:
-                    logger.info(f"[AGENT {agent.id}/{agent.agent_type.value}] Status={status} | Position=[{agent.position[0]:.1f}, {agent.position[1]:.1f}] | Resources={resources}")
+                    logger.debug(f"[AGENT {agent.id}/{agent.agent_type}] Status={status} | Position=[{agent.position[0]:.1f}, {agent.position[1]:.1f}] | Resources={resources}")
             
             for casualty_id, casualty in self.casualties.items():
                 treating_agent = None
@@ -639,10 +718,10 @@ class DisasterSim:
                         if dist < min_dist:
                             min_dist = dist
                             nearest_agent = agent
-                    status = f"NEAREST_AGENT=Agent{nearest_agent.id}({min_dist:.1f}steps)"
+                    status = f"NEAREST_AGENT=Agent{nearest_agent.id}({int(min_dist)}m,{int(min_dist / (nearest_agent.get_max_speed() * self.time_step))} steps)"
                 
                 discovered_str = f"DiscoveredBy=Agent{discovered_by}" if discovered_by is not None else "DiscoveredBy=None"
-                logger.info(f"[CASUALTY {casualty_id}] Severity={casualty.severity.name} | Survival={casualty.survival_probability:.4f} | {discovered_str} | {status}")
+                logger.debug(f"[CASUALTY {casualty_id}] Severity={casualty.severity.name} | Survival={casualty.survival_probability:.4f} | {discovered_str} | {status}")
         
         # Apply secondary disasters
         if np.random.rand() < self._get_secondary_disaster_probability():
@@ -785,8 +864,11 @@ class DisasterSim:
 
         if is_treating:
             pass
+        elif mission and mission.startswith("go_to_depot_"):
+            # 有去depot补充资源的任务，优先执行
+            pass  # 由_update_dynamics()处理
         elif agent.known_casualties:
-            untreated = [(cid, info) for cid, info in agent.known_casualties.items()]
+            untreated = [(cid, info) for cid, info in agent.known_casualties.items() if not info.get('treated', False)]
             if untreated:
                 target_cid, target_info = min(untreated, key=lambda x: x[1]['distance'])
                 target_position = target_info['position']
@@ -854,11 +936,13 @@ class DisasterSim:
                     agent.known_casualties[casualty_id]['distance'] = distance
 
         if not moved_towards_target and not is_treating:
-            # 无资源Agent策略：看离受害者和depot哪个近就往哪边去
             has_resources = sum(agent.capacity.values()) > 0.1
+            is_drone = getattr(agent, 'agent_type', None) == AgentType.DRONE
+            max_capacity = sum(agent.max_capacity.values()) if hasattr(agent, 'max_capacity') else 40.0
+            total_capacity = sum(agent.capacity.values())
+            drone_critical = is_drone and total_capacity < max_capacity * 0.2
             
-            if not has_resources:
-                # 无资源：选择最近的depot或最近的受害者
+            if not has_resources or drone_critical:
                 nearest_depot_dist = float('inf')
                 nearest_depot = None
                 for depot in self.resource_depots.values():
@@ -929,6 +1013,7 @@ class DisasterSim:
                     )
                     
                     # Resupply resources
+                    resource_abbr = {'BROAD_SPECTRUM_ANTIBIOTICS': 'ANT', 'BLOOD_PACKS': 'BLD', 'OXYGEN': 'OXY', 'PAIN_MEDICATION': 'PAIN'}
                     for resource_type in ResourceType:
                         if agent.capacity[resource_type] < agent.max_capacity[resource_type]:
                             # Try to get resources from depot
@@ -947,6 +1032,7 @@ class DisasterSim:
                 agent.endurance = max(agent.endurance - self.time_step, 0.0)
         
         # 无人机资源投送逻辑
+        resource_abbr = {'BROAD_SPECTRUM_ANTIBIOTICS': 'ANT', 'BLOOD_PACKS': 'BLD', 'OXYGEN': 'OXY', 'PAIN_MEDICATION': 'PAIN'}
         for drone in [a for a in self.rescue_agents.values() if a.agent_type == AgentType.DRONE]:
             # 无人机可以给100m范围内的其他agent补充资源
             for target_agent in self.rescue_agents.values():
@@ -955,8 +1041,12 @@ class DisasterSim:
                 
                 distance = np.linalg.norm(drone.position - target_agent.position)
                 if distance < 100.0:  # 100m范围内可以投送
+                    any_transfer = False
+                    transferred_resources = []
+                    
                     for resource_type in ResourceType:
-                        if target_agent.capacity[resource_type] < target_agent.max_capacity[resource_type]:
+                        # 资源低于80%才进行补充
+                        if target_agent.capacity[resource_type] < target_agent.max_capacity[resource_type] * 0.8:
                             needed = target_agent.max_capacity[resource_type] - target_agent.capacity[resource_type]
                             available = drone.capacity.get(resource_type, 0.0)
                             transfer = min(needed, available)
@@ -965,15 +1055,57 @@ class DisasterSim:
                                 drone.capacity[resource_type] -= transfer
                                 target_agent.capacity[resource_type] += transfer
                                 self.statistics["total_resources_replenished"] += transfer
-                                logger.info(f"[DRONE RESUPPLY] Drone{drone.id} -> Agent{target_agent.id}: {resource_type.name} +{transfer:.2f}")
+                                transferred_resources.append(f"{resource_abbr.get(resource_type.name, resource_type.name[:4])}+{transfer:.2f}")
+                                any_transfer = True
+                    
+                    if any_transfer:
+                        drone_remaining = sum(drone.capacity.values())
+                        target_remaining = sum(target_agent.capacity.values())
+                        logger.debug(f"[DRONE RESUPPLY] Time={self.current_time:.1f}s | Drone{drone.id} -> Agent{target_agent.id} | Distance={distance:.1f}m | Resources={','.join(transferred_resources)} | DroneRemaining={drone_remaining:.2f} | AgentRemaining={target_remaining:.2f}")
+        
+        # 无人机返回depot补充资源逻辑
+        for drone in [a for a in self.rescue_agents.values() if a.agent_type == AgentType.DRONE]:
+            # 检查无人机资源是否低于20%
+            total_resources = sum(drone.capacity.values())
+            total_max = sum(drone.max_capacity.values())
+            
+            if total_resources < total_max * 0.2:
+                # 资源不足，返回最近的depot补充
+                nearest_depot_dist = float('inf')
+                nearest_depot = None
+                for depot in self.resource_depots.values():
+                    dist = np.linalg.norm(drone.position - depot.position)
+                    if dist < nearest_depot_dist:
+                        nearest_depot_dist = dist
+                        nearest_depot = depot
+                
+                if nearest_depot:
+                    # 移动到depot
+                    direction = nearest_depot.position - drone.position
+                    distance = np.linalg.norm(direction)
+                    if distance > 1.0:
+                        direction = direction / distance
+                        max_speed = drone.get_max_speed()
+                        drone.position += direction * max_speed * self.time_step
+                        drone.position = np.clip(drone.position, 0, self.map_size)
+                        drone.current_mission = f"go_to_depot_{nearest_depot.id}"
+                    
+                    # 到达depot，补充资源
+                    if distance <= 10.0:  # 10m范围内视为到达
+                        for resource_type in ResourceType:
+                            drone.capacity[resource_type] = drone.max_capacity[resource_type]
+                        logger.info(f"[DRONE RESUPPLY] Drone{drone.id} refilled at depot {nearest_depot.id}")
+                        drone.current_mission = None
 
     def _can_treat_casualty(self, agent: 'RescueAgent', casualty: 'Casualty') -> bool:
         """Check if agent has sufficient resources to treat casualty."""
         if not hasattr(casualty, 'resources_needed') or not casualty.resources_needed:
             return True
 
+        # 直接按伤员真实需求判断，不按百分比
         for resource_type, amount_needed in casualty.resources_needed.items():
-            if agent.capacity.get(resource_type, 0.0) < amount_needed * 0.5:
+            if agent.capacity.get(resource_type, 0.0) < amount_needed:
+                logger.debug(f"[INSUFFICIENT RESOURCES] Agent{agent.id} cannot treat Casualty{casualty.id}: {resource_type.name} needed={amount_needed}, available={agent.capacity.get(resource_type, 0.0)}")
                 return False
         return True
 
@@ -1064,6 +1196,7 @@ class DisasterSim:
                         }
                         logger.debug(f"[CASUALTY FOUND] Agent={agent_id}, CasualtyID={casualty_id}, Severity={casualty.severity.name}, Position=[{casualty.position[0]:.1f}, {casualty.position[1]:.1f}], Distance={distances[i,j]:.1f}m, Time={self.current_time:.0f}")
                     else:
+                        agent.known_casualties[casualty_id]['position'] = casualty.position.copy()
                         agent.known_casualties[casualty_id]['distance'] = distances[i, j]
                         agent.known_casualties[casualty_id]['treated'] = casualty.treated
                         agent.known_casualties[casualty_id]['survival_probability'] = casualty.survival_probability
@@ -1081,7 +1214,7 @@ class DisasterSim:
                 if not casualty.treated:
                     close_agents = np.where(distances[:, j] <= treatment_distance_threshold)[0]
 
-                    available_agents = [a for a in close_agents if agent_ids[a] not in occupied_agents]
+                    available_agents = [a for a in close_agents if agent_ids[a] not in occupied_agents and self.rescue_agents[agent_ids[a]].agent_type != AgentType.DRONE]
 
                     if len(available_agents) > 0:
                         close_distances = distances[available_agents, j]
@@ -1094,6 +1227,18 @@ class DisasterSim:
                             priority = self._get_treatment_priority(casualty, nearest_distance)
                             candidates.append((priority, casualty_id, nearest_agent_id, nearest_distance))
                             occupied_agents.add(nearest_agent_id)
+                        else:
+                            # 最近的agent资源不足，寻找其他资源充足的agent
+                            for agent_idx in available_agents:
+                                agent_id = agent_ids[agent_idx]
+                                agent = self.rescue_agents[agent_id]
+                                if self._can_treat_casualty(agent, casualty):
+                                    distance = distances[agent_idx, j]
+                                    priority = self._get_treatment_priority(casualty, distance)
+                                    candidates.append((priority, casualty_id, agent_id, distance))
+                                    occupied_agents.add(agent_id)
+                                    logger.debug(f"[ALTERNATE TREATMENT] Agent{agent_id} (distance={distance:.1f}m) will treat Casualty{casualty_id} since nearest Agent{nearest_agent_id} lacks resources")
+                                    break
 
             candidates.sort(key=lambda x: x[0], reverse=True)
 
@@ -1106,8 +1251,12 @@ class DisasterSim:
                     if casualty.treatment_start is None:
                         casualty.treatment_start = self.current_time
                         casualty.treating_agent_id = nearest_agent_id
+                        casualty.original_treating_agent_id = nearest_agent_id  # 保存最初治疗的agent
                         self.statistics["total_treated"] = self.statistics.get("total_treated", 0) + 1
                         nearest_agent.current_mission = f"treat_casualty_{casualty_id}"
+                    # 如果treatment_start已设置但original_treating_agent_id未设置，补充设置
+                    elif not getattr(casualty, 'original_treating_agent_id', None):
+                        casualty.original_treating_agent_id = nearest_agent_id
                 else:
                     if self.step_count % 50 == 0:
                         logger.debug(f"[TREATMENT BLOCKED] Agent {nearest_agent_id} lacks resources for casualty {casualty_id}")
@@ -1134,6 +1283,7 @@ class DisasterSim:
                         casualty.treated = False
                         casualty.treatment_start = None
                         casualty.treating_agent_id = None
+                        # 注意：保留original_treating_agent_id以记录最初的治疗者
                         treating_agent.current_mission = None
                         if self.step_count % 100 == 0:
                             logger.debug(f"[TREATMENT ABANDONED] Casualty {casualty_id} released due to lack of resources")
@@ -1181,16 +1331,26 @@ class DisasterSim:
                 if treatment_duration >= required_time and casualty.survival_probability >= 0.8:
                     self.statistics["total_survivors"] += 1
                     self.statistics["total_rescued"] = self.statistics.get("total_rescued", 0) + 1
-                    treating_agent_name = f"Agent {casualty.treating_agent_id}" if hasattr(casualty, 'treating_agent_id') and casualty.treating_agent_id else "Unknown"
-                    treatment_start_str = f"{casualty.treatment_start:.1f}s" if casualty.treatment_start else "Unknown"
-                    treatment_end_str = f"{self.current_time:.1f}s"
+                    
+                    final_treating_agent_id = getattr(casualty, 'original_treating_agent_id', None) or getattr(casualty, 'treating_agent_id', None)
+                    if not final_treating_agent_id:
+                        for agent_id, agent in self.rescue_agents.items():
+                            if getattr(agent, 'current_mission', None) == f"treat_casualty_{casualty_id}":
+                                final_treating_agent_id = agent_id
+                                break
+                    
+                    treating_agent_name = f"Agent {final_treating_agent_id}" if final_treating_agent_id else "Unknown"
+                    if not final_treating_agent_id:
+                        logger.debug(f"[DEBUG] Casualty {casualty_id} rescued but no treating agent found. original_treating_agent_id={getattr(casualty, 'original_treating_agent_id', None)}, treating_agent_id={casualty.treating_agent_id}, treatment_start={casualty.treatment_start}")
+                    treatment_start_str = f"{int(casualty.treatment_start)}s" if casualty.treatment_start else "0s"
+                    treatment_end_str = f"{int(self.current_time)}s"
                     total_resources_used = sum(casualty.resources_needed.values()) * {
                         CasualtySeverity.CRITICAL: 0.15,
                         CasualtySeverity.SEVERE: 0.10,
                         CasualtySeverity.MODERATE: 0.06,
                         CasualtySeverity.MILD: 0.03
                     }[casualty.severity] * treatment_duration
-                    logger.info(f"[CASUALTY RESCUED] ID={casualty_id}, Severity={casualty.severity.name}, Survival={casualty.survival_probability:.4f}, TreatmentTime={treatment_duration:.1f}s, TreatedBy={treating_agent_name}, Start={treatment_start_str}, End={treatment_end_str}, ResourcesUsed={total_resources_used:.2f}")
+                    logger.info(f"[CASUALTY RESCUED] ID={casualty_id}, Severity={casualty.severity.name}, Survival={casualty.survival_probability:.4f}, TreatmentTime={int(treatment_duration)}s, TreatedBy={treating_agent_name}, Start={treatment_start_str}, End={treatment_end_str}, ResourcesUsed={total_resources_used:.2f}")
 
                     for area_id, area in self.affected_areas.items():
                         if casualty in area.casualties:
