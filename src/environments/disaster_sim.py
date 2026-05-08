@@ -1200,7 +1200,10 @@ class DisasterSim:
                 if needy_agents:
                     # 前往最近的需要资源的agent
                     needy_agents.sort(key=lambda x: x[0])
-                    nearest_dist, target_agent = needy_agents[0]
+                    _, target_agent = needy_agents[0]
+                    
+                    # 重新计算实时距离，而不是使用之前保存的旧距离（关键修复）
+                    nearest_dist = np.linalg.norm(drone.position - target_agent.position)
                     
                     if nearest_dist > 10.0:  # 超过10m需要移动（降低距离阈值）
                         direction = target_agent.position - drone.position
