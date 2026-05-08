@@ -22,7 +22,7 @@ warnings.filterwarnings('ignore')
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from environments.disaster_sim import DisasterSim
+from environments.disaster_sim import DisasterSim, ResourceType
 from algorithms.egt_marl import EGTMARL
 from algorithms.qmix_improved import ImprovedQMIX
 from algorithms.dynamic_frontier import DynamicParetoFrontier
@@ -305,10 +305,8 @@ class EGTMARLTrainer:
             episode_metrics['rescue_rate'] = 0.0
         
         # 计算资源利用率
-        # Calculate total initial resources across all depots
-        total_initial = 0.0
-        for initial_depot in self.env.initial_resources.values():
-            total_initial += sum(initial_depot.values())
+        # 使用环境中已计算好的初始资源总量（depot初始资源 + agent初始资源），确保与评估阶段计算口径一致
+        total_initial = sum(sum(r.values()) for r in self.env.initial_resources.values()) + self.env.initial_agent_resources
         
         if total_initial > 0:
             episode_metrics['resource_utilization'] = (episode_metrics['resources_used'] / total_initial) * 100
@@ -492,7 +490,18 @@ class EGTMARLTrainer:
             # 每个episode都打印简要的救援率信息（确保能看到每个episode的救援率）
             if episode % 1 == 0:
                 logger.info(f"Episode {episode} | Rescue Rate: {episode_metrics.get('rescue_rate', 0.0):.1f}% | "
-                           f"Rescued: {episode_metrics.get('rescued', 0)} | Deaths: {episode_metrics.get('deaths', 0)}")
+                           f"Rescued: {episode_metrics.get('rescued', 0)} | Deaths: {episode_metrics.get('deaths', 0)} | "
+                           f"Response Time: {episode_metrics.get('avg_response_time', 0.0):.1f}s | "
+                           f"Resource Utilization: {episode_metrics.get('resource_utilization', 0.0):.1f}%")
+                
+                # 打印每个agent的详细信息
+                resource_abbr = {'BROAD_SPECTRUM_ANTIBIOTICS': 'ANT', 'BLOOD_PACKS': 'BLD', 'OXYGEN': 'OXY', 'PAIN_MEDICATION': 'PAIN'}
+                for agent_id, agent in sorted(self.env.rescue_agents.items()):
+                    known_count = len(agent.known_casualties)
+                    rescued_count = getattr(agent, 'rescued_count', 0)
+                    mission = getattr(agent, 'current_mission', 'None')
+                    resources = {resource_abbr.get(rt.name, rt.name[:4]): round(agent.capacity[rt], 1) for rt in ResourceType}
+                    logger.info(f"  [AGENT {agent_id}/{agent.agent_type}] Status={mission} | Position=[{agent.position[0]:.1f}, {agent.position[1]:.1f}] | KNOWN CASUALTIES={known_count} | Rescued={rescued_count} | Resources={resources}")
         
         # 训练完成
         logger.info("Training completed!")

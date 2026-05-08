@@ -60,6 +60,8 @@ class Casualty:
     treatment_start: Optional[float] = None
     treating_agent_id: Optional[int] = None
     original_treating_agent_id: Optional[int] = None  # 保存最初治疗的agent
+    discovered_by: Optional[int] = None  # 记录第一个发现该伤员的agent
+    discovered_at: Optional[float] = None  # 记录该伤员被发现的时间
     grace_period_end: Optional[float] = None
     survival_probability: float = 1.0
     _last_update_time: float = 0.0
@@ -173,6 +175,7 @@ class RescueAgent:
         self.map_size = map_size
         self.route = []
         self.known_casualties = {}
+        self.rescued_count = 0  # 记录该agent救治的伤员数量
 
     def get_max_speed(self) -> float:
         """Get maximum speed of the agent in m/s based on type."""
@@ -233,6 +236,7 @@ class DisasterSim:
         self.casualties: Dict[int, Casualty] = {}
         self.road_network = nx.Graph()
         self.statistics = {}
+        self._logged_insufficient = set()  # 追踪已打印过资源不足日志的(agent_id, casualty_id)组合
         
         # Initialize environment
         self._initialize_affected_areas()
@@ -323,6 +327,7 @@ class DisasterSim:
                 map_size=self.map_size,
                 agent_type=agent_types[i]
             )
+            agent._has_refilled = False  # 显式初始化补充标志，避免初始状态错误显示为REFILLED
             self.rescue_agents[i] = agent
         
         # 计算初始agent资源总量
@@ -487,7 +492,19 @@ class DisasterSim:
                         'distance': distances[i, j],
                         'treated': casualty.treated
                     }
-                    logger.debug(f"[CASUALTY FOUND] Agent={agent_id}, CasualtyID={casualty_id}, Severity={casualty.severity.name}, Position=[{casualty.position[0]:.1f}, {casualty.position[1]:.1f}], Distance={distances[i,j]:.1f}m, Time={self.current_time:.0f}")
+                    # 记录第一个发现者
+                    if self.casualties[casualty_id].discovered_by is None:
+                        self.casualties[casualty_id].discovered_by = agent_id
+                        self.casualties[casualty_id].discovered_at = self.current_time
+                    # 记录每个agent的发现（用于分组打印）
+                    self.statistics["pending_casualty_discoveries"].append({
+                        'agent_id': agent_id,
+                        'casualty_id': casualty_id,
+                        'severity': casualty.severity,
+                        'position': casualty.position.copy(),
+                        'distance': distances[i, j],
+                        'time': self.current_time
+                    })
                 else:
                     # Update existing knowledge
                     agent.known_casualties[casualty_id]['distance'] = distances[i, j]
@@ -552,11 +569,13 @@ class DisasterSim:
             "total_resources_consumed": 0.0,
             "response_times": [],
             "fairness_metrics": {"gini": [], "theil": [], "max_min": []},
+            "pending_casualty_discoveries": [],  # 待打印的新发现伤员列表
         }
 
         self._last_currently_treating = 0
         self._last_min_survival = 1.0
         self._last_max_survival = 1.0
+        self._logged_insufficient = set()  # 重置已记录的资源不足日志组合
         
         # Reset reward state tracking
         self._last_survivors = 0
@@ -565,7 +584,7 @@ class DisasterSim:
         # Log initial environment information
         logger.info(f"[ENVIRONMENT INIT] Affected Areas: {len(self.affected_areas)}")
         for area_id, area in self.affected_areas.items():
-            logger.info(f"  Area {area_id}: Position=[{area.position[0]:.1f}, {area.position[1]:.1f}], Size={area.size:.1f}, Damage={area.building_damage:.2f}, Population={area.population:.0f}")
+            logger.info(f"  Area {area_id}: Position=[{area.position[0]:.1f}, {area.position[1]:.1f}], Radius={area.size:.1f}, Damage={area.building_damage:.2f}, Population={area.population:.0f}")
         
         logger.info(f"[ENVIRONMENT INIT] Resource Depots: {len(self.resource_depots)}")
         for depot_id, depot in self.resource_depots.items():
@@ -621,6 +640,19 @@ class DisasterSim:
             comm_coverage = (num_connected / max_possible_connections * 100) if max_possible_connections > 0 else 0
 
             logger.info(f"[STEP {self.step_count}] Alive: {len(self.casualties)} | Treating: {self._last_currently_treating} | Rescued: {self.statistics.get('total_rescued', 0)} | Deaths: {self.statistics.get('total_deaths', 0)} | Treated: {self.statistics.get('total_treated', 0)} | Resources: Depot={total_current_resources:.1f}, Agents={total_agent_resources:.1f}, Used={resource_consumed:.1f}/{total_initial_resources:.1f} | Comm: {num_connected}/{max_possible_connections} ({comm_coverage:.1f}%)")
+            
+            # 已移除重复的[CASUALTY FOUND]日志输出，改为仅在DEBUG级别记录发现详情
+            
+            # 每50步打印每个agent已知的伤员信息（按发现顺序输出）
+            if self.step_count % 50 == 0:
+                for agent_id, agent in sorted(self.rescue_agents.items()):
+                    if agent.known_casualties:
+                        casualty_strs = []
+                        # 按发现时间排序输出
+                        for c_id, info in sorted(agent.known_casualties.items(), key=lambda x: x[1].get('discovered_at', 0)):
+                            status = "T" if info.get('treated', False) else "F"
+                            casualty_strs.append(f"C{c_id}({info['severity'].name[:4]},{info['distance']:.0f}m,{status})")
+                        logger.debug(f"[AGENT {agent_id} KNOWN CASUALTIES] {', '.join(casualty_strs)}")
 
             for agent in self.rescue_agents.values():
                 mission = getattr(agent, 'current_mission', None)
@@ -670,7 +702,7 @@ class DisasterSim:
                         status = "WAITING_FOR_RESUPPLY"
                 # 无人机在depot补充完成后的状态
                 elif agent.agent_type == AgentType.DRONE and mission is None:
-                    # 检查是否在depot附近
+                    # 检查是否在depot附近且已完成过补充
                     at_depot = False
                     depot_id = None
                     for d_id, depot in self.resource_depots.items():
@@ -679,7 +711,7 @@ class DisasterSim:
                             at_depot = True
                             depot_id = d_id
                             break
-                    if at_depot:
+                    if at_depot and getattr(agent, '_has_refilled', False):
                         total_resources = sum(agent.capacity.values())
                         total_max = sum(agent.max_capacity.values())
                         if total_resources >= total_max * 0.95:
@@ -723,27 +755,21 @@ class DisasterSim:
                 
                 resource_abbr = {'BROAD_SPECTRUM_ANTIBIOTICS': 'ANT', 'BLOOD_PACKS': 'BLD', 'OXYGEN': 'OXY', 'PAIN_MEDICATION': 'PAIN'}
                 resources = {resource_abbr.get(rt.name, rt.name[:4]): round(agent.capacity[rt], 1) for rt in ResourceType}
+                rescued_count = getattr(agent, 'rescued_count', 0)
                 
                 if nearest_dist is not None:
-                    logger.debug(f"[AGENT {agent.id}/{agent.agent_type}] Status={status} | Position=[{agent.position[0]:.1f}, {agent.position[1]:.1f}] | NearestCasualtyDist={nearest_dist:.1f} | Resources={resources}")
+                    logger.debug(f"[AGENT {agent.id}/{agent.agent_type}] Status={status} | Position=[{agent.position[0]:.1f}, {agent.position[1]:.1f}] | NearestCasualtyDist={nearest_dist:.1f} | Resources={resources} | Rescued={rescued_count}")
                 else:
-                    logger.debug(f"[AGENT {agent.id}/{agent.agent_type}] Status={status} | Position=[{agent.position[0]:.1f}, {agent.position[1]:.1f}] | Resources={resources}")
+                    logger.debug(f"[AGENT {agent.id}/{agent.agent_type}] Status={status} | Position=[{agent.position[0]:.1f}, {agent.position[1]:.1f}] | Resources={resources} | Rescued={rescued_count}")
             
             for casualty_id, casualty in self.casualties.items():
                 treating_agent = None
-                discovered_by = None
                 
                 # Find treating agent
                 for agent in self.rescue_agents.values():
                     mission = getattr(agent, 'current_mission', None)
                     if mission == f"treat_casualty_{casualty_id}":
                         treating_agent = agent
-                        break
-                
-                # Find which agent discovered this casualty
-                for agent in self.rescue_agents.values():
-                    if casualty_id in agent.known_casualties:
-                        discovered_by = agent.id
                         break
                 
                 if treating_agent:
@@ -758,8 +784,8 @@ class DisasterSim:
                             nearest_agent = agent
                     status = f"NEAREST_AGENT=Agent{nearest_agent.id}({int(min_dist)}m,{int(min_dist / (nearest_agent.get_max_speed() * self.time_step))} steps)"
                 
-                discovered_str = f"DiscoveredBy=Agent{discovered_by}" if discovered_by is not None else "DiscoveredBy=None"
-                logger.debug(f"[CASUALTY {casualty_id}] Severity={casualty.severity.name} | Survival={casualty.survival_probability:.4f} | {discovered_str} | {status}")
+                discovered_str = f"DiscoveredBy=Agent{casualty.discovered_by}" if casualty.discovered_by is not None else "DiscoveredBy=None"
+                logger.debug(f"[CASUALTY {casualty_id}] Severity={casualty.severity.name} | Survival={casualty.survival_probability:.4f} | Position=[{casualty.position[0]:.1f},{casualty.position[1]:.1f}] | {discovered_str} | {status}")
         
         # Apply secondary disasters
         if np.random.rand() < self._get_secondary_disaster_probability():
@@ -792,10 +818,13 @@ class DisasterSim:
 
         total_replenished = self.statistics.get("total_resources_replenished", 0.0)
         total_consumed = self.statistics.get("total_resources_consumed", 0.0)
+        # 使用初始资源总量（depot初始资源 + agent初始资源），确保与训练阶段计算口径一致
+        total_initial = sum(sum(r.values()) for r in self.initial_resources.values()) + self.initial_agent_resources
+        total_available = total_initial + total_replenished
         info['resources_used'] = total_consumed
         info['resources_replenished'] = total_replenished
-        if total_replenished > 0:
-            info['resource_utilization'] = min(100.0, total_consumed / total_replenished * 100)
+        if total_available > 0:
+            info['resource_utilization'] = min(100.0, total_consumed / total_available * 100)
         else:
             info['resource_utilization'] = 0.0
         
@@ -867,16 +896,9 @@ class DisasterSim:
             target_position = np.clip(target_position, 0, self.map_size)
             agent.route = [target_position]
 
-        if "communication" in action:
-            comm_action = action["communication"]
-            if comm_action > 0 and agent.connected_agents:
-                for other_agent_id in agent.connected_agents:
-                    other_agent = self.rescue_agents[other_agent_id]
-                    for casualty_id, info in agent.known_casualties.items():
-                        if casualty_id not in other_agent.known_casualties:
-                            other_agent.known_casualties[casualty_id] = info.copy()
-        else:
-            comm_action = 0
+        # 禁用agent间信息共享，每个agent只记录自己发现的伤员
+        # 通信共享功能将在后续模拟通信通知场景时启用
+        comm_action = 0
 
         moved_towards_target = False
         
@@ -980,7 +1002,29 @@ class DisasterSim:
             total_capacity = sum(agent.capacity.values())
             drone_critical = is_drone and total_capacity < max_capacity * 0.2
             
-            if not has_resources or drone_critical:
+            # 检查资源是否足够救治最近的伤员
+            can_treat_nearest = True
+            nearest_casualty_for_resupply = None
+            if self.casualties and not is_drone:
+                nearest_casualty_dist = float('inf')
+                nearest_casualty = None
+                for casualty in self.casualties.values():
+                    if casualty.treated:
+                        continue
+                    dist = np.linalg.norm(agent.position - casualty.position)
+                    if dist < nearest_casualty_dist:
+                        nearest_casualty_dist = dist
+                        nearest_casualty = casualty
+                
+                if nearest_casualty:
+                    nearest_casualty_for_resupply = nearest_casualty
+                    can_treat_nearest = self._can_treat_casualty(agent, nearest_casualty, log_failure=False)
+            
+            # 资源不足条件：无法救治最近的伤员
+            needs_resupply = not can_treat_nearest
+            
+            if not has_resources or drone_critical or needs_resupply:
+                # 资源不足时，直接去depot补充（不比较距离）
                 nearest_depot_dist = float('inf')
                 nearest_depot = None
                 for depot in self.resource_depots.values():
@@ -989,31 +1033,46 @@ class DisasterSim:
                         nearest_depot_dist = dist
                         nearest_depot = depot
                 
-                nearest_casualty_dist = float('inf')
-                nearest_casualty = None
-                for casualty in self.casualties.values():
-                    dist = np.linalg.norm(agent.position - casualty.position)
-                    if dist < nearest_casualty_dist:
-                        nearest_casualty_dist = dist
-                        nearest_casualty = casualty
-                
-                # 选择更近的目标
-                if nearest_depot_dist < nearest_casualty_dist:
+                if nearest_depot:
                     # 去depot获取资源
                     target_position = nearest_depot.position
                     agent.current_mission = f"go_to_depot_{nearest_depot.id}"
-                else:
-                    # 去受害者位置（可能等待无人机投送）
-                    target_position = nearest_casualty.position
-                    agent.current_mission = f"wait_for_resupply"
+                    if self.step_count % 50 == 0:
+                        if not has_resources:
+                            reason = "No resources"
+                        elif needs_resupply and nearest_casualty_for_resupply:
+                            reason = f"Cannot treat nearest casualty {nearest_casualty_for_resupply.id}"
+                        elif needs_resupply:
+                            reason = "Insufficient resources for treatment"
+                        else:
+                            reason = "Drone critical"
+                        logger.info(f"[AGENT {agent.id} IDLE REASON] {reason}, going to depot {nearest_depot.id} (distance={nearest_depot_dist:.1f}m)")
+                elif self.casualties:
+                    # 没有depot但有伤员，去最近的伤员位置
+                    nearest_casualty_dist = float('inf')
+                    nearest_casualty = None
+                    for casualty in self.casualties.values():
+                        dist = np.linalg.norm(agent.position - casualty.position)
+                        if dist < nearest_casualty_dist:
+                            nearest_casualty_dist = dist
+                            nearest_casualty = casualty
+                    if nearest_casualty:
+                        target_position = nearest_casualty.position
+                        agent.current_mission = f"wait_for_resupply"
+                        if self.step_count % 50 == 0:
+                            logger.info(f"[AGENT {agent.id} IDLE REASON] No resources, no depot, waiting for resupply near casualty {nearest_casualty.id}")
                 
-                direction = target_position - agent.position
-                distance = np.linalg.norm(direction)
-                if distance > 1.0:
-                    direction = direction / distance
-                    max_speed = agent.get_max_speed()
-                    agent.position += direction * max_speed * self.time_step
-                    agent.position = np.clip(agent.position, 0, self.map_size)
+                if 'target_position' in locals():
+                    direction = target_position - agent.position
+                    distance = np.linalg.norm(direction)
+                    if distance > 1.0:
+                        direction = direction / distance
+                        max_speed = agent.get_max_speed()
+                        agent.position += direction * max_speed * self.time_step
+                        agent.position = np.clip(agent.position, 0, self.map_size)
+                else:
+                    if self.step_count % 50 == 0:
+                        logger.info(f"[AGENT {agent.id} IDLE REASON] No resources, no depot, no casualties - cannot move")
             elif hasattr(agent, 'route') and agent.route:
                 target_position = agent.route[0]
                 direction = target_position - agent.position
@@ -1026,6 +1085,7 @@ class DisasterSim:
                     if np.linalg.norm(agent.position - target_position) < 1.0:
                         agent.route.pop(0)
             else:
+                # 有资源但没有明确目标，随机移动
                 angles = np.linspace(0, 2*np.pi, 8, endpoint=False)
                 direction_idx = np.random.randint(0, 8)
                 direction = np.array([np.cos(angles[direction_idx]), np.sin(angles[direction_idx])])
@@ -1052,6 +1112,7 @@ class DisasterSim:
                     
                     # Resupply resources
                     resource_abbr = {'BROAD_SPECTRUM_ANTIBIOTICS': 'ANT', 'BLOOD_PACKS': 'BLD', 'OXYGEN': 'OXY', 'PAIN_MEDICATION': 'PAIN'}
+                    any_replenished = False
                     for resource_type in ResourceType:
                         if agent.capacity[resource_type] < agent.max_capacity[resource_type]:
                             # Try to get resources from depot
@@ -1063,128 +1124,362 @@ class DisasterSim:
                                 agent.capacity[resource_type] += transfer
                                 depot.resources[resource_type] -= transfer
                                 self.statistics["total_resources_replenished"] += transfer
+                                any_replenished = True
+                    # 如果有资源补充，清除该agent的资源不足日志记录
+                    if any_replenished:
+                        self._logged_insufficient = {k for k in self._logged_insufficient if k[0] != agent.id}
+                    
+                    # 检查agent是否在去depot的途中且资源已补充完成
+                    if getattr(agent, 'current_mission', None) and agent.current_mission.startswith("go_to_depot_"):
+                        # 检查资源是否已满
+                        total_resources = sum(agent.capacity.values())
+                        total_max = sum(agent.max_capacity.values())
+                        if total_resources >= total_max * 0.95:
+                            # 资源已满，重置任务并设置目标为最近的已知伤员
+                            agent.current_mission = None
+                            # 如果有已知伤员，设置目标为最近的
+                            if hasattr(agent, 'known_casualties') and agent.known_casualties:
+                                nearest = min(agent.known_casualties.items(), key=lambda x: x[1]['distance'])
+                                agent.target_casualty_id = nearest[0]
                     break
             
             # If not at depot, endurance decreases normally
             if not at_depot:
                 agent.endurance = max(agent.endurance - self.time_step, 0.0)
         
-        # 无人机返回depot补充资源逻辑（先执行，避免同一帧内投送后又补充）
+        # 无人机智能资源支援逻辑
         resource_abbr = {'BROAD_SPECTRUM_ANTIBIOTICS': 'ANT', 'BLOOD_PACKS': 'BLD', 'OXYGEN': 'OXY', 'PAIN_MEDICATION': 'PAIN'}
-        drones_needing_refill = []
         
         for drone in [a for a in self.rescue_agents.values() if a.agent_type == AgentType.DRONE]:
-            # 检查无人机资源是否低于20%
             total_resources = sum(drone.capacity.values())
             total_max = sum(drone.max_capacity.values())
             
+            # 检查无人机资源是否低于20%
             if total_resources < total_max * 0.2:
-                drones_needing_refill.append(drone)
-        
-        for drone in drones_needing_refill:
-            # 资源不足，返回最近的depot补充
-            nearest_depot_dist = float('inf')
-            nearest_depot = None
-            for depot in self.resource_depots.values():
-                dist = np.linalg.norm(drone.position - depot.position)
-                if dist < nearest_depot_dist:
-                    nearest_depot_dist = dist
-                    nearest_depot = depot
-            
-            if nearest_depot:
-                # 移动到depot
-                direction = nearest_depot.position - drone.position
-                distance = np.linalg.norm(direction)
-                if distance > 1.0:
-                    direction = direction / distance
-                    max_speed = drone.get_max_speed()
-                    drone.position += direction * max_speed * self.time_step
-                    drone.position = np.clip(drone.position, 0, self.map_size)
-                    drone.current_mission = f"go_to_depot_{nearest_depot.id}"
+                # 资源不足，返回最近的depot补充
+                nearest_depot_dist = float('inf')
+                nearest_depot = None
+                for depot in self.resource_depots.values():
+                    dist = np.linalg.norm(drone.position - depot.position)
+                    if dist < nearest_depot_dist:
+                        nearest_depot_dist = dist
+                        nearest_depot = depot
                 
-                # 到达depot，补充资源
-                if distance <= 10.0:  # 10m范围内视为到达
-                    for resource_type in ResourceType:
-                        drone.capacity[resource_type] = drone.max_capacity[resource_type]
-                    logger.info(f"[DRONE RESUPPLY] Drone{drone.id} refilled at depot {nearest_depot.id}")
-                    drone.current_mission = None
+                if nearest_depot:
+                    # 移动到depot
+                    direction = nearest_depot.position - drone.position
+                    distance = np.linalg.norm(direction)
+                    if distance > 1.0:
+                        direction = direction / distance
+                        max_speed = drone.get_max_speed()
+                        drone.position += direction * max_speed * self.time_step
+                        drone.position = np.clip(drone.position, 0, self.map_size)
+                        drone.current_mission = f"go_to_depot_{nearest_depot.id}"
+                    
+                    # 到达depot，补充资源
+                    if distance <= 10.0:  # 10m范围内视为到达
+                        for resource_type in ResourceType:
+                            drone.capacity[resource_type] = drone.max_capacity[resource_type]
+                        logger.info(f"[DRONE RESUPPLY] Drone{drone.id} refilled at depot {nearest_depot.id}")
+                        drone.current_mission = None
+                        drone._has_refilled = True  # 设置已补充标志
+            else:
+                # 资源充足，主动寻找需要资源的agent进行支援
+                # 找到资源不足50%的agent（降低阈值，更积极支援）
+                needy_agents = []
+                for agent in self.rescue_agents.values():
+                    if agent.id == drone.id or agent.agent_type == AgentType.DRONE:
+                        continue
+                    # 检查agent是否资源不足（低于最大容量的50%，降低阈值）
+                    agent_total = sum(agent.capacity.values())
+                    agent_max = sum(agent.max_capacity.values())
+                    if agent_total < agent_max * 0.5:
+                        dist = np.linalg.norm(drone.position - agent.position)
+                        needy_agents.append((dist, agent))
+                
+                if needy_agents:
+                    # 前往最近的需要资源的agent
+                    needy_agents.sort(key=lambda x: x[0])
+                    nearest_dist, target_agent = needy_agents[0]
+                    
+                    if nearest_dist > 10.0:  # 超过10m需要移动（降低距离阈值）
+                        direction = target_agent.position - drone.position
+                        distance = np.linalg.norm(direction)
+                        direction = direction / distance
+                        max_speed = drone.get_max_speed()
+                        drone.position += direction * max_speed * self.time_step
+                        drone.position = np.clip(drone.position, 0, self.map_size)
+                        drone.current_mission = f"go_to_agent_{target_agent.id}"
+                        
+                        # 每50step输出一次日志（在移动后输出，显示最新位置）
+                        if self.step_count % 50 == 0:
+                            new_dist = np.linalg.norm(drone.position - target_agent.position)
+                            logger.debug(f"[DRONE {drone.id}] Status=DELIVERING->Agent{target_agent.id} | Position={drone.position[0]:.1f},{drone.position[1]:.1f} | Distance={new_dist:.1f}m")
+                        
+                        if self.step_count % 100 == 0:
+                            logger.debug(f"[DRONE DISPATCH] Drone{drone.id} moving to Agent{target_agent.id} (distance={nearest_dist:.1f}m)")
+                    else:
+                        # 在10m范围内，进行投送
+                        any_transfer = False
+                        transferred_resources = []
+                        for resource_type in ResourceType:
+                            # 只要agent该资源未满，就补充
+                            if target_agent.capacity[resource_type] < target_agent.max_capacity[resource_type]:
+                                needed = target_agent.max_capacity[resource_type] - target_agent.capacity[resource_type]
+                                available = drone.capacity.get(resource_type, 0.0)
+                                transfer = min(needed, available)
+                                if transfer > 0:
+                                    drone.capacity[resource_type] -= transfer
+                                    target_agent.capacity[resource_type] += transfer
+                                    self.statistics["total_resources_replenished"] += transfer
+                                    transferred_resources.append(f"{resource_abbr.get(resource_type.name, resource_type.name[:4])}+{transfer:.2f}")
+                                    any_transfer = True
+                        
+                        if any_transfer:
+                            drone_remaining = sum(drone.capacity.values())
+                            target_remaining = sum(target_agent.capacity.values())
+                            logger.info(f"[DRONE RESUPPLY] Drone{drone.id} -> Agent{target_agent.id} | Resources={','.join(transferred_resources)} | DroneRemaining={drone_remaining:.2f}")
+                            # 清除目标agent的资源不足日志记录
+                            self._logged_insufficient = {k for k in self._logged_insufficient if k[0] != target_agent.id}
+                        # 完成交付后清除任务，允许切换到其他任务
+                        drone.current_mission = None
+                else:
+                    # 没有需要资源的agent，且资源充足，寻找未发现的伤员
+                    # 无人机的主要作用：1)寻找伤员 2)补充资源
+                    if getattr(drone, 'current_mission', None) and drone.current_mission.startswith("go_to_depot_"):
+                        # 取消返回depot任务，改为搜索伤员
+                        drone.current_mission = None
+                    
+                    # 如果没有任务，搜索未发现的伤员
+                    if not getattr(drone, 'current_mission', None):
+                        # 找到未被发现的伤员
+                        undiscovered_casualties = []
+                        for casualty in self.casualties.values():
+                            if casualty.discovered_by is None:
+                                dist = np.linalg.norm(drone.position - casualty.position)
+                                undiscovered_casualties.append((dist, casualty))
+                        
+                        if undiscovered_casualties:
+                            # 前往最近的未发现伤员
+                            undiscovered_casualties.sort(key=lambda x: x[0])
+                            nearest_dist, target_casualty = undiscovered_casualties[0]
+                            
+                            if nearest_dist > 5.0:  # 超过5m需要移动
+                                direction = target_casualty.position - drone.position
+                                distance = np.linalg.norm(direction)
+                                direction = direction / distance
+                                max_speed = drone.get_max_speed()
+                                drone.position += direction * max_speed * self.time_step
+                                map_size = self.map_size[0] if isinstance(self.map_size, (tuple, list, np.ndarray)) else self.map_size
+                                drone.position = np.clip(drone.position, 0, map_size)
+                                drone.current_mission = f"searching_casualty_{target_casualty.id}"
+                                
+                                # 每50step输出一次日志（在移动后输出，显示最新位置）
+                                if self.step_count % 50 == 0:
+                                    new_dist = np.linalg.norm(drone.position - target_casualty.position)
+                                    logger.debug(f"[DRONE {drone.id}] Status=SEARCHING->Casualty{target_casualty.id} | Position={drone.position[0]:.1f},{drone.position[1]:.1f} | Distance={new_dist:.1f}m")
+                            else:
+                                # 到达伤员位置，标记为已发现
+                                target_casualty.discovered_by = drone.id
+                                drone.current_mission = None
+                                if self.step_count % 50 == 0:
+                                    logger.debug(f"[DRONE {drone.id}] Discovered Casualty{target_casualty.id} at position {target_casualty.position}")
+                        else:
+                            # 所有伤员都已发现，进行地毯式巡逻
+                            if hasattr(drone, '_patrol_direction'):
+                                direction = drone._patrol_direction
+                            else:
+                                angles = np.linspace(0, 2*np.pi, 8, endpoint=False)
+                                direction_idx = np.random.randint(0, 8)
+                                direction = np.array([np.cos(angles[direction_idx]), np.sin(angles[direction_idx])])
+                                drone._patrol_direction = direction
+                            
+                            max_speed = drone.get_max_speed()
+                            new_position = drone.position + direction * max_speed * self.time_step
+                            
+                            # 检查是否超出边界，如果是则改变方向
+                            map_size = self.map_size[0] if isinstance(self.map_size, (tuple, list, np.ndarray)) else self.map_size
+                            if new_position[0] < 0 or new_position[0] > map_size or new_position[1] < 0 or new_position[1] > map_size:
+                                angles = np.linspace(0, 2*np.pi, 8, endpoint=False)
+                                direction_idx = np.random.randint(0, 8)
+                                direction = np.array([np.cos(angles[direction_idx]), np.sin(angles[direction_idx])])
+                                drone._patrol_direction = direction
+                                new_position = drone.position + direction * max_speed * self.time_step
+                            
+                            drone.position = np.clip(new_position, 0, map_size)
+                            
+                            # 每50step输出一次巡逻日志
+                            if self.step_count % 50 == 0:
+                                logger.debug(f"[DRONE {drone.id}] Status=PATROLLING | Position={drone.position[0]:.1f},{drone.position[1]:.1f} | Direction={direction[0]:.2f},{direction[1]:.2f}")
         
         # Agent之间资源共享逻辑
         self._agent_resource_sharing()
-        
-        # 无人机资源投送逻辑（只有不在返回depot途中的无人机才进行投送）
-        for drone in [a for a in self.rescue_agents.values() if a.agent_type == AgentType.DRONE]:
-            # 如果无人机正在返回depot，跳过投送
-            mission = getattr(drone, 'current_mission', None)
-            if mission and mission.startswith("go_to_depot_"):
-                continue
-            
-            # 无人机可以给100m范围内的其他agent补充资源
-            for target_agent in self.rescue_agents.values():
-                if target_agent.id == drone.id or target_agent.agent_type == AgentType.DRONE:
-                    continue
-                
-                distance = np.linalg.norm(drone.position - target_agent.position)
-                if distance < 100.0:  # 100m范围内可以投送
-                    any_transfer = False
-                    transferred_resources = []
-                    
-                    for resource_type in ResourceType:
-                        # 资源低于80%才进行补充
-                        if target_agent.capacity[resource_type] < target_agent.max_capacity[resource_type] * 0.8:
-                            needed = target_agent.max_capacity[resource_type] - target_agent.capacity[resource_type]
-                            available = drone.capacity.get(resource_type, 0.0)
-                            transfer = min(needed, available)
-                            
-                            if transfer > 0:
-                                drone.capacity[resource_type] -= transfer
-                                target_agent.capacity[resource_type] += transfer
-                                self.statistics["total_resources_replenished"] += transfer
-                                transferred_resources.append(f"{resource_abbr.get(resource_type.name, resource_type.name[:4])}+{transfer:.2f}")
-                                any_transfer = True
-                    
-                    if any_transfer:
-                        drone_remaining = sum(drone.capacity.values())
-                        target_remaining = sum(target_agent.capacity.values())
-                        logger.debug(f"[DRONE RESUPPLY] Time={self.current_time:.1f}s | Drone{drone.id} -> Agent{target_agent.id} | Distance={distance:.1f}m | Resources={','.join(transferred_resources)} | DroneRemaining={drone_remaining:.2f} | AgentRemaining={target_remaining:.2f}")
 
     def _agent_resource_sharing(self):
-        """Agent之间可以在近距离内交换资源"""
+        """Agent之间资源共享，仅在集中资源救治伤员时允许转移（无人机例外）"""
         resource_abbr = {'BROAD_SPECTRUM_ANTIBIOTICS': 'ANT', 'BLOOD_PACKS': 'BLD', 'OXYGEN': 'OXY', 'PAIN_MEDICATION': 'PAIN'}
         agents = list(self.rescue_agents.values())
+        transfer_logs = []  # 收集所有转移日志，最后合并输出
         
-        for i, agent1 in enumerate(agents):
-            for j, agent2 in enumerate(agents):
-                if i >= j:  # 避免重复处理
+        # 获取正在治疗的agent列表（同时检查casualty状态和agent的current_mission）
+        treating_agents = set()
+        for casualty in self.casualties.values():
+            if casualty.treated and getattr(casualty, 'treating_agent_id', None) is not None:
+                treating_agents.add(casualty.treating_agent_id)
+        # 额外检查agent的current_mission，确保捕获所有正在治疗的agent
+        for agent in agents:
+            mission = getattr(agent, 'current_mission', None)
+            if mission and mission.startswith("treat_casualty_"):
+                treating_agents.add(agent.id)
+        
+        # 仅保留策略：集中资源到即将治疗伤员但资源不足的agent
+        # 其他场景（普通资源转移）默认不进行，无人机例外（无人机逻辑在_update_dynamics中处理）
+        for casualty in self.casualties.values():
+            # 只处理未被治疗的伤员
+            if casualty.treated:
+                continue
+            
+            # 找到伤员15m范围内的所有agent（排除正在治疗的agent）
+            nearby_agents = []
+            for agent in agents:
+                if agent.agent_type == AgentType.DRONE:
+                    continue
+                # 跳过正在治疗其他伤员的agent，避免资源冲突
+                if agent.id in treating_agents:
+                    continue
+                dist = np.linalg.norm(agent.position - casualty.position)
+                if dist <= 15.0:
+                    nearby_agents.append((dist, agent))
+            
+            if not nearby_agents:
+                continue
+            
+            # 按距离排序，找到最近的agent
+            nearby_agents.sort(key=lambda x: x[0])
+            nearest_dist, nearest_agent = nearby_agents[0]
+            
+            # 检查条件1：是否没有任何一个agent单独能治疗该伤员
+            any_agent_can_treat = False
+            for _, agent in nearby_agents:
+                if self._can_treat_casualty(agent, casualty, log_failure=False):
+                    any_agent_can_treat = True
+                    break
+            
+            if any_agent_can_treat:
+                continue  # 有agent能单独治疗，不需要集中资源
+            
+            # 检查条件2：所有agent合起来是否有足够资源
+            total_resources = {}
+            for _, agent in nearby_agents:
+                for resource_type in ResourceType:
+                    total_resources[resource_type] = total_resources.get(resource_type, 0.0) + agent.capacity.get(resource_type, 0.0)
+            
+            can_treat_together = True
+            for resource_type, amount_needed in casualty.resources_needed.items():
+                if total_resources.get(resource_type, 0.0) < amount_needed:
+                    can_treat_together = False
+                    break
+            
+            if not can_treat_together:
+                # 合起来资源也不够，记录详细日志便于分析
+                log_key = (nearest_agent.id, casualty.id)
+                if log_key not in self._logged_insufficient:
+                    needed_str = ", ".join([f"{resource_abbr.get(rt.name, rt.name[:4])}={amount_needed:.1f}" 
+                                          for rt, amount_needed in casualty.resources_needed.items()])
+                    total_str = ", ".join([f"{resource_abbr.get(rt.name, rt.name[:4])}={total_resources.get(rt, 0.0):.1f}" 
+                                          for rt in ResourceType])
+                    logger.info(f"[INSUFFICIENT TOTAL RESOURCES] Casualty{casualty.id} cannot be treated - Needed: {needed_str}, Available: {total_str}, Agents nearby: {len(nearby_agents)}")
+                    self._logged_insufficient.add(log_key)
+                continue  # 合起来资源也不够，无法治疗
+            
+            # 满足条件：没有agent单独能治疗，但合起来可以
+            # 现在集中资源到最近的agent
+            gather_logs = []
+            gather_logs.append(f"Casualty{casualty.id}: gathering to Agent{nearest_agent.id}")
+            
+            # 计算每个资源类型还需要多少
+            needed = {}
+            for resource_type, amount_needed in casualty.resources_needed.items():
+                needed[resource_type] = max(0.0, amount_needed - nearest_agent.capacity.get(resource_type, 0.0))
+            
+            # 从其他agent按需转移资源（一次性转移足够量）
+            has_transfer = False
+            for dist, agent in nearby_agents[1:]:  # 跳过最近的agent
+                if agent.id == nearest_agent.id:
                     continue
                 
-                distance = np.linalg.norm(agent1.position - agent2.position)
-                if distance < 15.0:  # 15m范围内可以交换
-                    # 策略1：有余量的agent向资源不足的agent转移资源
-                    for resource_type in ResourceType:
-                        # agent1有余量（超过50%），agent2不足（低于30%）
-                        if agent1.capacity[resource_type] > agent1.max_capacity[resource_type] * 0.5:
-                            surplus = agent1.capacity[resource_type] - agent1.max_capacity[resource_type] * 0.5
-                            if agent2.capacity[resource_type] < agent2.max_capacity[resource_type] * 0.3:
-                                needed = agent2.max_capacity[resource_type] * 0.3 - agent2.capacity[resource_type]
-                                transfer = min(surplus, needed)
-                                if transfer > 0:
-                                    agent1.capacity[resource_type] -= transfer
-                                    agent2.capacity[resource_type] += transfer
-                                    abbr = resource_abbr.get(resource_type.name, resource_type.name[:4])
-                                    logger.debug(f"[RESOURCE TRANSFER] Agent{agent1.id} -> Agent{agent2.id}: {abbr}={transfer:.2f} | Dist={distance:.1f}m")
+                for resource_type in ResourceType:
+                    if needed.get(resource_type, 0.0) <= 0:
+                        continue
+                    
+                    available = agent.capacity.get(resource_type, 0.0)
+                    if available <= 0:
+                        continue
+                    
+                    # 一次性转移所有可用资源或所需资源的最小值
+                    transfer = min(available, needed[resource_type])
+                    if transfer > 0:
+                        agent.capacity[resource_type] -= transfer
+                        nearest_agent.capacity[resource_type] += transfer
+                        needed[resource_type] -= transfer
+                        abbr = resource_abbr.get(resource_type.name, resource_type.name[:4])
+                        gather_logs.append(f"  Agent{agent.id}->Agent{nearest_agent.id}:{abbr}+{transfer:.2f}")
+                        has_transfer = True
+            
+            if has_transfer:  # 有实际转移发生
+                transfer_logs.append("[RESOURCE GATHER] " + "; ".join(gather_logs))
+            
+            # 检查是否已经收集到足够资源（使用完整治疗所需资源量）
+            has_enough = self._can_treat_casualty(nearest_agent, casualty, log_failure=False)
+            
+            if has_enough:
+                transfer_logs.append(f"[RESOURCE GATHER COMPLETE] Agent{nearest_agent.id} has enough resources for Casualty{casualty.id}")
+                # 清除目标agent的资源不足日志记录
+                self._logged_insufficient = {k for k in self._logged_insufficient if k[0] != nearest_agent.id}
+                # 标记该agent即将开始治疗，避免被其他伤员选中
+                treating_agents.add(nearest_agent.id)
+        
+        # 合并所有转移日志为单行输出
+        if transfer_logs:
+            logger.debug(f"[RESOURCE TRANSFER] {'; '.join(transfer_logs)}")
 
     def _can_treat_casualty(self, agent: 'RescueAgent', casualty: 'Casualty', log_failure: bool = True) -> bool:
-        """Check if agent has sufficient resources to treat casualty."""
+        """Check if agent has sufficient resources to treat casualty.
+        
+        检查资源是否足够完成整个治疗过程，而不仅仅是开始时的需求量。
+        治疗过程中资源会持续消耗，需要确保有足够的资源完成治疗。
+        """
         if not hasattr(casualty, 'resources_needed') or not casualty.resources_needed:
             return True
 
-        # 直接按伤员真实需求判断，不按百分比
+        # 获取治疗时间和每步消耗量
+        required_time = {
+            CasualtySeverity.CRITICAL: 30,
+            CasualtySeverity.SEVERE: 20,
+            CasualtySeverity.MODERATE: 10,
+            CasualtySeverity.MILD: 3,
+        }[casualty.severity]
+        
+        # 每步消耗系数（基于治疗时间调整，确保总消耗合理）
+        consumption_factor = {
+            CasualtySeverity.CRITICAL: 0.30,  # 30秒治疗，总消耗约为需求量的1.5倍
+            CasualtySeverity.SEVERE: 0.25,    # 20秒治疗，总消耗约为需求量的1.3倍
+            CasualtySeverity.MODERATE: 0.20,  # 10秒治疗，总消耗约为需求量的1.2倍
+            CasualtySeverity.MILD: 0.15        # 3秒治疗，总消耗约为需求量的1.1倍
+        }[casualty.severity]
+
+        # 检查每种资源是否足够完成整个治疗过程
+        # 总消耗 = 需求量 × (1 + 消耗系数)，确保总消耗在合理范围内
         for resource_type, amount_needed in casualty.resources_needed.items():
             available = agent.capacity.get(resource_type, 0.0)
-            if available < amount_needed:
+            total_consumption = amount_needed * (1 + consumption_factor)
+            
+            if available < total_consumption - 1e-6:  # 允许微小浮点误差
                 if log_failure:
-                    logger.debug(f"[INSUFFICIENT RESOURCES] Agent{agent.id} cannot treat Casualty{casualty.id}: {resource_type.name} needed={amount_needed:.1f}, available={available:.1f}")
+                    log_key = (agent.id, casualty.id)
+                    if log_key not in self._logged_insufficient:
+                        logger.debug(f"[INSUFFICIENT RESOURCES] Agent{agent.id} cannot treat Casualty{casualty.id}: {resource_type.name} needed={total_consumption:.1f} (for full treatment), available={available:.1f}")
+                        self._logged_insufficient.add(log_key)
                 return False
         return True
 
@@ -1271,9 +1566,10 @@ class DisasterSim:
                             'severity': casualty.severity,
                             'survival_probability': casualty.survival_probability,
                             'distance': distances[i, j],
-                            'treated': casualty.treated
+                            'treated': casualty.treated,
+                            'discovered_at': self.current_time  # 记录发现时间，用于排序
                         }
-                        logger.debug(f"[CASUALTY FOUND] Agent={agent_id}, CasualtyID={casualty_id}, Severity={casualty.severity.name}, Position=[{casualty.position[0]:.1f}, {casualty.position[1]:.1f}], Distance={distances[i,j]:.1f}m, Time={self.current_time:.0f}")
+                        # 已注释掉[CASUALTY FOUND]日志，避免日志冗余
                     else:
                         agent.known_casualties[casualty_id]['position'] = casualty.position.copy()
                         agent.known_casualties[casualty_id]['distance'] = distances[i, j]
@@ -1320,9 +1616,12 @@ class DisasterSim:
                                     logger.debug(f"[ALTERNATE TREATMENT] Agent{agent_id} (distance={distance:.1f}m) will treat Casualty{casualty_id} since nearest Agent{nearest_agent_id} lacks resources")
                                     found_alternate = True
                                     break
-                            # 只有当没有找到替代agent时才打印资源不足的日志
+                            # 只有当没有找到替代agent且该组合未曾记录过时才打印资源不足的日志
                             if not found_alternate:
-                                self._can_treat_casualty(nearest_agent, casualty, log_failure=True)
+                                log_key = (nearest_agent_id, casualty_id)
+                                if log_key not in self._logged_insufficient:
+                                    self._can_treat_casualty(nearest_agent, casualty, log_failure=True)
+                                    self._logged_insufficient.add(log_key)
 
             candidates.sort(key=lambda x: x[0], reverse=True)
 
@@ -1331,6 +1630,15 @@ class DisasterSim:
                 nearest_agent = self.rescue_agents[nearest_agent_id]
 
                 if self._can_treat_casualty(nearest_agent, casualty, log_failure=False):
+                    # 确保救治agent知道这个伤员
+                    if casualty_id not in nearest_agent.known_casualties:
+                        nearest_agent.known_casualties[casualty_id] = {
+                            'position': casualty.position.copy(),
+                            'severity': casualty.severity,
+                            'survival_probability': casualty.survival_probability,
+                            'distance': nearest_distance,
+                            'treated': casualty.treated
+                        }
                     casualty.treated = True
                     if casualty.treatment_start is None:
                         casualty.treatment_start = self.current_time
@@ -1418,6 +1726,11 @@ class DisasterSim:
                     self.statistics["total_survivors"] += 1
                     self.statistics["total_rescued"] = self.statistics.get("total_rescued", 0) + 1
                     
+                    # 计算响应时间：从未发现到现在的时间
+                    discovered_time = casualty.discovered_at if casualty.discovered_at is not None else casualty.injury_time
+                    response_time = self.current_time - discovered_time
+                    self.statistics["response_times"].append(response_time)
+                    
                     original_id = getattr(casualty, 'original_treating_agent_id', None)
                     current_id = getattr(casualty, 'treating_agent_id', None)
                     final_treating_agent_id = original_id if original_id is not None else current_id
@@ -1439,7 +1752,11 @@ class DisasterSim:
                         CasualtySeverity.MODERATE: 0.06,
                         CasualtySeverity.MILD: 0.03
                     }[casualty.severity] * treatment_duration
-                    logger.info(f"[CASUALTY RESCUED] ID={casualty_id}, Severity={casualty.severity.name}, Survival={casualty.survival_probability:.4f}, TreatmentTime={int(treatment_duration)}s, TreatedBy={treating_agent_name}, Start={treatment_start_str}, End={treatment_end_str}, ResourcesUsed={total_resources_used:.2f}")
+                    logger.info(f"[CASUALTY RESCUED] ID={casualty_id}, Severity={casualty.severity.name}, Survival={casualty.survival_probability:.4f}, TreatmentTime={int(treatment_duration)}s, TreatedBy={treating_agent_name}, Start={treatment_start_str}, End={treatment_end_str}, ResourcesUsed={total_resources_used:.1f}")
+
+                    # 更新救治agent的救治数量
+                    if original_id is not None and original_id in self.rescue_agents:
+                        self.rescue_agents[original_id].rescued_count += 1
 
                     for area_id, area in self.affected_areas.items():
                         if casualty in area.casualties:
