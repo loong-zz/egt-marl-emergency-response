@@ -996,6 +996,14 @@ class DisasterSim:
                     agent.known_casualties[casualty_id]['distance'] = distance
 
         if not moved_towards_target and not is_treating:
+            # 检查是否正在执行资源补给任务，如果是则继续执行，不覆盖
+            current_mission = getattr(agent, 'current_mission', None)
+            if current_mission and current_mission.startswith("go_to_agent_"):
+                # 继续执行资源补给任务
+                continue_mission = True
+            else:
+                continue_mission = False
+            
             has_resources = sum(agent.capacity.values()) > 0.1
             is_drone = getattr(agent, 'agent_type', None) == AgentType.DRONE
             max_capacity = sum(agent.max_capacity.values()) if hasattr(agent, 'max_capacity') else 40.0
@@ -1023,7 +1031,48 @@ class DisasterSim:
             # 资源不足条件：无法救治最近的伤员
             needs_resupply = not can_treat_nearest
             
-            if not has_resources or drone_critical or needs_resupply:
+            # 如果正在执行资源补给任务，跳过资源检查逻辑，继续执行任务
+            if continue_mission:
+                # 继续执行当前的资源补给任务
+                target_agent_id = int(current_mission.replace("go_to_agent_", ""))
+                if target_agent_id in self.rescue_agents:
+                    target_agent = self.rescue_agents[target_agent_id]
+                    direction = target_agent.position - agent.position
+                    distance = np.linalg.norm(direction)
+                    if distance > 1.0:
+                        direction = direction / distance
+                        max_speed = agent.get_max_speed()
+                        agent.position += direction * max_speed * self.time_step
+                        agent.position = np.clip(agent.position, 0, self.map_size)
+                        
+                        if self.step_count % 50 == 0:
+                            new_dist = np.linalg.norm(agent.position - target_agent.position)
+                            logger.debug(f"[DRONE {agent.id}] Status=DELIVERING->Agent{target_agent.id} | Position={agent.position[0]:.1f},{agent.position[1]:.1f} | Distance={new_dist:.1f}m")
+                    else:
+                        # 到达目标agent位置，进行投送
+                        any_transfer = False
+                        transferred_resources = []
+                        resource_abbr = {'BROAD_SPECTRUM_ANTIBIOTICS': 'ANT', 'BLOOD_PACKS': 'BLD', 'OXYGEN': 'OXY', 'PAIN_MEDICATION': 'PAIN'}
+                        for resource_type in ResourceType:
+                            if target_agent.capacity[resource_type] < target_agent.max_capacity[resource_type]:
+                                needed = target_agent.max_capacity[resource_type] - target_agent.capacity[resource_type]
+                                available = agent.capacity.get(resource_type, 0.0)
+                                transfer = min(needed, available)
+                                if transfer > 0:
+                                    agent.capacity[resource_type] -= transfer
+                                    target_agent.capacity[resource_type] += transfer
+                                    self.statistics["total_resources_replenished"] += transfer
+                                    transferred_resources.append(f"{resource_abbr.get(resource_type.name, resource_type.name[:4])}+{transfer:.2f}")
+                                    any_transfer = True
+                        if any_transfer:
+                            drone_remaining = sum(agent.capacity.values())
+                            target_remaining = sum(target_agent.capacity.values())
+                            logger.info(f"[DRONE RESUPPLY] Drone{agent.id} -> Agent{target_agent.id} | Resources={','.join(transferred_resources)} | DroneRemaining={drone_remaining:.2f}")
+                            self._logged_insufficient = {k for k in self._logged_insufficient if k[0] != target_agent.id}
+                        agent.current_mission = None
+                else:
+                    agent.current_mission = None
+            elif not has_resources or drone_critical or needs_resupply:
                 # 资源不足时，直接去depot补充（不比较距离）
                 nearest_depot_dist = float('inf')
                 nearest_depot = None
@@ -1125,9 +1174,18 @@ class DisasterSim:
                                 depot.resources[resource_type] -= transfer
                                 self.statistics["total_resources_replenished"] += transfer
                                 any_replenished = True
-                    # 如果有资源补充，清除该agent的资源不足日志记录
+                    # 如果有资源补充，清除该agent的资源不足日志记录并输出日志
                     if any_replenished:
-                        self._logged_insufficient = {k for k in self._logged_insufficient if k[0] != agent.id}
+                        # 补充完成后，清除go_to_depot任务，切换到寻找伤员
+                        if getattr(agent, 'current_mission', None) and agent.current_mission.startswith("go_to_depot_"):
+                            agent.current_mission = None
+                            # 只有在完成depot任务时才输出日志（避免重复输出）
+                            self._logged_insufficient = {k for k in self._logged_insufficient if k[0] != agent.id}
+                            replenished_resources = []
+                            for resource_type in ResourceType:
+                                if agent.capacity[resource_type] > 0:
+                                    replenished_resources.append(f"{resource_abbr.get(resource_type.name, resource_type.name)}={agent.capacity[resource_type]:.1f}")
+                            logger.info(f"[AGENT RESUPPLY] Agent{agent.id} refilled at depot {depot.id} | Resources={','.join(replenished_resources)}")
                     
                     # 检查agent是否在去depot的途中且资源已补充完成
                     if getattr(agent, 'current_mission', None) and agent.current_mission.startswith("go_to_depot_"):
@@ -1249,7 +1307,50 @@ class DisasterSim:
                 else:
                     # 没有需要资源的agent，且资源充足，寻找未发现的伤员
                     # 无人机的主要作用：1)寻找伤员 2)补充资源
-                    if getattr(drone, 'current_mission', None) and drone.current_mission.startswith("go_to_depot_"):
+                    
+                    # 如果正在执行资源补给任务，继续执行，不切换到搜索
+                    if getattr(drone, 'current_mission', None) and drone.current_mission.startswith("go_to_agent_"):
+                        # 继续执行资源补给任务
+                        target_agent_id = int(drone.current_mission.replace("go_to_agent_", ""))
+                        if target_agent_id in self.rescue_agents:
+                            target_agent = self.rescue_agents[target_agent_id]
+                            nearest_dist = np.linalg.norm(drone.position - target_agent.position)
+                            if nearest_dist > 10.0:
+                                direction = target_agent.position - drone.position
+                                distance = np.linalg.norm(direction)
+                                direction = direction / distance
+                                max_speed = drone.get_max_speed()
+                                drone.position += direction * max_speed * self.time_step
+                                drone.position = np.clip(drone.position, 0, self.map_size)
+                                
+                                if self.step_count % 50 == 0:
+                                    new_dist = np.linalg.norm(drone.position - target_agent.position)
+                                    logger.debug(f"[DRONE {drone.id}] Status=DELIVERING->Agent{target_agent.id} | Position={drone.position[0]:.1f},{drone.position[1]:.1f} | Distance={new_dist:.1f}m")
+                            else:
+                                # 到达目标agent位置，进行投送
+                                any_transfer = False
+                                transferred_resources = []
+                                for resource_type in ResourceType:
+                                    if target_agent.capacity[resource_type] < target_agent.max_capacity[resource_type]:
+                                        needed = target_agent.max_capacity[resource_type] - target_agent.capacity[resource_type]
+                                        available = drone.capacity.get(resource_type, 0.0)
+                                        transfer = min(needed, available)
+                                        if transfer > 0:
+                                            drone.capacity[resource_type] -= transfer
+                                            target_agent.capacity[resource_type] += transfer
+                                            self.statistics["total_resources_replenished"] += transfer
+                                            transferred_resources.append(f"{resource_abbr.get(resource_type.name, resource_type.name[:4])}+{transfer:.2f}")
+                                            any_transfer = True
+                                if any_transfer:
+                                    drone_remaining = sum(drone.capacity.values())
+                                    target_remaining = sum(target_agent.capacity.values())
+                                    logger.info(f"[DRONE RESUPPLY] Drone{drone.id} -> Agent{target_agent.id} | Resources={','.join(transferred_resources)} | DroneRemaining={drone_remaining:.2f}")
+                                    self._logged_insufficient = {k for k in self._logged_insufficient if k[0] != target_agent.id}
+                                drone.current_mission = None
+                        else:
+                            drone.current_mission = None
+                    
+                    elif getattr(drone, 'current_mission', None) and drone.current_mission.startswith("go_to_depot_"):
                         # 取消返回depot任务，改为搜索伤员
                         drone.current_mission = None
                     
