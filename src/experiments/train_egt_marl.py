@@ -134,7 +134,7 @@ class EGTMARLTrainer:
         log_level = getattr(logging, log_level_str.upper(), logging.INFO)
         logging.basicConfig(
             level=log_level,
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            format='%(asctime)s %(name)s:%(lineno)d %(levelname)s %(message)s',
             handlers=[
                 logging.FileHandler(str(log_file), encoding='utf-8'),
                 logging.StreamHandler()
