@@ -23,6 +23,7 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from environments.disaster_sim import DisasterSim, ResourceType
+from environments.config.constants import RESOURCE_ABBR
 from algorithms.egt_marl import EGTMARL
 from algorithms.qmix_improved import ImprovedQMIX
 from algorithms.dynamic_frontier import DynamicParetoFrontier
@@ -272,7 +273,11 @@ class EGTMARLTrainer:
             
             # 记录奖励和状态信息
             if step % 50 == 0:
-                logger.debug(f"Step {step}: Reward={rewards:.4f}, Rescued={info.get('rescued', 0)}, Deaths={info.get('deaths', 0)}")
+                stats = info.get('statistics', {})
+                rescued = stats.get('total_rescued', 0)
+                deaths = stats.get('total_deaths', 0)
+                logger.debug(f"Step {step}: Reward={rewards:.4f}, Rescued={rescued}, Deaths={deaths}")
+                self._log_entity_info(step)
             
             # 更新状态
             state = next_state
@@ -293,9 +298,9 @@ class EGTMARLTrainer:
             episode_metrics['avg_response_time'] = 0.0
         
         # 在episode结束时获取最终的rescued和deaths值
-        episode_metrics['rescued'] = info.get('rescued', 0)
-        episode_metrics['deaths'] = info.get('deaths', 0)
-        episode_metrics['resources_used'] = info.get('resources_used', 0)
+        episode_metrics['rescued'] = info.get('statistics', {}).get('total_rescued', 0)
+        episode_metrics['deaths'] = info.get('statistics', {}).get('total_deaths', 0)
+        episode_metrics['resources_used'] = info.get('statistics', {}).get('resources_used', 0)
         
         # 计算救援成功率
         total_victims = self.env.num_victims
@@ -314,6 +319,32 @@ class EGTMARLTrainer:
             episode_metrics['resource_utilization'] = 0.0
         
         return episode_metrics
+    
+    def _log_entity_info(self, step: int) -> None:
+        """Log detailed entity information every 50 steps for debugging."""
+        # Log agent information (single line per agent)
+        logger.debug(f"=== Step {step} - Agents ===")
+        for agent_id, agent in sorted(self.env.rescue_agents.items()):
+            logger.debug(f"  {agent.format_log_line()}")
+        
+        # Log casualty information (single line per casualty) - skip treated casualties
+        logger.debug(f"=== Step {step} - Casualties ===")
+        for casualty_id, casualty in sorted(self.env.casualties.items()):
+            # Skip already treated casualties
+            if casualty.treated:
+                continue
+            
+            # Find nearest agent
+            nearest_agent = None
+            min_dist = float('inf')
+            for agent in self.env.rescue_agents.values():
+                dist = np.linalg.norm(agent.position - casualty.position)
+                if dist < min_dist:
+                    min_dist = dist
+                    nearest_agent = agent.id
+            
+            nearest_info = {'agent_id': nearest_agent, 'distance': min_dist}
+            logger.debug(f"  {casualty.format_log_line(nearest_info)}")
     
     def evaluate(self, num_episodes: int = 10) -> Dict[str, float]:
         """
@@ -349,22 +380,25 @@ class EGTMARLTrainer:
 
                 episode_reward += rewards
 
-                if 'response_time' in info:
-                    response_times.append(info['response_time'])
-
                 state = next_state
                 step += 1
             
-            # 在episode结束时获取最终的rescued值
-            episode_rescued = info.get('rescued', 0)
+            # 在episode结束时获取最终的统计数据
+            statistics = info.get('statistics', {})
+            episode_rescued = statistics.get('total_rescued', 0)
             
             # 计算指标
             total_victims = self.env.num_victims
             rescue_rate = (episode_rescued / total_victims * 100) if total_victims > 0 else 0.0
 
+            # 计算平均响应时间
+            response_times = statistics.get('response_times', [])
             avg_response_time = np.mean(response_times) if response_times else 0.0
 
-            resource_utilization = info.get('resource_utilization', 0.0)
+            # 计算资源利用率
+            resources_used = statistics.get('resources_used', 0.0)
+            total_initial = sum(sum(r.values()) for r in self.env.initial_resources.values()) + self.env.initial_agent_resources
+            resource_utilization = (resources_used / total_initial * 100) if total_initial > 0 else 0.0
 
             eval_metrics['rescue_rate'].append(rescue_rate)
             eval_metrics['avg_response_time'].append(avg_response_time)

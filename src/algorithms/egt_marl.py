@@ -63,14 +63,14 @@ class EGTMARL:
                 self.config = yaml.safe_load(f)
         
         # Update configuration with provided parameters (only if not already set)
-        if 'state_dim' not in self.config['marl'] or state_dim != 22:
+        if 'state_dim' not in self.config['marl']:
             self.config['marl']['state_dim'] = state_dim
         # Action space: 8 tactical (movement) * 4 communication = 32 possible actions
-        if 'action_dim' not in self.config['marl'] or action_dim != 32:
+        if 'action_dim' not in self.config['marl']:
             self.config['marl']['action_dim'] = action_dim
-        if 'num_agents' not in self.config['marl'] or num_agents != 3:
+        if 'num_agents' not in self.config['marl']:
             self.config['marl']['num_agents'] = num_agents
-        if 'hidden_dim' not in self.config['marl'] or hidden_dim != 64:
+        if 'hidden_dim' not in self.config['marl']:
             self.config['marl']['hidden_dim'] = hidden_dim
         
         # Get actual state dimension and num_agents from environment if provided
