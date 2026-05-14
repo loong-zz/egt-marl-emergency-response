@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Optional
 import numpy as np
 import logging
 
-from .config.constants import TREATMENT_RANGE, MODERATE_RESOURCES_NEEDED, ARRIVAL_RANGE, MIN_MOVE_DISTANCE, POSITION_CHANGE_THRESHOLD, ResourceType
+from .config.constants import TREATMENT_RANGE, ARRIVAL_RANGE, MIN_MOVE_DISTANCE, POSITION_CHANGE_THRESHOLD, ResourceType
 
 logger = logging.getLogger(__name__)
 
@@ -211,10 +211,7 @@ class PersonnelBehavior(AgentBehavior):
         if getattr(agent, '_has_refilled', False):
             return False
 
-        for rt, needed in MODERATE_RESOURCES_NEEDED.items():
-            if agent.capacity.get(rt, 0.0) < needed:
-                return True
-        return False
+        return agent.needs_resources()
 
     def _assign_depot_mission(self, agent: 'RescueAgent', env: 'DisasterSim') -> bool:
         """Assign go_to_depot mission."""
@@ -357,7 +354,7 @@ class VehicleBehavior(PersonnelBehavior):
         super().process(agent, env)
 
 
-class DroneBehavior(AgentBehavior):
+class DroneBehavior(PersonnelBehavior):
     """
     Behavior strategy for drone agents.
 
@@ -365,46 +362,107 @@ class DroneBehavior(AgentBehavior):
     - Resource delivery to agents
     - Casualty search
     - Depot resupply
-    - Patrol behavior
+    - Exploration
+
+    Process flow:
+        1. Detect casualties in range (inherited from parent)
+        2. Handle existing mission (go_to_depot / go_to_agent / exploring)
+        3. Assign new mission (prioritize delivery > supply > explore)
+
+    Drone-specific missions:
+        - go_to_depot_{id}: Return to depot for refill
+        - go_to_agent_{id}: Deliver resources to needy agent
+        - exploring: Search for casualties
     """
 
     def process(self, agent: 'RescueAgent', env: 'DisasterSim') -> None:
         """Process drone agent behavior."""
-        detection_range = agent.get_detection_range()
+        self._detect_casualties(agent, env)
 
-        for casualty in env.casualties.values():
-            if casualty.discovered_by is not None:
-                continue
-            dist = np.linalg.norm(agent.position - casualty.position)
-            if dist <= detection_range:
-                casualty.discovered_by = agent.id
-                casualty.discovered_at = env.current_time
+        if self._handle_existing_mission(agent, env):
+            return
 
+        if self._needs_refill(agent, env):
+            if self._assign_depot_mission(agent, env):
+                return
+
+        if self._assign_delivery_mission(agent, env):
+            return
+
+        self._explore(agent, env)
+
+    def _handle_existing_mission(self, agent: 'RescueAgent', env: 'DisasterSim') -> bool:
+        """Handle existing mission. Returns True if mission was handled."""
+        mission = getattr(agent, 'current_mission', None)
+        if not mission:
+            return False
+
+        if mission.startswith("go_to_depot_"):
+            return self._handle_depot_mission(agent, env, mission)
+
+        if mission.startswith("go_to_agent_"):
+            return self._handle_go_to_agent_mission(agent, env, mission)
+
+        if mission == "exploring":
+            return self._handle_exploration(agent, env)
+
+        return False
+
+    def _handle_go_to_agent_mission(self, agent: 'RescueAgent', env: 'DisasterSim', mission: str) -> bool:
+        """Handle go_to_agent mission - navigate to needy agent location."""
+        target_agent_id = int(mission.replace("go_to_agent_", ""))
+        if target_agent_id not in env.rescue_agents:
+            agent.current_mission = None
+            return False
+
+        target_agent = env.rescue_agents[target_agent_id]
+        distance = np.linalg.norm(agent.position - target_agent.position)
+
+        if distance > ARRIVAL_RANGE:
+            self._navigate_to(agent, target_agent.position, env)
+            return True
+
+        if env.drone_manager.deliver_resources(agent, target_agent):
+            agent.current_mission = None
+            return True
+
+        agent.current_mission = None
+        return False
+
+    def _needs_refill(self, agent: 'RescueAgent', env: 'DisasterSim') -> bool:
+        """Check if drone needs to return to depot for refill."""
         total_resources = sum(agent.capacity.values())
         total_max = sum(agent.max_capacity.values())
+        return total_resources < total_max * env.config.drone_resource_threshold
 
-        if total_resources < total_max * env.config.drone_resource_threshold:
-            env.drone_manager.return_to_depot(agent, env.resource_depots)
-            return
-
-        mission = getattr(agent, 'current_mission', None)
-        if mission and mission.startswith("go_to_agent_"):
-            target_agent_id = int(mission.replace("go_to_agent_", ""))
-            if target_agent_id in env.rescue_agents:
-                target_agent = env.rescue_agents[target_agent_id]
-                if env.drone_manager.deliver_resources(agent, target_agent):
-                    agent.current_mission = None
-            return
-
+    def _assign_delivery_mission(self, agent: 'RescueAgent', env: 'DisasterSim') -> bool:
+        """Assign go_to_agent mission for resource delivery."""
         needy_agent = env.drone_manager.find_needy_agent(agent, env.rescue_agents)
         if needy_agent:
-            distance = np.linalg.norm(agent.position - needy_agent.position)
-            if distance > 10.0:
-                env.drone_manager.move_to_target(agent, needy_agent.position)
-                agent.current_mission = f"go_to_agent_{needy_agent.id}"
-            else:
-                env.drone_manager.deliver_resources(agent, needy_agent)
+            agent.current_mission = f"go_to_agent_{needy_agent.id}"
+            return True
+        return False
+
+    def _explore(self, agent: 'RescueAgent', env: 'DisasterSim') -> None:
+        """Start or continue exploration when no other missions."""
+        agent.current_mission = "exploring"
+        if not hasattr(agent, '_exploration_target'):
+            agent._exploration_target = None
+
+    def _navigate_to(self, agent: 'RescueAgent', target_position: np.ndarray, env: 'DisasterSim') -> None:
+        """Navigate towards target position."""
+        direction = target_position - agent.position
+        distance = np.linalg.norm(direction)
+        if distance <= ARRIVAL_RANGE:
             return
 
-        if not getattr(agent, 'current_mission', None):
-            env.drone_manager.search_casualties(agent, env.casualties)
+        direction = direction / distance
+        max_speed = agent.get_max_speed()
+        old_position = agent.position.copy()
+        agent.position += direction * max_speed * env.config.time_step
+
+        map_size = env.map_size[0] if isinstance(env.map_size, (tuple, list, np.ndarray)) else env.map_size
+        agent.position = np.clip(agent.position, 0, map_size)
+
+        if np.linalg.norm(agent.position - old_position) > POSITION_CHANGE_THRESHOLD:
+            self._detect_casualties(agent, env)
