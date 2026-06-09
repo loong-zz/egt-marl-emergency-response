@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Optional
 import numpy as np
 import logging
 
-from .config.constants import TREATMENT_RANGE, ARRIVAL_RANGE, MIN_MOVE_DISTANCE, POSITION_CHANGE_THRESHOLD, ResourceType
+from .config.constants import TREATMENT_RANGE, ARRIVAL_RANGE, MIN_MOVE_DISTANCE, POSITION_CHANGE_THRESHOLD, ResourceType, CasualtySeverity
 
 logger = logging.getLogger(__name__)
 
@@ -114,9 +114,6 @@ class PersonnelBehavior(AgentBehavior):
             casualty_id = int(mission.replace("go_to_casualty_", ""))
             return self._handle_go_to_casualty(agent, env, casualty_id)
 
-        if mission == "exploring":
-            return self._handle_exploration(agent, env)
-
         return False
 
     def _handle_depot_mission(self, agent: 'RescueAgent', env: 'DisasterSim', mission: str) -> bool:
@@ -154,9 +151,15 @@ class PersonnelBehavior(AgentBehavior):
             return False
 
         if env.treatment_manager.can_treat_casualty(agent, casualty):
-            env.treatment_manager.process_treatment_step(agent, casualty, env.current_time)
+            completed = env.treatment_manager.process_treatment_step(agent, casualty, env.current_time)
+            if completed:
+                agent.current_mission = None
             return True
         else:
+            lower_casualty = self._find_lower_resource_casualty(agent, env, casualty.severity)
+            if lower_casualty:
+                agent.current_mission = f"go_to_casualty_{lower_casualty.id}"
+                return True
             agent.current_mission = None
             return False
 
@@ -178,10 +181,14 @@ class PersonnelBehavior(AgentBehavior):
             return True
 
         if env.treatment_manager.can_treat_casualty(agent, casualty):
+            # Switch to treatment mission; actual treatment starts next step
             agent.current_mission = f"treat_casualty_{casualty_id}"
-            env.treatment_manager.process_treatment_step(agent, casualty, env.current_time)
             return True
         else:
+            lower_casualty = self._find_lower_resource_casualty(agent, env, casualty.severity)
+            if lower_casualty:
+                agent.current_mission = f"go_to_casualty_{lower_casualty.id}"
+                return True
             agent.current_mission = None
             return False
 
@@ -241,18 +248,26 @@ class PersonnelBehavior(AgentBehavior):
         agent.current_mission = "exploring"
         if not hasattr(agent, '_exploration_target'):
             agent._exploration_target = None
+        self._handle_exploration(agent, env)
 
     def _navigate_to(self, agent: 'RescueAgent', target_position: np.ndarray, env: 'DisasterSim') -> None:
         """Navigate towards target position with detection during movement."""
         direction = target_position - agent.position
         distance = np.linalg.norm(direction)
+        
         if distance <= ARRIVAL_RANGE:
+            agent.position = target_position.copy()
             return
 
         direction = direction / distance
         max_speed = agent.get_max_speed()
         old_position = agent.position.copy()
-        agent.position += direction * max_speed * env.config.time_step
+        
+        step_distance = max_speed * env.config.time_step
+        if step_distance > distance:
+            agent.position = target_position.copy()
+        else:
+            agent.position += direction * step_distance
 
         map_size = env.map_size[0] if isinstance(env.map_size, (tuple, list, np.ndarray)) else env.map_size
         agent.position = np.clip(agent.position, 0, map_size)
@@ -301,6 +316,39 @@ class PersonnelBehavior(AgentBehavior):
 
         return best
 
+    def _find_lower_resource_casualty(
+        self,
+        agent: 'RescueAgent',
+        env: 'DisasterSim',
+        current_severity: 'CasualtySeverity'
+    ) -> Optional['Casualty']:
+        """Find a casualty with lower resource requirements that can be treated."""
+        severity_order = [
+            CasualtySeverity.MILD,
+            CasualtySeverity.MODERATE,
+            CasualtySeverity.SEVERE,
+            CasualtySeverity.CRITICAL
+        ]
+
+        try:
+            current_idx = severity_order.index(current_severity)
+        except ValueError:
+            return None
+
+        for severity in severity_order[:current_idx]:
+            for casualty_id in agent.known_casualties:
+                if casualty_id not in env.casualties:
+                    continue
+                casualty = env.casualties[casualty_id]
+                if casualty.treated or not casualty.is_alive(env.current_time):
+                    continue
+                if casualty.treating_agent_id is not None and casualty.treating_agent_id != agent.id:
+                    continue
+                if env.treatment_manager.can_treat_casualty(agent, casualty):
+                    return casualty
+
+        return None
+
     def _find_nearest_known_casualty(self, agent: 'RescueAgent', env: 'DisasterSim') -> Optional['Casualty']:
         """Find the nearest known untreated casualty."""
         nearest = None
@@ -312,6 +360,9 @@ class PersonnelBehavior(AgentBehavior):
             casualty = env.casualties[casualty_id]
             if casualty.treated or not casualty.is_alive(env.current_time):
                 continue
+            if casualty.treating_agent_id is not None and casualty.treating_agent_id != agent.id:
+                continue
+
             dist = np.linalg.norm(agent.position - casualty.position)
             if dist < min_dist:
                 min_dist = dist

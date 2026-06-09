@@ -197,7 +197,7 @@ class DroneManager:
 
             mission = getattr(target_agent, 'current_mission', None)
             if mission and mission.startswith("go_to_depot_"):
-                if target_agent.has_enough_resources_for_moderate():
+                if not target_agent.needs_resources():
                     target_agent.current_mission = None
                     logger.info(f"[AGENT {target_agent.id}] Resources replenished, cancelled go_to_depot mission")
 

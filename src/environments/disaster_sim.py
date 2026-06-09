@@ -287,12 +287,16 @@ class DisasterSim:
         Returns:
             Tuple of (observation, reward, terminated, truncated, info)
         """
+        # Increment time first - this ensures treatment timing is correct
+        self.current_time += self.config.time_step
+        self.step_count += 1
+
         # Update casualty survival probabilities
         self._update_casualties()
 
         # Apply algorithm actions to agents
-        if actions is not None:
-            self._apply_actions(actions)
+        # if actions is not None:
+        #     self._apply_actions(actions)
 
         # Process agent behaviors using strategy pattern
         for agent in self.rescue_agents.values():
@@ -303,10 +307,6 @@ class DisasterSim:
 
         # Calculate reward
         reward = self._calculate_reward()
-
-        # Increment time and step count
-        self.current_time += self.config.time_step
-        self.step_count += 1
 
         # Check termination conditions
         terminated = self._check_termination()
@@ -340,15 +340,24 @@ class DisasterSim:
 
             agent = self.rescue_agents[agent_id]
 
-            if getattr(agent, 'current_mission', None) is not None:
+            # Allow algorithm actions to override existing missions, especially exploration
+            # This ensures the MARL algorithm can take control of agent behavior
+            current_mission = getattr(agent, 'current_mission', None)
+            
+            # Only allow override for exploring mission or no mission
+            # Other missions like treating or going to depot should not be interrupted
+            if current_mission is not None and not current_mission == "exploring":
                 continue
 
             tactical = action.get('tactical', 0)
 
-            if tactical == 1:
+            if tactical == 0:
+                # Stay/idle action - clear mission to let agent continue normal behavior
+                agent.current_mission = None
+            elif tactical == 1:
                 nearest = self._find_nearest_untreated_casualty(agent)
                 if nearest:
-                    agent.current_mission = f"treat_casualty_{nearest.id}"
+                    agent.current_mission = f"go_to_casualty_{nearest.id}"
             elif tactical == 2:
                 nearest_depot = self._find_nearest_depot(agent)
                 if nearest_depot:
@@ -356,7 +365,18 @@ class DisasterSim:
             elif tactical == 3:
                 nearest_unknown = self._find_nearest_unknown_casualty(agent)
                 if nearest_unknown:
-                    agent.current_mission = f"searching_casualty_{nearest_unknown.id}"
+                    agent.current_mission = f"go_to_casualty_{nearest_unknown.id}"
+            elif tactical == 4:
+                # Go to nearest known casualty
+                if agent.known_casualties:
+                    nearest_known = self._find_nearest_known_casualty(agent)
+                    if nearest_known:
+                        agent.current_mission = f"go_to_casualty_{nearest_known.id}"
+            elif tactical == 5:
+                # Return to base (first depot)
+                if self.resource_depots:
+                    first_depot = next(iter(self.resource_depots.values()))
+                    agent.current_mission = f"go_to_depot_{first_depot.id}"
 
     def _find_nearest_untreated_casualty(self, agent: 'RescueAgent') -> Optional['Casualty']:
         """Find nearest untreated casualty."""
@@ -388,6 +408,22 @@ class DisasterSim:
         nearest = None
         for casualty in self.casualties.values():
             if casualty.discovered_by == agent.id or not casualty.is_alive(self.current_time):
+                continue
+            dist = np.linalg.norm(agent.position - casualty.position)
+            if dist < min_dist:
+                min_dist = dist
+                nearest = casualty
+        return nearest
+
+    def _find_nearest_known_casualty(self, agent: 'RescueAgent') -> Optional['Casualty']:
+        """Find nearest casualty known to this agent."""
+        min_dist = float('inf')
+        nearest = None
+        for casualty_id in agent.known_casualties:
+            if casualty_id not in self.casualties:
+                continue
+            casualty = self.casualties[casualty_id]
+            if casualty.treated or not casualty.is_alive(self.current_time):
                 continue
             dist = np.linalg.norm(agent.position - casualty.position)
             if dist < min_dist:
