@@ -150,18 +150,10 @@ class PersonnelBehavior(AgentBehavior):
             agent.current_mission = None
             return False
 
-        if env.treatment_manager.can_treat_casualty(agent, casualty):
-            completed = env.treatment_manager.process_treatment_step(agent, casualty, env.current_time)
-            if completed:
-                agent.current_mission = None
-            return True
-        else:
-            lower_casualty = self._find_lower_resource_casualty(agent, env, casualty.severity)
-            if lower_casualty:
-                agent.current_mission = f"go_to_casualty_{lower_casualty.id}"
-                return True
+        completed = env.treatment_manager.process_treatment_step(agent, casualty, env.current_time)
+        if completed:
             agent.current_mission = None
-            return False
+        return True
 
     def _handle_go_to_casualty(self, agent: 'RescueAgent', env: 'DisasterSim', casualty_id: int) -> bool:
         """Handle go_to_casualty mission - navigate to casualty location."""
@@ -188,9 +180,12 @@ class PersonnelBehavior(AgentBehavior):
             lower_casualty = self._find_lower_resource_casualty(agent, env, casualty.severity)
             if lower_casualty:
                 agent.current_mission = f"go_to_casualty_{lower_casualty.id}"
+                logger.debug(
+                    f"[GO TO CASUALTY] Agent{agent.id} cannot treat Casualty{casualty_id} "
+                    f"(Severity={casualty.severity.name}) - Lower severity casualty {lower_casualty.id}"
+                )
                 return True
-            agent.current_mission = None
-            return False
+            return self._assign_depot_mission(agent, env)
 
     def _handle_exploration(self, agent: 'RescueAgent', env: 'DisasterSim') -> bool:
         """Handle exploring mission - grid-based exploration."""
@@ -225,22 +220,40 @@ class PersonnelBehavior(AgentBehavior):
         nearest_depot = self._find_nearest_depot(agent, env)
         if nearest_depot:
             agent.current_mission = f"go_to_depot_{nearest_depot.id}"
+            logger.debug(
+                f"[GO TO DEPOT] Agent{agent.id} Go to depot {nearest_depot.id}"
+            )
             return True
         return False
 
     def _assign_go_to_casualty_mission(self, agent: 'RescueAgent', env: 'DisasterSim') -> bool:
         """Assign go_to_casualty mission."""
+        if not agent.known_casualties:
+            return False
+        
+        logger.debug(f"[ASSIGN CASUALTY] Agent{agent.id} known_casualties count: {len(agent.known_casualties)}")
+        
         priority_casualty = self._find_highest_priority_casualty(agent, env)
         if priority_casualty:
             agent.current_mission = f"go_to_casualty_{priority_casualty.id}"
+            logger.debug(
+                f"[ASSIGN CASUALTY] Agent{agent.id} assigned priority casualty {priority_casualty.id} "
+                f"(Severity={priority_casualty.severity.name})"
+            )
             return True
+        
+        logger.debug(f"[ASSIGN CASUALTY] Agent{agent.id} no priority casualty found")
 
-        if agent.known_casualties:
-            nearest = self._find_nearest_known_casualty(agent, env)
-            if nearest:
-                agent.current_mission = f"go_to_casualty_{nearest.id}"
-                return True
-
+        nearest = self._find_nearest_known_casualty(agent, env)
+        if nearest:
+            agent.current_mission = f"go_to_casualty_{nearest.id}"
+            logger.debug(
+                f"[ASSIGN CASUALTY] Agent{agent.id} assigned nearest casualty {nearest.id} "
+                f"(Severity={nearest.severity.name})"
+            )
+            return True
+        
+        logger.debug(f"[ASSIGN CASUALTY] Agent{agent.id} known_casualties not assignable (all filtered out)")
         return False
 
     def _explore(self, agent: 'RescueAgent', env: 'DisasterSim') -> None:
@@ -335,17 +348,20 @@ class PersonnelBehavior(AgentBehavior):
         except ValueError:
             return None
 
-        for severity in severity_order[:current_idx]:
-            for casualty_id in agent.known_casualties:
-                if casualty_id not in env.casualties:
-                    continue
-                casualty = env.casualties[casualty_id]
-                if casualty.treated or not casualty.is_alive(env.current_time):
-                    continue
-                if casualty.treating_agent_id is not None and casualty.treating_agent_id != agent.id:
-                    continue
-                if env.treatment_manager.can_treat_casualty(agent, casualty):
-                    return casualty
+        for casualty_id in agent.known_casualties:
+            if casualty_id not in env.casualties:
+                continue
+            casualty = env.casualties[casualty_id]
+            
+            if severity_order.index(casualty.severity) >= current_idx:
+                continue
+            
+            if casualty.treated or not casualty.is_alive(env.current_time):
+                continue
+            if casualty.treating_agent_id is not None and casualty.treating_agent_id != agent.id:
+                continue
+            if env.treatment_manager.can_treat_casualty(agent, casualty):
+                return casualty
 
         return None
 
@@ -497,8 +513,23 @@ class DroneBehavior(PersonnelBehavior):
     def _explore(self, agent: 'RescueAgent', env: 'DisasterSim') -> None:
         """Start or continue exploration when no other missions."""
         agent.current_mission = "exploring"
-        if not hasattr(agent, '_exploration_target'):
-            agent._exploration_target = None
+        
+        map_size = env.map_size[0] if isinstance(env.map_size, (tuple, list, np.ndarray)) else env.map_size
+        grid_size = 100.0
+        num_grids = int(map_size / grid_size)
+
+        if not hasattr(agent, '_explored_grids'):
+            agent._explored_grids = set()
+        if not hasattr(agent, '_exploration_target') or agent._exploration_target is None:
+            agent._exploration_target = self._select_unexplored_grid(agent, num_grids, map_size)
+
+        distance = np.linalg.norm(agent.position - agent._exploration_target)
+        if distance <= ARRIVAL_RANGE:
+            current_grid = self._get_grid_coords(agent.position, grid_size)
+            agent._explored_grids.add(current_grid)
+            agent._exploration_target = self._select_unexplored_grid(agent, num_grids, map_size)
+        else:
+            self._navigate_to(agent, agent._exploration_target, env)
 
     def _navigate_to(self, agent: 'RescueAgent', target_position: np.ndarray, env: 'DisasterSim') -> None:
         """Navigate towards target position."""

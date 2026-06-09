@@ -59,8 +59,12 @@ class SeverityBasedStrategy(TreatmentStrategy):
         for resource_type, needed in casualty.resources_needed.items():
             consumption_factor = CONSUMPTION_FACTOR[casualty.severity]
             total_needed = needed * (1 + consumption_factor)
-
-            if agent.capacity.get(resource_type, 0.0) < total_needed:
+            current = agent.capacity.get(resource_type, 0.0)
+            if current < total_needed:
+                logger.debug(
+                    f"[RESOURCE SHORTAGE] Agent{agent.id} cannot treat Casualty{casualty.id} "
+                    f"(Severity={casualty.severity.name}) - {resource_type.name} {current:.1f}/{total_needed:.1f}"
+                )
                 return False
 
         return True
@@ -144,24 +148,7 @@ class TreatmentManager:
             return False
 
         has_resources = self.strategy.check_resources(agent, casualty)
-        if not has_resources:
-            self._log_resource_shortage(agent, casualty)
         return has_resources
-
-    def _log_resource_shortage(self, agent: RescueAgent, casualty: Casualty) -> None:
-        """Log which resources are insufficient for treatment."""
-        shortage = []
-        for resource_type, needed in casualty.resources_needed.items():
-            consumption_factor = CONSUMPTION_FACTOR[casualty.severity]
-            total_needed = needed * (1 + consumption_factor)
-            current = agent.capacity.get(resource_type, 0.0)
-            if current < total_needed:
-                abbr = RESOURCE_ABBR.get(resource_type.name, resource_type.name[:4])
-                shortage.append(f"{abbr}:{current:.1f}/{total_needed:.1f}")
-        logger.debug(
-            f"[RESOURCE SHORTAGE] Agent{agent.id} cannot treat Casualty{casualty.id} "
-            f"(Severity={casualty.severity.name}) - {', '.join(shortage)}"
-        )
 
     def process_treatment_step(
         self,
@@ -204,6 +191,7 @@ class TreatmentManager:
                     f"Resource={RESOURCE_ABBR.get(resource_type.name, resource_type.name[:4])}"
                 )
                 casualty.stop_treatment()
+                agent.current_mission = None
                 return False
 
         self.total_resources_used += step_consumption
