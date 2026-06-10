@@ -295,8 +295,8 @@ class DisasterSim:
         self._update_casualties()
 
         # Apply algorithm actions to agents
-        # if actions is not None:
-        #     self._apply_actions(actions)
+        if actions is not None:
+            self._apply_actions(actions)
 
         # Process agent behaviors using strategy pattern
         for agent in self.rescue_agents.values():
