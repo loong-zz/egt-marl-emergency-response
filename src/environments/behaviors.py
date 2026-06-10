@@ -79,12 +79,21 @@ class PersonnelBehavior(AgentBehavior):
         Unified detection for both stationary and moving agents.
         """
         detection_range = agent.get_detection_range()
+        
+        # Get set of casualties this agent has marked as untreatable
+        untreatable_casualties = getattr(agent, '_untreatable_casualties', set())
 
         for casualty in env.casualties.values():
             if casualty.id in agent.known_casualties:
                 continue
+            # Skip casualties marked as untreatable (resources insufficient even when full)
+            if casualty.id in untreatable_casualties:
+                continue
             # Skip already treated casualties
             if casualty.treated:
+                continue
+            # Skip dead casualties
+            if not casualty.is_alive(env.current_time):
                 continue
             dist = np.linalg.norm(agent.position - casualty.position)
             if dist > detection_range:
@@ -335,23 +344,28 @@ class PersonnelBehavior(AgentBehavior):
         # Get set of casualties this agent has marked as untreatable
         untreatable_casualties = getattr(agent, '_untreatable_casualties', set())
 
-        # Track filtered casualties for debugging
+        # Track filtered casualties for debugging and cleanup
         filtered_reasons = []
+        to_remove_from_known = []
 
         for casualty_id in agent.known_casualties:
             if casualty_id not in env.casualties:
                 filtered_reasons.append(f"{casualty_id}:not_in_env")
+                to_remove_from_known.append(casualty_id)
                 continue
             # Skip casualties marked as untreatable (resources insufficient even when full)
             if casualty_id in untreatable_casualties:
                 filtered_reasons.append(f"{casualty_id}:untreatable")
+                to_remove_from_known.append(casualty_id)
                 continue
             casualty = env.casualties[casualty_id]
             if casualty.treated:
                 filtered_reasons.append(f"{casualty_id}:treated")
+                to_remove_from_known.append(casualty_id)
                 continue
             if not casualty.is_alive(env.current_time):
                 filtered_reasons.append(f"{casualty_id}:dead")
+                to_remove_from_known.append(casualty_id)
                 continue
             if casualty.treating_agent_id is not None and casualty.treating_agent_id != agent.id:
                 filtered_reasons.append(f"{casualty_id}:being_treated_by_{casualty.treating_agent_id}")
@@ -364,8 +378,16 @@ class PersonnelBehavior(AgentBehavior):
                 best_priority = priority
                 best = casualty
 
+        # Remove unassignable casualties from known list
+        for casualty_id in to_remove_from_known:
+            if casualty_id in agent.known_casualties:
+                del agent.known_casualties[casualty_id]
+
+        if to_remove_from_known:
+            logger.debug(f"[FIND PRIORITY] Agent{agent.id} removed from known: {', '.join(map(str, to_remove_from_known))}")
+
         if agent.known_casualties and not best and filtered_reasons:
-            logger.debug(f"[FIND PRIORITY] Agent{agent.id} all known casualties filtered: {', '.join(filtered_reasons)}")
+            logger.debug(f"[FIND PRIORITY] Agent{agent.id} filtered: {', '.join(filtered_reasons)}")
 
         return best
 
@@ -413,23 +435,28 @@ class PersonnelBehavior(AgentBehavior):
         # Get set of casualties this agent has marked as untreatable
         untreatable_casualties = getattr(agent, '_untreatable_casualties', set())
 
-        # Track filtered casualties for debugging
+        # Track filtered casualties for debugging and cleanup
         filtered_reasons = []
+        to_remove_from_known = []
 
         for casualty_id in agent.known_casualties:
             if casualty_id not in env.casualties:
                 filtered_reasons.append(f"{casualty_id}:not_in_env")
+                to_remove_from_known.append(casualty_id)
                 continue
             # Skip casualties marked as untreatable (resources insufficient even when full)
             if casualty_id in untreatable_casualties:
                 filtered_reasons.append(f"{casualty_id}:untreatable")
+                to_remove_from_known.append(casualty_id)
                 continue
             casualty = env.casualties[casualty_id]
             if casualty.treated:
                 filtered_reasons.append(f"{casualty_id}:treated")
+                to_remove_from_known.append(casualty_id)
                 continue
             if not casualty.is_alive(env.current_time):
                 filtered_reasons.append(f"{casualty_id}:dead")
+                to_remove_from_known.append(casualty_id)
                 continue
             if casualty.treating_agent_id is not None and casualty.treating_agent_id != agent.id:
                 filtered_reasons.append(f"{casualty_id}:being_treated_by_{casualty.treating_agent_id}")
@@ -440,8 +467,16 @@ class PersonnelBehavior(AgentBehavior):
                 min_dist = dist
                 nearest = casualty
 
+        # Remove unassignable casualties from known list
+        for casualty_id in to_remove_from_known:
+            if casualty_id in agent.known_casualties:
+                del agent.known_casualties[casualty_id]
+
+        if to_remove_from_known:
+            logger.debug(f"[FIND NEAREST] Agent{agent.id} removed from known: {', '.join(map(str, to_remove_from_known))}")
+
         if agent.known_casualties and not nearest and filtered_reasons:
-            logger.debug(f"[FIND NEAREST] Agent{agent.id} all known casualties filtered: {', '.join(filtered_reasons)}")
+            logger.debug(f"[FIND NEAREST] Agent{agent.id} filtered: {', '.join(filtered_reasons)}")
 
         return nearest
 
