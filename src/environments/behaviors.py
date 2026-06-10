@@ -83,6 +83,9 @@ class PersonnelBehavior(AgentBehavior):
         for casualty in env.casualties.values():
             if casualty.id in agent.known_casualties:
                 continue
+            # Skip already treated casualties
+            if casualty.treated:
+                continue
             dist = np.linalg.norm(agent.position - casualty.position)
             if dist > detection_range:
                 continue
@@ -185,6 +188,24 @@ class PersonnelBehavior(AgentBehavior):
                     f"(Severity={casualty.severity.name}) - Lower severity casualty {lower_casualty.id}"
                 )
                 return True
+            
+            # No lower priority casualty available
+            # Check if resources are already full (cannot benefit from depot)
+            if agent.has_full_resources():
+                # Record this casualty as untreatable (resource capacity insufficient)
+                if not hasattr(agent, '_untreatable_casualties'):
+                    agent._untreatable_casualties = set()
+                agent._untreatable_casualties.add(casualty_id)
+                
+                logger.debug(
+                    f"[GO TO CASUALTY] Agent{agent.id} cannot treat Casualty{casualty_id} "
+                    f"(Severity={casualty.severity.name}) - Resources full but insufficient, "
+                    f"marking as untreatable and exploring"
+                )
+                self._explore(agent, env)
+                return True
+            
+            # Resources not full - go to depot to refill
             return self._assign_depot_mission(agent, env)
 
     def _handle_exploration(self, agent: 'RescueAgent', env: 'DisasterSim') -> bool:
@@ -242,7 +263,7 @@ class PersonnelBehavior(AgentBehavior):
             )
             return True
         
-        logger.debug(f"[ASSIGN CASUALTY] Agent{agent.id} no priority casualty found")
+        # logger.debug(f"[ASSIGN CASUALTY] Agent{agent.id} no priority casualty found")
 
         nearest = self._find_nearest_known_casualty(agent, env)
         if nearest:
@@ -311,13 +332,29 @@ class PersonnelBehavior(AgentBehavior):
             'MILD': 1
         }
 
+        # Get set of casualties this agent has marked as untreatable
+        untreatable_casualties = getattr(agent, '_untreatable_casualties', set())
+
+        # Track filtered casualties for debugging
+        filtered_reasons = []
+
         for casualty_id in agent.known_casualties:
             if casualty_id not in env.casualties:
+                filtered_reasons.append(f"{casualty_id}:not_in_env")
+                continue
+            # Skip casualties marked as untreatable (resources insufficient even when full)
+            if casualty_id in untreatable_casualties:
+                filtered_reasons.append(f"{casualty_id}:untreatable")
                 continue
             casualty = env.casualties[casualty_id]
-            if casualty.treated or not casualty.is_alive(env.current_time):
+            if casualty.treated:
+                filtered_reasons.append(f"{casualty_id}:treated")
+                continue
+            if not casualty.is_alive(env.current_time):
+                filtered_reasons.append(f"{casualty_id}:dead")
                 continue
             if casualty.treating_agent_id is not None and casualty.treating_agent_id != agent.id:
+                filtered_reasons.append(f"{casualty_id}:being_treated_by_{casualty.treating_agent_id}")
                 continue
 
             dist = np.linalg.norm(agent.position - casualty.position)
@@ -326,6 +363,9 @@ class PersonnelBehavior(AgentBehavior):
             if priority > best_priority:
                 best_priority = priority
                 best = casualty
+
+        if agent.known_casualties and not best and filtered_reasons:
+            logger.debug(f"[FIND PRIORITY] Agent{agent.id} all known casualties filtered: {', '.join(filtered_reasons)}")
 
         return best
 
@@ -370,19 +410,38 @@ class PersonnelBehavior(AgentBehavior):
         nearest = None
         min_dist = float('inf')
 
+        # Get set of casualties this agent has marked as untreatable
+        untreatable_casualties = getattr(agent, '_untreatable_casualties', set())
+
+        # Track filtered casualties for debugging
+        filtered_reasons = []
+
         for casualty_id in agent.known_casualties:
             if casualty_id not in env.casualties:
+                filtered_reasons.append(f"{casualty_id}:not_in_env")
+                continue
+            # Skip casualties marked as untreatable (resources insufficient even when full)
+            if casualty_id in untreatable_casualties:
+                filtered_reasons.append(f"{casualty_id}:untreatable")
                 continue
             casualty = env.casualties[casualty_id]
-            if casualty.treated or not casualty.is_alive(env.current_time):
+            if casualty.treated:
+                filtered_reasons.append(f"{casualty_id}:treated")
+                continue
+            if not casualty.is_alive(env.current_time):
+                filtered_reasons.append(f"{casualty_id}:dead")
                 continue
             if casualty.treating_agent_id is not None and casualty.treating_agent_id != agent.id:
+                filtered_reasons.append(f"{casualty_id}:being_treated_by_{casualty.treating_agent_id}")
                 continue
 
             dist = np.linalg.norm(agent.position - casualty.position)
             if dist < min_dist:
                 min_dist = dist
                 nearest = casualty
+
+        if agent.known_casualties and not nearest and filtered_reasons:
+            logger.debug(f"[FIND NEAREST] Agent{agent.id} all known casualties filtered: {', '.join(filtered_reasons)}")
 
         return nearest
 
