@@ -23,12 +23,13 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from environments.disaster_sim import DisasterSim, ResourceType
-from environments.config.constants import RESOURCE_ABBR
+from environments.config.constants import RESOURCE_ABBR, EGT_CONFIG, REPUTATION_CONFIG, PARETO_CONFIG, COMMUNICATION_CONFIG, INTERFERENCE_CONFIG, NUM_REGIONS
 from algorithms.egt_marl import EGTMARL
 from algorithms.qmix_improved import ImprovedQMIX
 from algorithms.dynamic_frontier import DynamicParetoFrontier
 from utils.metrics import MetricsCollector
 from environments.visualization import DisasterVisualizer
+from environments.managers.manager_integration import ManagerIntegration
 import logging
 
 # 初始化logger
@@ -53,6 +54,7 @@ class EGTMARLTrainer:
         self.algorithm = None
         self.metrics_collector = None
         self.visualizer = None
+        self.manager_integration = None  # Manager集成
         
         logger.info(f"EGT-MARL Trainer initialized with config: {config_path}")
     
@@ -100,7 +102,13 @@ class EGTMARLTrainer:
                 'pareto_weight_beta': 0.4,
                 'pareto_weight_gamma': 0.3,
                 'anti_spoofing_enabled': True
-            }
+            },
+            # Manager配置默认值（从constants.py导入）
+            'egt': EGT_CONFIG,
+            'reputation': REPUTATION_CONFIG,
+            'pareto': PARETO_CONFIG,
+            'communication': COMMUNICATION_CONFIG,
+            'interference': INTERFERENCE_CONFIG
         }
         
         # 合并配置
@@ -158,6 +166,19 @@ class EGTMARLTrainer:
         else:
             self.device = torch.device('cpu')
             logger.info("Using CPU")
+    
+    def setup_manager_integration(self):
+        """设置Manager集成"""
+        manager_config = {
+            'egt': self.config['egt'],
+            'reputation': self.config['reputation'],
+            'pareto': self.config['pareto'],
+            'communication': self.config['communication'],
+            'interference': self.config['interference']
+        }
+        
+        self.manager_integration = ManagerIntegration(manager_config)
+        logger.info("Manager Integration initialized")
     
     def setup_environment(self):
         """设置环境"""
@@ -245,13 +266,23 @@ class EGTMARLTrainer:
         state, info = self.env.reset()
         logger.info(f"Episode {episode_idx} reset - Num casualties: {info.get('num_casualties', 0)}, Num agents: {info.get('num_rescue_agents', 0)}")
         
+        # Manager集成：Episode开始回调
+        if self.manager_integration is not None:
+            self.manager_integration.on_episode_start(
+                num_agents=self.env.num_agents,
+                num_regions=NUM_REGIONS
+            )
+        
         episode_metrics = {
             'total_reward': 0.0,
             'steps': 0,
             'rescued': 0,
             'deaths': 0,
             'resources_used': 0,
-            'response_times': []
+            'response_times': [],
+            'final_lambda': 0.0,
+            'total_communications': 0,
+            'shared_casualties': 0
         }
         
         done = False
@@ -259,6 +290,12 @@ class EGTMARLTrainer:
         max_steps = self.config['training']['max_steps_per_episode']
         
         while not done and step < max_steps:
+            # Manager集成：Step开始回调
+            if self.manager_integration is not None:
+                hours_elapsed = step * 0.1 / 3600.0  # 假设每步0.1秒
+                aftershock = info.get('aftershock_happening', False)
+                self.manager_integration.on_step_start(hours_elapsed, aftershock)
+            
             # 获取动作 - 传递训练参数和epsilon以启用探索
             actions = self.algorithm.select_action(state, training=True, epsilon=epsilon)
             
@@ -266,34 +303,65 @@ class EGTMARLTrainer:
             next_state, rewards, terminated, truncated, info = self.env.step(actions)
             done = terminated or truncated
             
+            # Manager集成：Agent通信（每5步）
+            if self.manager_integration is not None and step % 5 == 0:
+                self._process_agent_communication()
+            
+            # Manager集成：奖励塑形
+            if self.manager_integration is not None:
+                # rewards可能是int或float，转换为字典格式
+                if isinstance(rewards, (int, float)):
+                    num_agents = len(self.env.rescue_agents)
+                    per_agent_reward = rewards / num_agents if num_agents > 0 else 0.0
+                    rewards = {aid: per_agent_reward for aid in self.env.rescue_agents}
+                
+                shaped_rewards = {}
+                for agent_id in self.env.rescue_agents:
+                    base_reward = rewards.get(agent_id, 0.0)
+                    shaped_reward = self.manager_integration.get_shaped_reward(
+                        base_reward=base_reward,
+                        agent_id=agent_id,
+                        action_type='step',
+                        context=info
+                    )
+                    shaped_rewards[agent_id] = shaped_reward
+                rewards = shaped_rewards
+            
             # 存储经验并更新算法
             self.algorithm.store_experience(state, actions, rewards, next_state, done)
             if step % self.config['training']['update_frequency'] == 0:
                 self.algorithm.update()
+            
+            # Manager集成：Step结束回调
+            if self.manager_integration is not None:
+                agent_states = self._get_agent_states()
+                agent_rewards = {aid: rewards.get(aid, 0.0) for aid in self.env.rescue_agents}
+                self.manager_integration.on_step_end(agent_states, agent_rewards, {})
             
             # 记录奖励和状态信息
             if step % 50 == 0:
                 stats = info.get('statistics', {})
                 rescued = stats.get('total_rescued', 0)
                 deaths = stats.get('total_deaths', 0)
-                logger.debug(f"Step {step}: Reward={rewards:.4f}, Rescued={rescued}, Deaths={deaths}")
+                total_reward = sum(rewards.values()) if isinstance(rewards, dict) else rewards
+                logger.debug(f"Step {step}: Reward={total_reward:.4f}, Rescued={rescued}, Deaths={deaths}")
                 self._log_entity_info(step)
             
             # 更新状态
             state = next_state
             
             # 收集指标
-            episode_metrics['total_reward'] += rewards
+            total_reward = sum(rewards.values()) if isinstance(rewards, dict) else rewards
+            episode_metrics['total_reward'] += total_reward
             episode_metrics['steps'] += 1
-            
-            if 'response_time' in info:
-                episode_metrics['response_times'].append(info['response_time'])
             
             step += 1
         
-        # 计算平均响应时间
-        if episode_metrics['response_times']:
-            episode_metrics['avg_response_time'] = np.mean(episode_metrics['response_times'])
+        # 计算平均响应时间（从statistics中获取）
+        response_times = info.get('statistics', {}).get('response_times', [])
+        if response_times:
+            episode_metrics['response_times'] = response_times
+            episode_metrics['avg_response_time'] = np.mean(response_times)
         else:
             episode_metrics['avg_response_time'] = 0.0
         
@@ -317,6 +385,16 @@ class EGTMARLTrainer:
             episode_metrics['resource_utilization'] = (episode_metrics['resources_used'] / total_initial) * 100
         else:
             episode_metrics['resource_utilization'] = 0.0
+        
+        # Manager集成：Episode结束回调
+        if self.manager_integration is not None:
+            episode_summary = self.manager_integration.on_episode_end()
+            episode_metrics['final_lambda'] = episode_summary.get('final_lambda', 0.0)
+            episode_metrics['total_communications'] = episode_summary.get('total_communications', 0)
+            episode_metrics['shared_casualties'] = episode_summary.get('shared_casualties', 0)
+        
+        # 记录Manager指标
+        self._log_manager_metrics(episode_idx)
         
         return episode_metrics
     
@@ -345,6 +423,108 @@ class EGTMARLTrainer:
             
             nearest_info = {'agent_id': nearest_agent, 'distance': min_dist}
             logger.debug(f"  {casualty.format_log_line(nearest_info)}")
+    
+    def _get_agent_states(self) -> Dict:
+        """获取所有agent的状态（用于EGT fitness计算）"""
+        agent_states = {}
+        for agent_id, agent in self.env.rescue_agents.items():
+            # 计算该agent的生存率和资源效率
+            total_casualties = len(agent.known_casualties)
+            treated_casualties = sum(1 for cid in agent.known_casualties 
+                                   if cid in self.env.casualties 
+                                   and self.env.casualties[cid].treated)
+            survival_rate = treated_casualties / max(total_casualties, 1)
+            
+            resource_usage = sum(agent.capacity.values())
+            resource_capacity = sum(agent.max_capacity.values())
+            resource_efficiency = resource_usage / max(resource_capacity, 1)
+            
+            agent_states[agent_id] = {
+                'survival_rate': survival_rate,
+                'resource_efficiency': resource_efficiency
+            }
+        return agent_states
+    
+    def _process_agent_communication(self):
+        """处理Agent间的信息共享"""
+        if self.manager_integration is None:
+            return
+        
+        # 更新每个agent的已知伤员
+        for agent_id, agent in self.env.rescue_agents.items():
+            # 准备邻近agent列表
+            nearby_agents = []
+            for other_id, other_agent in self.env.rescue_agents.items():
+                if other_id == agent_id:
+                    continue
+                
+                # 检查通信是否成功
+                can_comm, _ = self.manager_integration.check_communication(
+                    agent.position,
+                    other_agent.position
+                )
+                
+                if can_comm:
+                    nearby_agents.append((other_id, other_agent.position))
+            
+            # 广播自己的已知伤员
+            known_casualties = {}
+            for cid in agent.known_casualties:
+                if cid in self.env.casualties:
+                    casualty = self.env.casualties[cid]
+                    known_casualties[cid] = {
+                        'position': casualty.position,
+                        'severity': casualty.severity.name
+                    }
+            
+            self.manager_integration.broadcast_casualties(agent_id, agent.position, known_casualties)
+            
+            # 接收邻近agent的广播
+            new_casualties = self.manager_integration.receive_broadcasts(
+                agent_id, agent.position, nearby_agents
+            )
+            
+            # 更新agent的known_casualties（字典类型）
+            for casualty_id, casualty_info in new_casualties.items():
+                if casualty_id not in agent.known_casualties:
+                    agent.known_casualties[casualty_id] = casualty_info
+    
+    def _log_manager_metrics(self, episode: int):
+        """记录Manager指标到日志"""
+        if self.manager_integration is None:
+            return
+        
+        metrics = self.manager_integration.get_metrics()
+        
+        # EGT指标
+        egt = metrics['egt']
+        logger.info(f"[EGT] Episode {episode} - λ={egt['lambda_t']:.4f}, "
+                    f"HistoryLen={egt['history_length']}")
+        
+        # Pareto指标
+        pareto = metrics['pareto']
+        logger.info(f"[PARETO] Episode {episode} - "
+                    f"Efficiency={pareto['current_efficiency_weight']:.2f}, "
+                    f"Fairness={pareto['current_fairness_weight']:.2f}")
+        
+        # Reputation指标
+        rep = metrics['reputation']
+        logger.info(f"[REPUTATION] Episode {episode} - "
+                    f"AvgReputation={rep.get('avg_reputation', 0.0):.2f}, "
+                    f"AgentCount={rep.get('agent_count', 0)}")
+        
+        # Communication指标
+        comm = metrics['communication']
+        logger.info(f"[COMM] Episode {episode} - "
+                    f"SharedCasualties={comm['shared_casualties_count']}, "
+                    f"Events={comm['communication_events']}")
+        
+        # Interference指标
+        interf = metrics['interference']
+        logger.info(f"[INTERFERENCE] Episode {episode} - "
+                    f"AvgDelay={interf.get('avg_delay', 0.0):.3f}s, "
+                    f"LossRate={interf.get('loss_rate', 0.0):.2%}, "
+                    f"Interrupted={interf['is_interrupted']}")
     
     def evaluate(self, num_episodes: int = 10) -> Dict[str, float]:
         """
@@ -449,7 +629,8 @@ class EGTMARLTrainer:
         # 设置目录（在参数覆盖后）
         self.setup_directories()
         
-        # 设置组件
+        # 设置组件（包括Manager集成）
+        self.setup_manager_integration()
         self.setup_environment()
         self.setup_algorithm()
         self.setup_metrics()

@@ -123,11 +123,12 @@ class DisasterSim:
         ]
         
         for i, position in enumerate(depot_positions):
+            # 初始资源基于伤员需求计算（30个伤员约需400-500单位，2个depot分担）
             resources = {
-                ResourceType.BROAD_SPECTRUM_ANTIBIOTICS: 1000.0,
-                ResourceType.BLOOD_PACKS: 500.0,
-                ResourceType.OXYGEN: 800.0,
-                ResourceType.PAIN_MEDICATION: 1200.0
+                ResourceType.BROAD_SPECTRUM_ANTIBIOTICS: 100.0,
+                ResourceType.BLOOD_PACKS: 50.0,
+                ResourceType.OXYGEN: 120.0,
+                ResourceType.PAIN_MEDICATION: 50.0
             }
             
             depot = ResourceDepot(
@@ -143,6 +144,7 @@ class DisasterSim:
             depot_id: depot.resources.copy()
             for depot_id, depot in self.resource_depots.items()
         }
+        # 计算agent初始实际资源总量（capacity初始值为满载资源量）
         self.initial_agent_resources = sum(
             sum(agent.capacity.values())
             for agent in self.rescue_agents.values()

@@ -143,6 +143,59 @@ MIN_MOVE_DISTANCE = 1.0
 # Position change threshold for casualty detection (in meters)
 POSITION_CHANGE_THRESHOLD = 0.1
 
+# ==================== Manager Configuration Constants ====================
+
+# EGT Manager 参数（演化博弈论元控制器）
+EGT_CONFIG = {
+    'kappa': 0.01,           # 调整率
+    'tau_0': 0.3,            # 初始阈值
+    'nu': 0.001,             # 衰减率
+    'lambda_min': 0.0,       # 公平权重最小值
+    'lambda_max': 1.0,       # 公平权重最大值
+    'delta': 0.02,           # 滞后阈值
+    'initial_lambda': 0.5    # 初始公平-效率权重
+}
+
+# Reputation Manager 参数（激励相容机制）
+REPUTATION_CONFIG = {
+    'initial_reputation': 0.5,      # 初始信誉值
+    'honesty_bonus': 0.05,          # 诚实奖励
+    'dishonesty_penalty': 0.1,      # 不诚实惩罚
+    'decay_rate': 0.01,             # 衰减率
+    'forgetting_factor': 0.95,      # 遗忘因子
+    'penalty_factor': 0.7,          # 惩罚因子
+    'anomaly_threshold': 2.0        # 异常检测阈值
+}
+
+# Pareto Manager 参数（动态帕累托前沿）
+PARETO_CONFIG = {
+    'initial_efficiency': 0.5,           # 初始效率权重
+    'initial_fairness': 0.5,             # 初始公平权重
+    'efficiency_weight_phase1': 0.9,     # 灾情初期效率权重
+    'efficiency_weight_phase2': 0.6,     # 灾情中期效率权重
+    'efficiency_weight_phase3': 0.3      # 灾情恢复期效率权重
+}
+
+# Communication Manager 参数（信息共享机制）
+COMMUNICATION_CONFIG = {
+    'communication_range': 50.0,      # 通信范围（米）
+    'broadcast_frequency': 5,         # 广播频率（每N步）
+    'max_broadcast_size': 10          # 最大广播伤员数量
+}
+
+# Interference Manager 参数（通信干扰模型）
+INTERFERENCE_CONFIG = {
+    'min_delay_mean': 0.5,           # 最小通信延迟均值（秒）
+    'max_delay_mean': 2.0,           # 最大通信延迟均值（秒）
+    'min_packet_loss': 0.05,         # 最小丢包率
+    'max_packet_loss': 0.20,         # 最大丢包率
+    'interruption_probability': 0.10, # 余震中断概率
+    'improvement_rate': 0.001        # 通信质量改善率
+}
+
+# 区域配置（用于多区域适应度计算）
+NUM_REGIONS = 4  # 灾难场景划分为4个区域
+
 # ==================== Configuration Dataclass ====================
 
 @dataclass
@@ -196,6 +249,16 @@ class SimulationConfig:
 
     # Secondary disaster configuration
     secondary_disaster_probability: float = 0.001  # Probability per step
+
+    # Manager configurations
+    egt_config: Dict = field(default_factory=lambda: EGT_CONFIG.copy())
+    reputation_config: Dict = field(default_factory=lambda: REPUTATION_CONFIG.copy())
+    pareto_config: Dict = field(default_factory=lambda: PARETO_CONFIG.copy())
+    communication_config: Dict = field(default_factory=lambda: COMMUNICATION_CONFIG.copy())
+    interference_config: Dict = field(default_factory=lambda: INTERFERENCE_CONFIG.copy())
+
+    # Region configuration
+    num_regions: int = NUM_REGIONS
 
 
 # ==================== Default Config Instance ====================
