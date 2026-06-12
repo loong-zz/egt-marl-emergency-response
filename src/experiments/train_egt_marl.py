@@ -30,6 +30,7 @@ from algorithms.dynamic_frontier import DynamicParetoFrontier
 from utils.metrics import MetricsCollector
 from environments.visualization import DisasterVisualizer
 from environments.managers.manager_integration import ManagerIntegration
+from torch.utils.tensorboard import SummaryWriter
 import logging
 
 # 初始化logger
@@ -49,12 +50,22 @@ class EGTMARLTrainer:
         self.config = self._load_config(config_path)
         self.setup_device()
         
+        # 初始化 TensorBoard
+        self.writer = None
+        if self.config.get('logging', {}).get('tensorboard', {}).get('enabled', False):
+            log_dir = self.config['logging']['tensorboard'].get('log_dir', 'runs/{experiment_name}')
+            experiment_name = self.config.get('experiment', {}).get('name', 'egt_marl')
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            log_dir = log_dir.format(experiment_name=experiment_name, timestamp=timestamp)
+            self.writer = SummaryWriter(log_dir=log_dir)
+            logger.info(f"TensorBoard logging enabled, log directory: {log_dir}")
+        
         # 初始化组件
         self.env = None
         self.algorithm = None
         self.metrics_collector = None
         self.visualizer = None
-        self.manager_integration = None  # Manager集成
+        self.manager_integration = None  # Manager 集成
         
         logger.info(f"EGT-MARL Trainer initialized with config: {config_path}")
     
@@ -270,8 +281,16 @@ class EGTMARLTrainer:
         if self.manager_integration is not None:
             self.manager_integration.on_episode_start(
                 num_agents=self.env.num_agents,
-                num_regions=NUM_REGIONS
+                num_regions=NUM_REGIONS,
+                map_size=self.env.map_size
             )
+            
+            # 注册伤员和agent区域信息
+            casualties = {cid: {'position': casualty.position} for cid, casualty in self.env.casualties.items()}
+            self.manager_integration.register_casualties(casualties)
+            
+            agents = {aid: {'position': agent.position} for aid, agent in self.env.rescue_agents.items()}
+            self.manager_integration.register_agents(agents)
         
         episode_metrics = {
             'total_reward': 0.0,
@@ -284,6 +303,9 @@ class EGTMARLTrainer:
             'total_communications': 0,
             'shared_casualties': 0
         }
+        
+        # Track rescued casualties for region manager
+        previously_rescued = set()
         
         done = False
         step = 0
@@ -331,6 +353,28 @@ class EGTMARLTrainer:
             self.algorithm.store_experience(state, actions, rewards, next_state, done)
             if step % self.config['training']['update_frequency'] == 0:
                 self.algorithm.update()
+            
+            # Manager集成：记录新救援的伤员
+            if self.manager_integration is not None:
+                current_rescued = {cid for cid, casualty in self.env.casualties.items() if casualty.treated}
+                newly_rescued = current_rescued - previously_rescued
+                for cid in newly_rescued:
+                    # 找到救援该伤员的agent（通过检查rescued_count变化）
+                    rescuer_id = None
+                    for aid, agent in self.env.rescue_agents.items():
+                        if hasattr(agent, 'current_mission') and agent.current_mission:
+                            mission_target = getattr(agent.current_mission, 'target_id', None)
+                            if mission_target == cid:
+                                rescuer_id = aid
+                                break
+                    # 如果找不到具体救援者，使用-1表示未知
+                    self.manager_integration.record_rescue(rescuer_id if rescuer_id else -1, cid, success=True)
+                previously_rescued.update(newly_rescued)
+            
+            # Manager集成：更新区域公平性指标
+            if self.manager_integration is not None:
+                self.manager_integration.update_region_fairness_metrics()
+                self.manager_integration.record_fairness_step()
             
             # Manager集成：Step结束回调
             if self.manager_integration is not None:
@@ -671,6 +715,23 @@ class EGTMARLTrainer:
             training_history['total_reward'].append(episode_metrics.get('total_reward', 0.0))
             training_history['loss'].append(episode_metrics.get('loss', 0.0))
             
+            # TensorBoard 日志记录
+            if self.writer is not None:
+                tb_step = episode  # 使用 episode 作为 step
+                self.writer.add_scalar('Metrics/Rescue_Rate', episode_metrics.get('rescue_rate', 0.0), tb_step)
+                self.writer.add_scalar('Metrics/Avg_Response_Time', episode_metrics.get('avg_response_time', 0.0), tb_step)
+                self.writer.add_scalar('Metrics/Resource_Utilization', episode_metrics.get('resource_utilization', 0.0), tb_step)
+                self.writer.add_scalar('Metrics/Total_Reward', episode_metrics.get('total_reward', 0.0), tb_step)
+                self.writer.add_scalar('Metrics/Rescued_Count', episode_metrics.get('rescued', 0), tb_step)
+                self.writer.add_scalar('Metrics/Deaths', episode_metrics.get('deaths', 0), tb_step)
+                self.writer.add_scalar('Metrics/Epsilon', epsilon, tb_step)
+                
+                # 记录 Manager 指标
+                if self.manager_integration is not None:
+                    self.writer.add_scalar('EGT/Lambda', episode_metrics.get('final_lambda', 0.0), tb_step)
+                    self.writer.add_scalar('Communication/Total', episode_metrics.get('total_communications', 0), tb_step)
+                    self.writer.add_scalar('Communication/Shared', episode_metrics.get('shared_casualties', 0), tb_step)
+            
             # 定期评估
             if episode % eval_interval == 0:
                 eval_metrics = self.evaluate(num_eval_episodes)
@@ -731,6 +792,11 @@ class EGTMARLTrainer:
         # 生成训练报告
         self.generate_training_report(training_history, final_metrics)
         
+        # 关闭 TensorBoard writer
+        if self.writer is not None:
+            self.writer.close()
+            logger.info("TensorBoard writer closed")
+        
         return training_history, final_metrics
     
     def generate_training_report(self, 
@@ -760,8 +826,9 @@ class EGTMARLTrainer:
             f.write(f"Learning Rate: {self.config['training']['learning_rate']}\n")
             f.write(f"Gamma: {self.config['training']['gamma']}\n\n")
             
-            f.write("3. Final Performance Metrics\n")
+            f.write("3. Evaluation Performance Metrics\n")
             f.write("-" * 40 + "\n")
+            f.write(f"(Evaluated on {num_eval_episodes * 2} episodes after training)\n")
             f.write(f"Rescue Rate: {final_metrics.get('rescue_rate', 0.0):.1f}% "
                    f"(±{final_metrics.get('rescue_rate_std', 0.0):.1f})\n")
             f.write(f"Average Response Time: {final_metrics.get('avg_response_time', 0.0):.1f}s\n")
@@ -770,10 +837,11 @@ class EGTMARLTrainer:
             
             f.write("4. Training Statistics\n")
             f.write("-" * 40 + "\n")
+            f.write(f"(Recorded during {self.config['training']['num_episodes']} training episodes)\n")
             if training_history['rescue_rate']:
-                f.write(f"Best Rescue Rate: {max(training_history['rescue_rate']):.1f}%\n")
-                f.write(f"Final Rescue Rate: {training_history['rescue_rate'][-1]:.1f}%\n")
-                f.write(f"Average Rescue Rate: {np.mean(training_history['rescue_rate']):.1f}%\n")
+                f.write(f"Best Training Rescue Rate: {max(training_history['rescue_rate']):.1f}%\n")
+                f.write(f"Final Training Rescue Rate: {training_history['rescue_rate'][-1]:.1f}%\n")
+                f.write(f"Average Training Rescue Rate: {np.mean(training_history['rescue_rate']):.1f}%\n")
             
             if training_history['loss']:
                 valid_losses = [l for l in training_history['loss'] if l is not None and l > 0]

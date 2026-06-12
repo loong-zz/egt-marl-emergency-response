@@ -7,6 +7,9 @@ This module integrates all the specialized managers into the training pipeline:
 3. ParetoFrontierManager - Dynamic Pareto frontier
 4. CommunicationManager - Agent-to-agent communication
 5. CommunicationInterference - Communication interference model
+6. RegionManager - Spatial partitioning and regional fitness calculation
+7. StrategyDetectionManager - Strategic behavior detection (false reporting, hoarding)
+8. FairnessMetricsManager - Fairness metrics monitoring (Gini, Theil, visualization)
 """
 
 import numpy as np
@@ -18,6 +21,9 @@ from .reputation_manager import ReputationManager
 from .pareto_manager import ParetoFrontierManager
 from .communication_manager import CommunicationManager
 from .communication_interference import CommunicationInterference
+from .region_manager import RegionManager
+from .strategy_detection_manager import StrategyDetectionManager
+from .fairness_metrics_manager import FairnessMetricsManager
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +51,9 @@ class ManagerIntegration:
         self.pareto_manager = ParetoFrontierManager(config.get('pareto', {}))
         self.communication_manager = CommunicationManager(config.get('communication', {}))
         self.communication_interference = CommunicationInterference(config.get('interference', {}))
+        self.region_manager = None  # Initialized in on_episode_start with map_size
+        self.strategy_detection_manager = StrategyDetectionManager()
+        self.fairness_metrics_manager = FairnessMetricsManager()
 
         # Training state
         self.current_time_step = 0
@@ -53,13 +62,14 @@ class ManagerIntegration:
 
         logger.info("Manager Integration initialized with all managers")
 
-    def on_episode_start(self, num_agents: int, num_regions: int):
+    def on_episode_start(self, num_agents: int, num_regions: int, map_size: Tuple[float, float] = None):
         """
         Callback at the start of each episode.
 
         Args:
             num_agents: Number of agents in the simulation
             num_regions: Number of regions for fitness calculation
+            map_size: (width, height) of the disaster map for region initialization
         """
         self.current_time_step = 0
         self.agent_fitness = {i: 0.0 for i in range(num_agents)}
@@ -70,8 +80,52 @@ class ManagerIntegration:
         self.reputation_manager.reset()
         self.communication_manager.reset()
         self.communication_interference.reset()
+        self.strategy_detection_manager.reset()
+        self.fairness_metrics_manager.reset()
+        
+        # Initialize or reset region manager
+        if map_size is not None:
+            if self.region_manager is None or self.region_manager.map_size != map_size:
+                self.region_manager = RegionManager(map_size, num_regions)
+            else:
+                self.region_manager.reset()
+        elif self.region_manager is None:
+            # Default map size if not provided
+            self.region_manager = RegionManager((500.0, 500.0), num_regions)
+        else:
+            self.region_manager.reset()
 
-        logger.debug(f"[INTEGRATION] Episode started - Agents: {num_agents}, Regions: {num_regions}")
+        logger.debug(f"[INTEGRATION] Episode started - Agents: {num_agents}, Regions: {num_regions}, Map: {map_size}")
+
+    def register_casualties(self, casualties: Dict[int, Dict]):
+        """
+        Register initial casualty positions for region tracking.
+        
+        Args:
+            casualties: Dictionary of {casualty_id: {'position': np.ndarray, ...}}
+        """
+        if self.region_manager is not None:
+            for casualty_id, data in casualties.items():
+                position = data.get('position')
+                if position is not None:
+                    self.region_manager.register_casualty(casualty_id, position)
+            
+            logger.debug(f"[REGION] Registered {len(casualties)} casualties")
+
+    def register_agents(self, agents: Dict[int, Dict]):
+        """
+        Register initial agent positions for region tracking.
+        
+        Args:
+            agents: Dictionary of {agent_id: {'position': np.ndarray, ...}}
+        """
+        if self.region_manager is not None:
+            for agent_id, data in agents.items():
+                position = data.get('position')
+                if position is not None:
+                    self.region_manager.register_agent(agent_id, position)
+            
+            logger.debug(f"[REGION] Registered {len(agents)} agents")
 
     def on_step_start(self, hours_elapsed: float, aftershock_happening: bool = False):
         """
@@ -124,6 +178,12 @@ class ManagerIntegration:
             # Positive reward = good performance = honest behavior
             is_honest = reward >= 0
             self.reputation_manager.update_reputation(agent_id, is_honest)
+            
+            # Update agent position in region manager
+            if self.region_manager is not None:
+                position = state.get('position')
+                if position is not None:
+                    self.region_manager.update_agent_position(agent_id, position)
 
         # Update EGT lambda based on fitness distribution
         if len(fitness_values) > 0:
@@ -310,13 +370,155 @@ class ManagerIntegration:
 
     def get_metrics(self) -> Dict:
         """Get aggregated metrics from all managers."""
-        return {
+        metrics = {
             'egt': self.egt_manager.get_egt_metrics(),
             'pareto': self.pareto_manager.get_pareto_metrics(),
             'communication': self.communication_manager.get_communication_metrics(),
             'interference': self.communication_interference.get_interference_metrics(),
-            'reputation': self.reputation_manager.get_reputation_metrics()
+            'reputation': self.reputation_manager.get_reputation_metrics(),
+            'strategy_detection': self.strategy_detection_manager.get_detection_summary(),
+            'fairness': self.fairness_metrics_manager.get_overall_fairness_metrics()
         }
+        
+        # Add region metrics if available
+        if self.region_manager is not None:
+            metrics['region'] = self.region_manager.get_metrics()
+        
+        return metrics
+    
+    def update_fairness_metrics(self, agent_id: int, rescues: int = 0, 
+                                resources_used: float = 0.0, response_time: float = 0.0,
+                                survival_rate: float = 0.0):
+        """
+        Update fairness metrics for an agent.
+        
+        Args:
+            agent_id: Agent ID
+            rescues: Number of rescues performed
+            resources_used: Resources consumed
+            response_time: Response time
+            survival_rate: Survival rate achieved
+        """
+        self.fairness_metrics_manager.record_agent_metrics(
+            agent_id, rescues, resources_used, response_time, survival_rate
+        )
+    
+    def update_region_fairness_metrics(self):
+        """
+        Update fairness metrics from region data.
+        """
+        if self.region_manager is not None:
+            for region_id in range(self.region_manager.num_regions):
+                fitness = self.region_manager.calculate_region_fitness(region_id)
+                stats = self.region_manager.region_stats[region_id]
+                self.fairness_metrics_manager.update_region_metrics(
+                    region_id, fitness, stats['saved'], stats['initial']
+                )
+    
+    def record_fairness_step(self):
+        """
+        Record fairness metrics at current step.
+        """
+        self.fairness_metrics_manager.record_step_metrics(self.current_time_step)
+    
+    def generate_fairness_report(self) -> str:
+        """
+        Generate a summary report of fairness metrics.
+        
+        Returns:
+            Formatted report string
+        """
+        return self.fairness_metrics_manager.generate_summary_report()
+    
+    def get_visualization_data(self) -> Dict:
+        """
+        Get visualization data for fairness metrics.
+        
+        Returns:
+            Visualization data dictionary
+        """
+        return self.fairness_metrics_manager.generate_visualization_data()
+
+    def report_casualty(self, agent_id: int, position: np.ndarray, severity: str):
+        """
+        Record a casualty report from an agent.
+        
+        Args:
+            agent_id: Agent making the report
+            position: Reported casualty position
+            severity: Reported casualty severity
+        """
+        self.strategy_detection_manager.report_casualty(
+            agent_id, position, self.current_time_step, severity
+        )
+    
+    def record_rescue(self, agent_id: int, casualty_id: int, success: bool):
+        """
+        Record an agent's rescue attempt.
+        
+        Args:
+            agent_id: Agent performing the rescue
+            casualty_id: Casualty being rescued
+            success: Whether the rescue was successful
+        """
+        self.strategy_detection_manager.record_rescue(
+            agent_id, casualty_id, self.current_time_step, success
+        )
+        
+        # Record rescue in region manager for spatial tracking
+        if self.region_manager is not None and success:
+            self.region_manager.record_rescue(casualty_id)
+    
+    def record_resource_state(self, agent_id: int, resources: float, capacity: float):
+        """
+        Record an agent's resource state.
+        
+        Args:
+            agent_id: Agent ID
+            resources: Current resources
+            capacity: Maximum resource capacity
+        """
+        self.strategy_detection_manager.record_resource_state(
+            agent_id, self.current_time_step, resources, capacity
+        )
+    
+    def verify_reports(self, verified_casualties: dict):
+        """
+        Verify reported casualties against verified data.
+        
+        Args:
+            verified_casualties: Dictionary of verified casualties
+        """
+        self.strategy_detection_manager.verify_reports(verified_casualties)
+    
+    def detect_strategic_behavior(self, global_stats: dict = None):
+        """
+        Detect strategic behavior across all agents.
+        
+        Args:
+            global_stats: Global statistics for fairness comparison
+        
+        Returns:
+            Dictionary of detected strategies by agent
+        """
+        if global_stats is None:
+            global_stats = {}
+        
+        detected = {}
+        for agent_id in self.agent_fitness.keys():
+            # Detect resource hoarding
+            hoarding = self.strategy_detection_manager.detect_resource_hoarding(agent_id)
+            
+            # Detect unfair claiming
+            unfair = self.strategy_detection_manager.detect_unfair_claiming(agent_id, global_stats)
+            
+            if hoarding or unfair:
+                detected[agent_id] = {
+                    'hoarding_detected': hoarding,
+                    'unfair_claiming_detected': unfair
+                }
+        
+        return detected
 
     def on_episode_end(self) -> Dict:
         """
@@ -339,6 +541,17 @@ class ManagerIntegration:
         if interference_metrics['total_packets'] > 0:
             summary['avg_communication_delay'] = interference_metrics['avg_delay']
             summary['packet_loss_rate'] = interference_metrics['loss_rate']
+        
+        # Add region summary if available
+        if self.region_manager is not None:
+            region_summary = self.region_manager.get_region_summary()
+            summary['cross_region_gini'] = region_summary.get('cross_region_gini', 0.0)
+            summary['cross_region_theil'] = region_summary.get('cross_region_theil', 0.0)
+            summary['num_regions'] = self.region_manager.num_regions
+            
+            # Log region fairness metrics
+            logger.info(f"[REGION] Cross-region Gini={summary['cross_region_gini']:.4f}, "
+                       f"Theil={summary['cross_region_theil']:.4f}")
 
         logger.info(f"[EPISODE END] Summary: λ={summary['final_lambda']:.4f}, "
                    f"Communications={summary['total_communications']}, "
