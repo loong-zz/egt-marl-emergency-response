@@ -109,7 +109,7 @@ class ManagerIntegration:
         # Update time step
         self.current_time_step += 1
 
-        # Calculate fitness for each agent
+        # Calculate fitness for each agent and update reputation
         fitness_values = []
         for agent_id, state in agent_states.items():
             # Fitness based on survival rate and resource efficiency
@@ -118,6 +118,12 @@ class ManagerIntegration:
             fitness = 0.7 * survival_rate + 0.3 * resource_efficiency
             self.agent_fitness[agent_id] = fitness
             fitness_values.append(fitness)
+            
+            # Update reputation based on agent performance
+            reward = agent_rewards.get(agent_id, 0.0)
+            # Positive reward = good performance = honest behavior
+            is_honest = reward >= 0
+            self.reputation_manager.update_reputation(agent_id, is_honest)
 
         # Update EGT lambda based on fitness distribution
         if len(fitness_values) > 0:

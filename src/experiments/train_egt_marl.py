@@ -428,19 +428,16 @@ class EGTMARLTrainer:
         """获取所有agent的状态（用于EGT fitness计算）"""
         agent_states = {}
         for agent_id, agent in self.env.rescue_agents.items():
-            # 计算该agent的生存率和资源效率
-            total_casualties = len(agent.known_casualties)
-            treated_casualties = sum(1 for cid in agent.known_casualties 
-                                   if cid in self.env.casualties 
-                                   and self.env.casualties[cid].treated)
-            survival_rate = treated_casualties / max(total_casualties, 1)
+            # 使用agent自己救援的人数作为fitness指标
+            rescued_count = getattr(agent, 'rescued_count', 0)
             
-            resource_usage = sum(agent.capacity.values())
-            resource_capacity = sum(agent.max_capacity.values())
-            resource_efficiency = resource_usage / max(resource_capacity, 1)
+            # 资源效率：当前资源量与最大容量的比例（反映资源利用情况）
+            current_resources = sum(agent.capacity.values())
+            max_resources = sum(agent.max_capacity.values())
+            resource_efficiency = current_resources / max(max_resources, 1)
             
             agent_states[agent_id] = {
-                'survival_rate': survival_rate,
+                'survival_rate': float(rescued_count),  # 使用绝对救援数
                 'resource_efficiency': resource_efficiency
             }
         return agent_states
