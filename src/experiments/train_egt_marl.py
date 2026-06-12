@@ -678,7 +678,17 @@ class EGTMARLTrainer:
         
         # 训练参数
         training_config = self.config['training']
-        num_episodes = training_config['num_episodes']
+        
+        # 检查是否有阶段配置，如果有则计算总 episode 数
+        if 'schedule' in self.config and 'phases' in self.config['schedule']:
+            phases = self.config['schedule']['phases']
+            num_episodes = sum(phase['episodes'] for phase in phases)
+            logger.info(f"Multi-phase training enabled: {len(phases)} phases, total episodes: {num_episodes}")
+            for phase in phases:
+                logger.info(f"  - {phase['name']}: {phase['episodes']} episodes")
+        else:
+            num_episodes = training_config['num_episodes']
+        
         epsilon = training_config['epsilon_start']
         epsilon_decay = training_config['epsilon_decay']
         epsilon_end = training_config['epsilon_end']
@@ -828,6 +838,7 @@ class EGTMARLTrainer:
             
             f.write("3. Evaluation Performance Metrics\n")
             f.write("-" * 40 + "\n")
+            num_eval_episodes = self.config['training']['num_eval_episodes']
             f.write(f"(Evaluated on {num_eval_episodes * 2} episodes after training)\n")
             f.write(f"Rescue Rate: {final_metrics.get('rescue_rate', 0.0):.1f}% "
                    f"(±{final_metrics.get('rescue_rate_std', 0.0):.1f})\n")

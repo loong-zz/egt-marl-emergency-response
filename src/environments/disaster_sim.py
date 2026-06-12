@@ -54,6 +54,10 @@ class DisasterSim:
         self.current_time = 0.0
         self.step_count = 0
         
+        # Track previous statistics for incremental reward calculation
+        self.prev_total_rescued = 0
+        self.prev_total_deaths = 0
+        
         # Managers
         self.resource_manager = ResourceManager(self.config)
         self.treatment_manager = TreatmentManager(self.config)
@@ -457,9 +461,22 @@ class DisasterSim:
                     self.statistics['response_times'].append(response_time)
     
     def _calculate_reward(self) -> float:
-        """Calculate reward for this step."""
-        # Simple reward based on number of rescued casualties
-        return self.statistics['total_rescued'] - self.statistics['total_deaths'] * 10
+        """Calculate incremental reward for this step.
+        
+        Returns reward based on newly rescued casualties and deaths in this step,
+        not cumulative totals. This ensures agents learn the correct association
+        between their actions and rewards.
+        """
+        # Calculate incremental changes
+        new_rescued = self.statistics['total_rescued'] - self.prev_total_rescued
+        new_deaths = self.statistics['total_deaths'] - self.prev_total_deaths
+        
+        # Update previous values for next step
+        self.prev_total_rescued = self.statistics['total_rescued']
+        self.prev_total_deaths = self.statistics['total_deaths']
+        
+        # Reward: +1 for each rescue, -10 for each death
+        return new_rescued - new_deaths * 10
     
     def _check_termination(self) -> bool:
         """Check if simulation should terminate."""
@@ -511,6 +528,10 @@ class DisasterSim:
         self.current_time = 0.0
         self.step_count = 0
         self.statistics = self._initialize_statistics()
+        
+        # Reset previous statistics for incremental reward calculation
+        self.prev_total_rescued = 0
+        self.prev_total_deaths = 0
         
         # Reset treatment manager statistics
         self.treatment_manager.total_resources_used = 0.0
