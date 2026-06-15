@@ -79,7 +79,7 @@ class EGTMARLTrainer:
         defaults = {
             'training': {
                 'num_episodes': 200,
-                'max_steps_per_episode': 600,
+                'max_steps_per_episode': 1200,
                 'batch_size': 32,
                 'buffer_size': 5000,
                 'gamma': 0.99,
@@ -331,8 +331,9 @@ class EGTMARLTrainer:
             
             # Manager集成：奖励塑形
             if self.manager_integration is not None:
-                # rewards可能是int或float，转换为字典格式
-                if isinstance(rewards, (int, float)):
+                # rewards现在是字典格式（个体奖励）
+                if not isinstance(rewards, dict):
+                    # 如果是旧格式（全局奖励），转换为字典格式
                     num_agents = len(self.env.rescue_agents)
                     per_agent_reward = rewards / num_agents if num_agents > 0 else 0.0
                     rewards = {aid: per_agent_reward for aid in self.env.rescue_agents}
@@ -348,6 +349,12 @@ class EGTMARLTrainer:
                     )
                     shaped_rewards[agent_id] = shaped_reward
                 rewards = shaped_rewards
+            else:
+                # 如果没有manager_integration，确保rewards是字典格式
+                if not isinstance(rewards, dict):
+                    num_agents = len(self.env.rescue_agents)
+                    per_agent_reward = rewards / num_agents if num_agents > 0 else 0.0
+                    rewards = {aid: per_agent_reward for aid in self.env.rescue_agents}
             
             # 存储经验并更新算法
             self.algorithm.store_experience(state, actions, rewards, next_state, done)
@@ -599,7 +606,9 @@ class EGTMARLTrainer:
                 next_state, rewards, terminated, truncated, info = self.env.step(actions)
                 done = terminated or truncated
 
-                episode_reward += rewards
+                # Handle individual rewards (dict) or global reward (float)
+                step_reward = sum(rewards.values()) if isinstance(rewards, dict) else rewards
+                episode_reward += step_reward
 
                 state = next_state
                 step += 1

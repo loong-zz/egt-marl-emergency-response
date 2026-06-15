@@ -113,6 +113,19 @@ RESOURCES_NEEDED = {
 # Convenience reference for moderate casualty resources (used for refill threshold check)
 MODERATE_RESOURCES_NEEDED = RESOURCES_NEEDED[CasualtySeverity.MODERATE]
 
+# Resource supply ratio for creating scarcity (0.7-0.8 is recommended for balanced challenge)
+# This creates a "zero-sum" environment where resources are insufficient but achievable through optimization
+RESOURCE_SUPPLY_RATIO = 0.75
+
+# Expected severity distribution (used for initial resource calculation)
+# Can be overridden by config if casualty generation uses different distribution
+EXPECTED_SEVERITY_DISTRIBUTION = {
+    CasualtySeverity.CRITICAL: 0.25,
+    CasualtySeverity.SEVERE: 0.25,
+    CasualtySeverity.MODERATE: 0.30,
+    CasualtySeverity.MILD: 0.20
+}
+
 # Agent speed in m/s
 AGENT_SPEEDS = {
     AgentType.DRONE: 30.0,

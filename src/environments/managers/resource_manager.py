@@ -82,10 +82,12 @@ class ResourceManager:
         for resource_type in ResourceType:
             needed = agent.max_capacity[resource_type] - agent.capacity[resource_type]
             if needed > 0:
-                agent.capacity[resource_type] = agent.max_capacity[resource_type]
+                # 调用depot.consume()获取实际可补充的资源量（可能少于需求量）
+                actual = depot.consume(resource_type, needed)
+                agent.capacity[resource_type] += actual
                 any_refilled = True
                 abbr = RESOURCE_ABBR.get(resource_type.name, resource_type.name[:4])
-                transferred.append(f"{abbr}+{needed:.2f}")
+                transferred.append(f"{abbr}+{actual:.2f}")
         
         if any_refilled:
             logger.info(

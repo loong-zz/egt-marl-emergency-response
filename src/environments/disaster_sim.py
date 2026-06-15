@@ -58,6 +58,9 @@ class DisasterSim:
         self.prev_total_rescued = 0
         self.prev_total_deaths = 0
         
+        # Track individual agent rescue contributions for reward attribution
+        self.prev_agent_rescued: Dict[int, int] = {}
+        
         # Managers
         self.resource_manager = ResourceManager(self.config)
         self.treatment_manager = TreatmentManager(self.config)
@@ -119,21 +122,36 @@ class DisasterSim:
             self.affected_areas[i] = area
     
     def _initialize_resource_depots(self) -> None:
-        """Initialize resource depots."""
+        """Initialize resource depots with dynamic resource calculation based on num_victims."""
+        from environments.config.constants import (
+            RESOURCE_SUPPLY_RATIO, EXPECTED_SEVERITY_DISTRIBUTION,
+            RESOURCES_NEEDED, ResourceType, CasualtySeverity
+        )
+        
         map_size = self.map_size[0] if isinstance(self.map_size, (tuple, list)) else self.map_size
         depot_positions = [
             np.array([map_size * 0.2, map_size * 0.2]),
             np.array([map_size * 0.8, map_size * 0.8])
         ]
         
+        # Calculate total expected resource demand based on num_victims
+        num_victims = getattr(self.config, 'num_victims', 100)
+        total_demand = {rt: 0.0 for rt in ResourceType}
+        
+        for severity, ratio in EXPECTED_SEVERITY_DISTRIBUTION.items():
+            count = int(num_victims * ratio)
+            for rt, amount in RESOURCES_NEEDED[severity].items():
+                total_demand[rt] += amount * count
+        
+        # Apply supply ratio to create scarcity (zero-sum environment)
+        total_supply = {rt: demand * RESOURCE_SUPPLY_RATIO for rt, demand in total_demand.items()}
+        
+        # Divide between depots (each depot gets half)
+        num_depots = len(depot_positions)
+        per_depot = {rt: supply / num_depots for rt, supply in total_supply.items()}
+        
         for i, position in enumerate(depot_positions):
-            # 初始资源基于伤员需求计算（30个伤员约需400-500单位，2个depot分担）
-            resources = {
-                ResourceType.BROAD_SPECTRUM_ANTIBIOTICS: 100.0,
-                ResourceType.BLOOD_PACKS: 50.0,
-                ResourceType.OXYGEN: 120.0,
-                ResourceType.PAIN_MEDICATION: 50.0
-            }
+            resources = per_depot.copy()
             
             depot = ResourceDepot(
                 id=i,
@@ -460,12 +478,17 @@ class DisasterSim:
                 if response_time > 0 and response_time not in self.statistics['response_times']:
                     self.statistics['response_times'].append(response_time)
     
-    def _calculate_reward(self) -> float:
-        """Calculate incremental reward for this step.
+    def _calculate_reward(self) -> Dict[int, float]:
+        """Calculate individual rewards for each agent.
         
-        Returns reward based on newly rescued casualties and deaths in this step,
-        not cumulative totals. This ensures agents learn the correct association
-        between their actions and rewards.
+        Returns rewards based on newly rescued casualties and deaths in this step,
+        with individual attribution to reward the agents who actually performed rescues.
+        
+        This solves the "free-rider" problem where inactive agents would get the same
+        reward as active rescuers.
+        
+        Returns:
+            Dictionary mapping agent_id to individual reward
         """
         # Calculate incremental changes
         new_rescued = self.statistics['total_rescued'] - self.prev_total_rescued
@@ -475,8 +498,41 @@ class DisasterSim:
         self.prev_total_rescued = self.statistics['total_rescued']
         self.prev_total_deaths = self.statistics['total_deaths']
         
-        # Reward: +1 for each rescue, -10 for each death
-        return new_rescued - new_deaths * 10
+        # Global base reward components
+        global_rescue_reward = new_rescued  # +1 for each rescue
+        global_death_penalty = new_deaths * 10  # -10 for each death
+        time_penalty = 0.01  # Small penalty per step to encourage efficiency
+        
+        # Calculate individual rewards
+        individual_rewards: Dict[int, float] = {}
+        
+        # Initialize prev_agent_rescued if not done yet
+        if not self.prev_agent_rescued:
+            for agent_id, agent in self.rescue_agents.items():
+                self.prev_agent_rescued[agent_id] = 0
+        
+        # Calculate each agent's contribution
+        for agent_id, agent in self.rescue_agents.items():
+            # Get agent's rescue count change
+            current_rescued = getattr(agent, 'rescued_count', 0)
+            prev_rescued = self.prev_agent_rescued.get(agent_id, 0)
+            agent_new_rescued = current_rescued - prev_rescued
+            
+            # Update previous rescued count for next step
+            self.prev_agent_rescued[agent_id] = current_rescued
+            
+            # Individual reward components:
+            # 1. Share of global reward (distributed equally)
+            num_agents = len(self.rescue_agents)
+            global_share = (global_rescue_reward - global_death_penalty) / num_agents
+            
+            # 2. Individual rescue bonus (agent who rescued gets extra reward)
+            rescue_bonus = agent_new_rescued * 0.5  # Extra reward for each rescue
+            
+            # 3. Time penalty (applied to all agents)
+            individual_rewards[agent_id] = global_share + rescue_bonus - time_penalty
+        
+        return individual_rewards
     
     def _check_termination(self) -> bool:
         """Check if simulation should terminate."""
@@ -532,6 +588,9 @@ class DisasterSim:
         # Reset previous statistics for incremental reward calculation
         self.prev_total_rescued = 0
         self.prev_total_deaths = 0
+        
+        # Reset individual agent rescue tracking
+        self.prev_agent_rescued = {}
         
         # Reset treatment manager statistics
         self.treatment_manager.total_resources_used = 0.0
