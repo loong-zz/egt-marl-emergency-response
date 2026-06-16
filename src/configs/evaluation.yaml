@@ -1,34 +1,19 @@
-# Evaluation Configuration
-# =======================
+# Evaluation Configuration for Baseline Comparison
+# Using same parameters as training for model compatibility
 
-# Evaluation settings
 evaluation:
-  num_episodes: 100          # Number of episodes per run
-  max_steps_per_episode: 200  # Maximum steps per episode
-  num_runs: 5                # Number of independent runs
-  scenarios:                  # Scenarios to evaluate
+  num_episodes: 50
+  max_steps_per_episode: 1200
+  num_runs: 5
+  scenarios:
     - earthquake
-    - flood
-    - hurricane
-  severities:                 # Disaster severities
-    - low
+  severities:
     - medium
-    - high
 
-# Algorithm settings
 algorithms:
   egt_marl:
-    enabled: true
-    model_path: null
-  qmix:
-    enabled: true
-    model_path: null
-  maddpg:
     enabled: false
-    model_path: null
-  mappo:
-    enabled: false
-    model_path: null
+    model_path: "experiment_results/egt_marl_20260613_122050/models/best_model.pt"
   fcfs:
     enabled: true
   priority:
@@ -37,32 +22,14 @@ algorithms:
     enabled: true
   proportional_fair:
     enabled: true
-  centralized_mpc:
-    enabled: true
-  game_theoretic:
-    enabled: true
-  gnn_based:
-    enabled: true
-  transformer_based:
-    enabled: true
 
-# Environment settings
 environment:
-  map_size: [100, 100]
-  num_agents: 5
-  num_victims: 100
-  num_resources: 50
-  disaster_duration: 100
-  time_step: 1
+  map_size: [1000, 1000]
+  num_agents: 20
+  num_victims: 200
+  num_resources: 10
+  num_hospitals: 3
+  disaster_type: earthquake
+  severity: medium
 
-# Output settings
-output_dir: evaluation_results
-visualization:
-  enabled: true
-  plot_format: png
-  dpi: 300
-
-# Logging settings
-logging:
-  level: info
-  format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+output_dir: "evaluation_results"

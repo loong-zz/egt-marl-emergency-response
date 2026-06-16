@@ -477,6 +477,15 @@ class DisasterSim:
                 response_time = casualty.treatment_start - casualty.injury_time
                 if response_time > 0 and response_time not in self.statistics['response_times']:
                     self.statistics['response_times'].append(response_time)
+        
+        # Record severities of rescued casualties for fairness metrics
+        severity_order = {'CRITICAL': 0, 'SEVERE': 1, 'MODERATE': 2, 'MILD': 3}
+        rescued_severities = []
+        for casualty in self.casualties.values():
+            if casualty.treated:
+                severity_value = severity_order.get(casualty.severity.name, 2)  # Default to MODERATE
+                rescued_severities.append(severity_value)
+        self.statistics['rescued_severities'] = rescued_severities
     
     def _calculate_reward(self) -> Dict[int, float]:
         """Calculate individual rewards for each agent.

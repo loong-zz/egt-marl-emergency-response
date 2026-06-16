@@ -168,8 +168,8 @@ class AblationStudy:
         """
         # 获取环境信息
         state_dim = self.env.get_state_dimension()
-        action_dim = self.env.get_action_dimension()
-        num_agents = self.env.num_agents
+        action_dim = 32  # 8 tactical actions * 4 communication modes
+        num_agents = self.env.get_num_agents()
         
         # 创建算法实例
         algorithm = EGTMARL(
@@ -280,21 +280,36 @@ class AblationStudy:
             done = terminated or truncated
             
             # 收集指标
-            episode_metrics['total_reward'] += rewards
+            if isinstance(rewards, dict):
+                episode_metrics['total_reward'] += sum(rewards.values())
+            elif isinstance(rewards, list):
+                total = 0.0
+                for r in rewards:
+                    if isinstance(r, dict):
+                        total += sum(r.values())
+                    elif isinstance(r, (int, float)):
+                        total += r
+                episode_metrics['total_reward'] += total
+            else:
+                episode_metrics['total_reward'] += rewards
+                
             episode_metrics['steps'] += 1
-            # 记录当前累计值（最后会取最终值），不累加
-            episode_metrics['rescued'] = info.get('rescued', 0)
-            episode_metrics['deaths'] = info.get('deaths', 0)
-            episode_metrics['resources_used'] += info.get('resources_used', 0)
             
-            if 'response_time' in info:
-                episode_metrics['response_times'].append(info['response_time'])
+            # 从statistics中获取救援数据
+            statistics = info.get('statistics', {})
+            episode_metrics['rescued'] = statistics.get('total_rescued', 0)
+            episode_metrics['deaths'] = statistics.get('total_deaths', 0)
+            episode_metrics['resources_used'] += statistics.get('resources_used', 0)
+            
+            # 从statistics中获取响应时间列表
+            if 'response_times' in statistics:
+                episode_metrics['response_times'].extend(statistics['response_times'])
             
             state = next_state
             step += 1
         
         # 计算衍生指标
-        total_victims = self.env.num_victims
+        total_victims = len(self.env.casualties)
         if total_victims > 0:
             episode_metrics['rescue_rate'] = (episode_metrics['rescued'] / total_victims) * 100
         
@@ -303,9 +318,8 @@ class AblationStudy:
         else:
             episode_metrics['avg_response_time'] = 0.0
         
-        total_resources = self.env.num_resources * 100
-        if total_resources > 0:
-            episode_metrics['resource_utilization'] = (episode_metrics['resources_used'] / total_resources) * 100
+        # 简化资源利用率计算
+        episode_metrics['resource_utilization'] = min(100.0, episode_metrics['resources_used'] / 10.0)
         
         # 计算公平性指标（简化）
         if episode_metrics['rescued'] > 0:

@@ -656,6 +656,31 @@ class EGTMARLTrainer:
         torch.save(checkpoint, checkpoint_path)
         logger.info(f"Checkpoint saved: {checkpoint_path}")
     
+    def load_checkpoint(self, checkpoint_path: str) -> int:
+        """
+        从检查点恢复训练
+        
+        Args:
+            checkpoint_path: 检查点文件路径
+            
+        Returns:
+            恢复时的episode编号
+        """
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        
+        episode = checkpoint.get('episode', 0)
+        self.config = checkpoint.get('config', self.config)
+        
+        # 加载算法权重
+        if self.algorithm is not None:
+            model_path = self.experiment_dir / 'models' / 'best_model.pt'
+            if model_path.exists():
+                self.algorithm.load_checkpoint(model_path)
+                logger.info(f"Model weights loaded from: {model_path}")
+        
+        logger.info(f"Checkpoint loaded: {checkpoint_path} (resuming from episode {episode})")
+        return episode
+    
     def save_best_model(self, episode_idx: int, metrics: Dict[str, float]):
         """保存最佳模型"""
         best_model_path = self.experiment_dir / 'models' / 'best_model.pt'

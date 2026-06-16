@@ -172,7 +172,7 @@ class BaselineEvaluator:
             raise ValueError("Environment must be initialized before setting up algorithms")
         
         state_dim = self.env.get_state_dimension()
-        action_dim = self.env.get_action_dimension()
+        action_dim = 32  # 8 tactical actions * 4 communication modes (from training config)
         num_agents = self.env.num_agents
         
         # 初始化 EGT-MARL
@@ -183,8 +183,8 @@ class BaselineEvaluator:
                     'num_agents': num_agents,
                     'state_dim': state_dim,
                     'action_dim': action_dim,
-                    'hidden_dim': 64,       # 与训练一致（从checkpoint推断）
-                    'mixing_hidden_dim': 64, # 与训练一致（从checkpoint推断）
+                    'hidden_dim': 128,      # 与训练一致
+                    'mixing_hidden_dim': 64,  # 与训练一致
                     'attention_heads': 4,    # 与训练一致（从checkpoint推断）
                     'learning_rate': 0.0001,
                     'epsilon_start': 1.0,
@@ -243,70 +243,18 @@ class BaselineEvaluator:
             if model_path and os.path.exists(model_path):
                 self._load_algorithm_model('EGT-MARL', model_path)
         
-        # 初始化 QMIX
-        if algo_config['qmix']['enabled']:
-            # 为 ImprovedQMIX 创建必要的参数
-            # 从环境获取观察维度
-            # 假设观察维度是状态维度的一部分
-            obs_dim = 19  # 根据错误信息，实际观察维度是 19
-            
-            # 创建动作维度列表和智能体类型列表
-            # 假设所有智能体都是无人机类型
-            action_dims = [16] * num_agents  # 简化为固定动作维度
-            agent_types = ['drone'] * num_agents
-            
-            # 创建配置字典
-            qmix_config = {
-                'hidden_dim': 64,
-                'mixing_hidden_dim': 64,
-                'attention_heads': 4,
-                'learning_rate': 0.0001
-            }
-            
-            self.algorithms['QMIX'] = ImprovedQMIX(
-                num_agents=num_agents,
-                obs_dim=obs_dim,
-                state_dim=state_dim,
-                action_dims=action_dims,
-                agent_types=agent_types,
-                config=qmix_config
-            )
-            
-            model_path = algo_config['qmix'].get('model_path')
-            if model_path and os.path.exists(model_path):
-                self._load_algorithm_model('QMIX', model_path)
-        
         # 初始化传统方法
         if algo_config['fcfs']['enabled']:
             self.algorithms['FCFS'] = self._create_fcfs_policy()
         
         if algo_config['priority']['enabled']:
             self.algorithms['Priority'] = self._create_priority_policy()
-        self.algorithms['Greedy-Local'] = self._create_greedy_policy()
-        self.algorithms['Proportional-Fair'] = self._create_proportional_fair_policy()
-        self.algorithms['Centralized-MPC'] = self._create_mpc_policy()
-        self.algorithms['Game-Theoretic'] = self._create_game_theoretic_policy()
-        self.algorithms['GNN-Based'] = self._create_gnn_policy()
-        self.algorithms['Transformer-Based'] = self._create_transformer_policy()
         
-        # 初始化新基线算法
         if algo_config.get('greedy_local', {}).get('enabled', True):
             self.algorithms['Greedy-Local'] = self._create_greedy_policy()
         
         if algo_config.get('proportional_fair', {}).get('enabled', True):
             self.algorithms['Proportional-Fair'] = self._create_proportional_fair_policy()
-        
-        if algo_config.get('centralized_mpc', {}).get('enabled', True):
-            self.algorithms['Centralized-MPC'] = self._create_mpc_policy()
-        
-        if algo_config.get('game_theoretic', {}).get('enabled', True):
-            self.algorithms['Game-Theoretic'] = self._create_game_theoretic_policy()
-        
-        if algo_config.get('gnn_based', {}).get('enabled', True):
-            self.algorithms['GNN-Based'] = self._create_gnn_policy()
-        
-        if algo_config.get('transformer_based', {}).get('enabled', True):
-            self.algorithms['Transformer-Based'] = self._create_transformer_policy()
         
         logger.info(f"Algorithms initialized: {list(self.algorithms.keys())}")
     
@@ -582,6 +530,7 @@ class BaselineEvaluator:
             'resource_utilization': [],
             'total_reward': [],
             'fairness_gini': [],
+            'fairness_theil': [],
             'fairness_maxmin': []
         }
         
@@ -683,18 +632,35 @@ class BaselineEvaluator:
             done = terminated or truncated
             
             # 收集指标
-            episode_metrics['total_reward'] += sum(rewards)
+            # 处理奖励（可能是dict或其他类型）
+            if isinstance(rewards, dict):
+                episode_metrics['total_reward'] += sum(rewards.values())
+            elif isinstance(rewards, list):
+                # 列表中的元素可能是dict
+                total = 0.0
+                for r in rewards:
+                    if isinstance(r, dict):
+                        total += sum(r.values())
+                    elif isinstance(r, (int, float)):
+                        total += r
+                episode_metrics['total_reward'] += total
+            elif isinstance(rewards, (int, float)):
+                episode_metrics['total_reward'] += rewards
             episode_metrics['steps'] += 1
             # 直接记录当前救援人数（最后会取最终值），不累加
-            episode_metrics['rescued'] = info.get('rescued', 0)
-            episode_metrics['deaths'] = info.get('deaths', 0)
-            episode_metrics['resources_used'] += info.get('resources_used', 0)
+            # 从 statistics 中获取救援和死亡人数
+            statistics = info.get('statistics', {})
+            episode_metrics['rescued'] = statistics.get('total_rescued', 0)
+            episode_metrics['deaths'] = statistics.get('total_deaths', 0)
+            episode_metrics['resources_used'] += statistics.get('resources_used', 0)
             
-            if 'response_time' in info:
-                episode_metrics['response_times'].append(info['response_time'])
+            # 从 statistics 中获取响应时间
+            if 'response_times' in statistics:
+                episode_metrics['response_times'].extend(statistics['response_times'])
             
-            if 'victim_severity' in info:
-                episode_metrics['victim_severities'].append(info['victim_severity'])
+            # 从 statistics 中获取被救援受害者的严重程度，用于计算公平性指标
+            if 'rescued_severities' in statistics:
+                episode_metrics['victim_severities'].extend(statistics['rescued_severities'])
             
             state = next_state
             step += 1
@@ -715,15 +681,27 @@ class BaselineEvaluator:
         if total_resources > 0:
             episode_metrics['resource_utilization'] = (episode_metrics['resources_used'] / total_resources) * 100
         
-        # 计算公平性指标（简化）
+        # 计算公平性指标
         if episode_metrics['victim_severities']:
-            # 基尼系数（简化计算）
             severities = np.array(episode_metrics['victim_severities'])
+            
+            # 基尼系数（简化计算）
             sorted_severities = np.sort(severities)
             n = len(sorted_severities)
             cum_values = np.cumsum(sorted_severities)
             gini = (n + 1 - 2 * np.sum(cum_values) / cum_values[-1]) / n if cum_values[-1] > 0 else 0
             episode_metrics['fairness_gini'] = gini
+            
+            # 泰尔指数（Theil Index）
+            if len(severities) > 0 and np.mean(severities) > 0:
+                normalized = severities / np.mean(severities)
+                # 处理零值和负值，避免对数错误
+                normalized = np.clip(normalized, 1e-10, None)
+                log_normalized = np.log(normalized)
+                theil = np.mean(normalized * log_normalized)
+                episode_metrics['fairness_theil'] = theil
+            else:
+                episode_metrics['fairness_theil'] = 0.0
             
             # 最大最小公平性
             if len(severities) > 0:
@@ -829,12 +807,16 @@ class BaselineEvaluator:
                     # 收集所有运行的结果
                     rescue_rates = []
                     response_times = []
+                    gini_coefficients = []
+                    theil_indices = []
                     
                     for run_key, run_results in scenario_results.items():
                         if algo_name in run_results:
                             stats = run_results[algo_name]
                             rescue_rates.append(stats.get('rescue_rate_mean', 0.0))
                             response_times.append(stats.get('avg_response_time_mean', 0.0))
+                            gini_coefficients.append(stats.get('fairness_gini_mean', 0.0))
+                            theil_indices.append(stats.get('fairness_theil_mean', 0.0))
                     
                     # 计算平均值和标准差
                     if rescue_rates:
@@ -845,6 +827,10 @@ class BaselineEvaluator:
                             'rescue_rate_std': np.std(rescue_rates),
                             'response_time_mean': np.mean(response_times),
                             'response_time_std': np.std(response_times),
+                            'gini_mean': np.mean(gini_coefficients),
+                            'gini_std': np.std(gini_coefficients),
+                            'theil_mean': np.mean(theil_indices),
+                            'theil_std': np.std(theil_indices),
                             'num_runs': len(rescue_rates)
                         }
                         rows.append(row)
@@ -908,6 +894,8 @@ class BaselineEvaluator:
                         f.write(f"  {row['algorithm']}:\n")
                         f.write(f"    Rescue Rate: {row['rescue_rate_mean']:.1f}% (±{row['rescue_rate_std']:.1f})\n")
                         f.write(f"    Response Time: {row['response_time_mean']:.1f}s (±{row['response_time_std']:.1f})\n")
+                        f.write(f"    Gini Coefficient: {row['gini_mean']:.4f} (±{row['gini_std']:.4f})\n")
+                        f.write(f"    Theil Index: {row['theil_mean']:.4f} (±{row['theil_std']:.4f})\n")
             
             f.write("\n4. Key Findings\n")
             f.write("-" * 40 + "\n")

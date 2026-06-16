@@ -173,8 +173,8 @@ class RobustnessTester:
         
         # 获取环境信息
         state_dim = self.env.get_state_dimension()
-        action_dim = self.env.get_action_dimension()
-        num_agents = self.env.num_agents
+        action_dim = 32  # 8 tactical actions * 4 communication modes
+        num_agents = self.env.get_num_agents()
         
         # 创建算法实例
         self.algorithm = EGTMARL(
@@ -222,7 +222,7 @@ class RobustnessTester:
         """
         logger.info(f"Testing attack robustness with {malicious_ratio*100:.0f}% malicious agents")
         
-        num_agents = self.env.num_agents
+        num_agents = self.env.get_num_agents()
         num_malicious = int(num_agents * malicious_ratio)
         
         metrics = {
@@ -308,18 +308,32 @@ class RobustnessTester:
                 episode_metrics['system_disruptions'] += 1
             
             # 收集指标
-            episode_metrics['total_reward'] += rewards
+            if isinstance(rewards, dict):
+                episode_metrics['total_reward'] += sum(rewards.values())
+            elif isinstance(rewards, list):
+                total = 0.0
+                for r in rewards:
+                    if isinstance(r, dict):
+                        total += sum(r.values())
+                    elif isinstance(r, (int, float)):
+                        total += r
+                episode_metrics['total_reward'] += total
+            else:
+                episode_metrics['total_reward'] += rewards
+                
             episode_metrics['steps'] += 1
-            # 记录当前累计值（最后会取最终值），不累加
-            episode_metrics['rescued'] = info.get('rescued', 0)
-            episode_metrics['deaths'] = info.get('deaths', 0)
-            episode_metrics['resources_used'] += info.get('resources_used', 0)
+            
+            # 从statistics中获取救援数据
+            statistics = info.get('statistics', {})
+            episode_metrics['rescued'] = statistics.get('total_rescued', 0)
+            episode_metrics['deaths'] = statistics.get('total_deaths', 0)
+            episode_metrics['resources_used'] += statistics.get('resources_used', 0)
             
             state = next_state
             step += 1
         
         # 计算衍生指标
-        total_victims = self.env.num_victims
+        total_victims = len(self.env.casualties)
         if total_victims > 0:
             episode_metrics['rescue_rate'] = (episode_metrics['rescued'] / total_victims) * 100
         
@@ -344,13 +358,27 @@ class RobustnessTester:
             actions.append(malicious_action)
         return actions
     
-    def _detect_system_disruption(self, rewards: float, info: Dict[str, Any]) -> bool:
+    def _detect_system_disruption(self, rewards, info: Dict[str, Any]) -> bool:
         """检测系统扰动"""
         # 如果奖励显著为负或关键指标异常
-        if rewards < -10:  # 大负奖励
+        reward_sum = 0.0
+        if isinstance(rewards, dict):
+            reward_sum = sum(rewards.values())
+        elif isinstance(rewards, list):
+            for r in rewards:
+                if isinstance(r, dict):
+                    reward_sum += sum(r.values())
+                elif isinstance(r, (int, float)):
+                    reward_sum += r
+        else:
+            reward_sum = rewards
+            
+        if reward_sum < -10:  # 大负奖励
             return True
         
-        if info.get('deaths', 0) > 2:  # 单步死亡过多
+        # 从statistics中获取死亡人数
+        statistics = info.get('statistics', {})
+        if statistics.get('total_deaths', 0) > 2:  # 单步死亡过多
             return True
         
         if info.get('resources_wasted', 0) > 5:  # 资源浪费
@@ -465,17 +493,31 @@ class RobustnessTester:
                 episode_metrics['coordination_errors'] += 1
             
             # 收集指标
-            episode_metrics['total_reward'] += rewards
+            if isinstance(rewards, dict):
+                episode_metrics['total_reward'] += sum(rewards.values())
+            elif isinstance(rewards, list):
+                total = 0.0
+                for r in rewards:
+                    if isinstance(r, dict):
+                        total += sum(r.values())
+                    elif isinstance(r, (int, float)):
+                        total += r
+                episode_metrics['total_reward'] += total
+            else:
+                episode_metrics['total_reward'] += rewards
+                
             episode_metrics['steps'] += 1
-            # 记录当前累计值（最后会取最终值），不累加
-            episode_metrics['rescued'] = info.get('rescued', 0)
-            episode_metrics['deaths'] = info.get('deaths', 0)
+            
+            # 从statistics中获取救援数据
+            statistics = info.get('statistics', {})
+            episode_metrics['rescued'] = statistics.get('total_rescued', 0)
+            episode_metrics['deaths'] = statistics.get('total_deaths', 0)
             
             state = next_state
             step += 1
         
         # 计算衍生指标
-        total_victims = self.env.num_victims
+        total_victims = len(self.env.casualties)
         if total_victims > 0:
             episode_metrics['rescue_rate'] = (episode_metrics['rescued'] / total_victims) * 100
         
@@ -603,21 +645,47 @@ class RobustnessTester:
             # 跟踪适应过程
             if adaptation_started and episode_metrics['adaptation_steps'] == 0:
                 # 检测系统是否开始恢复
-                if rewards > -5:  # 奖励不再严重为负
+                reward_sum = 0.0
+                if isinstance(rewards, dict):
+                    reward_sum = sum(rewards.values())
+                elif isinstance(rewards, list):
+                    for r in rewards:
+                        if isinstance(r, dict):
+                            reward_sum += sum(r.values())
+                        elif isinstance(r, (int, float)):
+                            reward_sum += r
+                else:
+                    reward_sum = rewards
+                    
+                if reward_sum > -5:  # 奖励不再严重为负
                     episode_metrics['adaptation_steps'] = step - mutation_time
             
             # 收集指标
-            episode_metrics['total_reward'] += rewards
+            if isinstance(rewards, dict):
+                episode_metrics['total_reward'] += sum(rewards.values())
+            elif isinstance(rewards, list):
+                total = 0.0
+                for r in rewards:
+                    if isinstance(r, dict):
+                        total += sum(r.values())
+                    elif isinstance(r, (int, float)):
+                        total += r
+                episode_metrics['total_reward'] += total
+            else:
+                episode_metrics['total_reward'] += rewards
+                
             episode_metrics['steps'] += 1
-            # 记录当前累计值（最后会取最终值），不累加
-            episode_metrics['rescued'] = info.get('rescued', 0)
-            episode_metrics['deaths'] = info.get('deaths', 0)
+            
+            # 从statistics中获取救援数据
+            statistics = info.get('statistics', {})
+            episode_metrics['rescued'] = statistics.get('total_rescued', 0)
+            episode_metrics['deaths'] = statistics.get('total_deaths', 0)
             
             state = next_state
             step += 1
         
         # 计算衍生指标
-        total_victims = self.env.num_victims
+        total_victims = len(self.env.casualties)
         if total_victims > 0:
             episode_metrics['rescue_rate'] = (episode_metrics['rescued'] / total_victims) * 100
         
@@ -627,11 +695,8 @@ class RobustnessTester:
         else:
             episode_metrics['adaptation_speed'] = 0.0
         
-        # 计算资源效率
-        total_resources = self.env.num_resources * 100
-        if total_resources > 0:
-            resources_used = info.get('resources_used', 0)
-            episode_metrics['resource_efficiency'] = (resources_used / total_resources) * 100
+        # 计算资源效率（简化）
+        episode_metrics['resource_efficiency'] = min(100.0, episode_metrics['resources_used'] / 10.0)
         
         return episode_metrics
     
