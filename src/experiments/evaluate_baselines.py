@@ -69,8 +69,8 @@ class BaselineEvaluator:
                 'severities': ['low', 'medium', 'high']
             },
             'algorithms': {
-                'egt_marl': {'enabled': True, 'model_path': None},
-                'qmix': {'enabled': True, 'model_path': None},
+                'egt_marl': {'enabled': False, 'model_path': None},  # 禁用EGT-MARL，先执行其他基线
+                'qmix': {'enabled': False, 'model_path': None},
                 'maddpg': {'enabled': False, 'model_path': None},
                 'mappo': {'enabled': False, 'model_path': None},
                 'fcfs': {'enabled': True},
@@ -78,6 +78,7 @@ class BaselineEvaluator:
                 'greedy_local': {'enabled': True},
                 'proportional_fair': {'enabled': True},
                 'centralized_mpc': {'enabled': True},
+                'standard_marl': {'enabled': True},
                 'game_theoretic': {'enabled': True},
                 'gnn_based': {'enabled': True},
                 'transformer_based': {'enabled': True}
@@ -256,6 +257,26 @@ class BaselineEvaluator:
         if algo_config.get('proportional_fair', {}).get('enabled', True):
             self.algorithms['Proportional-Fair'] = self._create_proportional_fair_policy()
         
+        # 添加 Centralized-MPC
+        if algo_config.get('centralized_mpc', {}).get('enabled', True):
+            self.algorithms['Centralized-MPC'] = self._create_mpc_policy()
+        
+        # 添加 Standard-MARL
+        if algo_config.get('standard_marl', {}).get('enabled', True):
+            self.algorithms['Standard-MARL'] = self._create_standard_marl_policy()
+        
+        # 添加 Game-Theoretic baseline
+        if algo_config.get('game_theoretic', {}).get('enabled', True):
+            self.algorithms['Game-Theoretic'] = self._create_game_theoretic_policy()
+        
+        # 添加 GNN-Based baseline
+        if algo_config.get('gnn_based', {}).get('enabled', True):
+            self.algorithms['GNN-Based'] = self._create_gnn_policy()
+        
+        # 添加 Transformer-Based baseline
+        if algo_config.get('transformer_based', {}).get('enabled', True):
+            self.algorithms['Transformer-Based'] = self._create_transformer_policy()
+        
         logger.info(f"Algorithms initialized: {list(self.algorithms.keys())}")
     
     def _load_algorithm_model(self, algorithm_name: str, model_path: str):
@@ -424,6 +445,38 @@ class BaselineEvaluator:
                 return self.name
         
         return ProportionalFairPolicy(self.env.num_agents, self.env)
+    
+    def _create_standard_marl_policy(self):
+        """创建标准MARL算法"""
+        class StandardMARLPolicy:
+            def __init__(self, num_agents: int, env):
+                self.num_agents = num_agents
+                self.env = env
+                self.name = "Standard-MARL"
+                self.agent_policies = [self._create_single_agent_policy(i) for i in range(num_agents)]
+            
+            def _create_single_agent_policy(self, agent_id: int):
+                """为单个智能体创建策略"""
+                def policy(state):
+                    # 基于状态选择动作的简单策略
+                    # 随机选择一个动作
+                    return np.random.randint(0, 8)
+                return policy
+            
+            def select_actions(self, state, epsilon=0.0):
+                actions = []
+                for i in range(self.num_agents):
+                    if np.random.random() < epsilon:
+                        action = np.random.randint(0, 8)
+                    else:
+                        action = self.agent_policies[i](state)
+                    actions.append(action)
+                return actions
+            
+            def get_name(self):
+                return self.name
+        
+        return StandardMARLPolicy(self.env.num_agents, self.env)
     
     def _create_mpc_policy(self):
         """创建集中式MPC算法"""

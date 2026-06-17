@@ -647,10 +647,17 @@ class EGTMARLTrainer:
         """保存检查点"""
         checkpoint_path = self.experiment_dir / 'checkpoints' / f'checkpoint_ep{episode_idx}.pt'
         
+        # 保存完整的算法状态（包括EGT层、MARL层等）
+        algorithm_checkpoint_path = self.experiment_dir / 'checkpoints' / f'checkpoint_ep{episode_idx}_algorithm.pt'
+        if self.algorithm is not None:
+            self.algorithm.save_checkpoint(algorithm_checkpoint_path)
+            logger.info(f"Algorithm checkpoint saved: {algorithm_checkpoint_path}")
+        
         checkpoint = {
             'episode': episode_idx,
             'metrics': metrics,
-            'config': self.config
+            'config': self.config,
+            'algorithm_checkpoint_path': str(algorithm_checkpoint_path)
         }
         
         torch.save(checkpoint, checkpoint_path)
@@ -666,17 +673,26 @@ class EGTMARLTrainer:
         Returns:
             恢复时的episode编号
         """
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         
         episode = checkpoint.get('episode', 0)
         self.config = checkpoint.get('config', self.config)
         
-        # 加载算法权重
+        # 加载算法权重（包括EGT层、MARL层等）
         if self.algorithm is not None:
-            model_path = self.experiment_dir / 'models' / 'best_model.pt'
-            if model_path.exists():
-                self.algorithm.load_checkpoint(model_path)
-                logger.info(f"Model weights loaded from: {model_path}")
+            # 首先尝试从checkpoint中指定的路径加载
+            algo_ckpt_path = checkpoint.get('algorithm_checkpoint_path')
+            if algo_ckpt_path and os.path.exists(algo_ckpt_path):
+                self.algorithm.load_checkpoint(algo_ckpt_path)
+                logger.info(f"Algorithm checkpoint loaded from: {algo_ckpt_path}")
+            else:
+                # 旧格式兼容：尝试从同一目录加载算法checkpoint
+                algo_ckpt_path = Path(checkpoint_path).parent / f'checkpoint_ep{episode}_algorithm.pt'
+                if algo_ckpt_path.exists():
+                    self.algorithm.load_checkpoint(algo_ckpt_path)
+                    logger.info(f"Algorithm checkpoint loaded from: {algo_ckpt_path}")
+                else:
+                    logger.warning(f"Algorithm checkpoint not found, EGT/MARL state will be reset")
         
         logger.info(f"Checkpoint loaded: {checkpoint_path} (resuming from episode {episode})")
         return episode
@@ -697,7 +713,7 @@ class EGTMARLTrainer:
         self.algorithm.save_checkpoint(final_model_path)
         logger.info(f"Final model saved: {final_model_path}")
     
-    def train(self):
+    def train(self, resume_from: str = None):
         """主训练循环"""
         logger.info("Starting training...")
         
@@ -743,8 +759,16 @@ class EGTMARLTrainer:
             'loss': []
         }
         
+        # 检查是否需要恢复训练
+        start_episode = 1
+        if resume_from:
+            start_episode = self.load_checkpoint(resume_from) + 1
+            # 计算恢复后的epsilon值
+            epsilon = max(epsilon_end, epsilon * (epsilon_decay ** (start_episode - 1)))
+            logger.info(f"Resuming training from episode {start_episode} with epsilon={epsilon:.4f}")
+        
         # 训练循环
-        for episode in range(1, num_episodes + 1):
+        for episode in range(start_episode, num_episodes + 1):
             # 训练一个episode
             episode_metrics = self.train_episode(episode, epsilon)
             
@@ -988,6 +1012,8 @@ def main():
                        help='Batch size (overrides config)')
     parser.add_argument('--batch-size', type=int, default=None,
                        help='Batch size (alias for --batch_size)')
+    parser.add_argument('--resume', type=str, default=None,
+                       help='Path to checkpoint file to resume training from')
     
     args = parser.parse_args()
     
@@ -1012,9 +1038,15 @@ def main():
     if args.batch_size:
         trainer.config['training']['batch_size'] = args.batch_size
     
+    # 设置恢复检查点路径
+    resume_checkpoint = args.resume
+    
     # 开始训练
     try:
-        training_history, final_metrics = trainer.train()
+        if resume_checkpoint:
+            training_history, final_metrics = trainer.train(resume_from=resume_checkpoint)
+        else:
+            training_history, final_metrics = trainer.train()
         
         logger.info("Training completed successfully!")
         logger.info(f"Results saved to: {trainer.experiment_dir}")

@@ -63,7 +63,7 @@ class RobustnessTester:
                 'severity': 'medium',
                 'attack_tests': {
                     'enabled': True,
-                    'malicious_ratios': [0.0, 0.2, 0.4]
+                    'malicious_ratios': [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
                 },
                 'communication_tests': {
                     'enabled': True,
@@ -702,9 +702,11 @@ class RobustnessTester:
     
     def _apply_resource_mutation(self, magnitude: float):
         """应用资源突变"""
-        # 减少可用资源
-        for resource in self.env.resources:
-            resource['remaining'] = int(resource['remaining'] * magnitude)
+        # 减少所有资源仓库的可用资源
+        for depot in self.env.resource_depots.values():
+            # 修改depot的资源
+            for resource_type in depot.resources:
+                depot.resources[resource_type] = int(depot.resources[resource_type] * magnitude)
         
         logger.debug(f"Resource mutation applied: resources reduced to {magnitude*100:.0f}%")
     
