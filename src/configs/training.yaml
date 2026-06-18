@@ -1,35 +1,45 @@
 # Training Configuration
-# Ultra-compact configuration based on observed fast convergence (~600 episodes)
-# All phases completed within 1500 episodes total
+# Complete refactoring configuration for EGT-MARL disaster response
+# Target: Rescue Rate >80%, Total 1500 episodes
 
 # Experiment setup
 experiment:
-  name: "egt_marl_disaster_fast"
-  description: "Fast-converging EGT-MARL training for disaster response"
+  name: "egt_marl_disaster_refactored"
+  description: "EGT-MARL training with refactored configuration - targeting >80% rescue rate"
   seed: 42
   device: "cuda"
   num_workers: 4
   
-# Training schedule - Ultra-compact phases
+# Training schedule - Four phases with dynamic lambda adjustment
 schedule:
   phases:
     - name: "warmup"
-      episodes: 400  # Shortened: model learns basics quickly
+      episodes: 400
       learning_rate: 0.0001
-      exploration_rate: 0.8  # Start with high exploration
+      exploration_rate: 0.8
       difficulty: 0.3
+      lambda: 0.9  # Focus on efficiency first
+      
+    - name: "transition"  # New transition phase
+      episodes: 200
+      learning_rate: 0.0001
+      exploration_rate: 0.3
+      difficulty: 0.5
+      lambda: 0.8  # Start balancing fairness
       
     - name: "main_training"
-      episodes: 700  # Main learning completed quickly
+      episodes: 500
       learning_rate: 0.0001
       exploration_rate: 0.1
       difficulty: 0.7
+      lambda: 0.7  # Balance efficiency and fairness
       
     - name: "fine_tuning"
-      episodes: 400  # Quick fine-tuning for final polish
+      episodes: 400
       learning_rate: 0.00001
       exploration_rate: 0.01
       difficulty: 1.0
+      lambda: 0.6  # More focus on fairness
   
   # Learning rate scheduling
   lr_schedule:
@@ -38,12 +48,12 @@ schedule:
     min_lr: 1e-6
     max_lr: 0.0001
     
-  # Fast exploration decay
+  # Optimized exploration decay: decay=0.997 gives 30% at episode 400, 2% at episode 1500
   exploration_schedule:
     type: "exponential"
     start: 0.8
     end: 0.01
-    decay: 0.99  # Faster decay since model converges quickly
+    decay: 0.997  # Slower decay for better exploration
 
 # Environment configuration
 environment:
@@ -91,7 +101,7 @@ evaluation:
 # Model saving and checkpointing
 checkpoint:
   enabled: true
-  frequency: 200
+  frequency: 150  # More frequent checkpoints for better recovery
   keep_last: 5
   
   save:

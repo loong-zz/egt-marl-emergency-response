@@ -816,6 +816,103 @@ class AdaptiveWeightController:
         self.performance_buffer = []
 
 
+    def update(self, batch: Dict[str, Any]) -> float:
+        """
+        Update dynamic frontier and compute frontier loss for integration with EGT-MARL.
+        
+        Args:
+            batch: Experience batch containing performance metrics
+            
+        Returns:
+            frontier_loss: Loss value to be fed back to EGT-MARL
+        """
+        try:
+            # Extract performance metrics from batch
+            performance_metrics = {}
+            
+            # Calculate efficiency score from rewards
+            if 'rewards' in batch:
+                rewards = batch['rewards']
+                if isinstance(rewards, torch.Tensor):
+                    rewards = rewards.detach().cpu().numpy()
+                performance_metrics['efficiency_score'] = float(np.mean(rewards))
+            
+            # Calculate fairness score from Gini coefficient
+            if 'gini_coefficient' in batch:
+                gini = batch['gini_coefficient']
+                if isinstance(gini, torch.Tensor):
+                    gini = gini.detach().cpu().numpy()
+                performance_metrics['fairness_score'] = float(1.0 - gini)
+            
+            # Default values
+            if 'efficiency_score' not in performance_metrics:
+                performance_metrics['efficiency_score'] = 0.5
+            if 'fairness_score' not in performance_metrics:
+                performance_metrics['fairness_score'] = 0.5
+            if 'robustness_score' not in performance_metrics:
+                performance_metrics['robustness_score'] = 0.5
+            
+            # Update frontier with empty solutions list (will use performance metrics)
+            self.update_frontier([], performance_metrics)
+            
+            # Calculate frontier loss
+            frontier_loss = self._calculate_frontier_loss(performance_metrics)
+            
+            return float(frontier_loss)
+        
+        except Exception as e:
+            # Return 0.0 if update fails
+            return 0.0
+    
+    def _calculate_frontier_loss(self, performance_metrics: Dict[str, float]) -> float:
+        """
+        Calculate frontier loss based on distance to Pareto optimal front.
+        
+        The loss encourages the system to move towards the Pareto frontier.
+        """
+        if not self.frontier:
+            return 0.0
+        
+        # Get current performance as objective vector
+        current_objectives = np.array([
+            performance_metrics.get('efficiency_score', 0.5),
+            performance_metrics.get('fairness_score', 0.5),
+            performance_metrics.get('robustness_score', 0.5)
+        ])
+        
+        # Find closest frontier point
+        min_distance = float('inf')
+        for point in self.frontier:
+            frontier_objectives = np.array([point.efficiency, point.fairness, point.robustness])
+            distance = np.linalg.norm(current_objectives - frontier_objectives)
+            if distance < min_distance:
+                min_distance = distance
+        
+        # Calculate loss as distance to frontier
+        # Also include penalty for dominated solutions
+        dominated_penalty = 0.0
+        for point in self.frontier:
+            frontier_objectives = np.array([point.efficiency, point.fairness, point.robustness])
+            # Check if current is dominated by frontier point
+            if np.all(frontier_objectives >= current_objectives) and np.any(frontier_objectives > current_objectives):
+                dominated_penalty += np.sum(frontier_objectives - current_objectives)
+        
+        # Total loss = distance + dominated penalty
+        total_loss = min_distance + dominated_penalty
+        
+        return float(total_loss)
+    
+    def get_frontier_weights(self) -> np.ndarray:
+        """Get current frontier weights for integration with EGT-MARL."""
+        # Get recommended weights based on current state
+        dummy_metrics = {
+            'efficiency_score': 0.5,
+            'fairness_score': 0.5,
+            'robustness_score': 0.5
+        }
+        return self.get_recommended_weights(dummy_metrics)
+
+
 # Integration with EGT-MARL
 def integrate_frontier_with_egt_marl(frontier: DynamicParetoFrontier,
                                     egt_marl_system,

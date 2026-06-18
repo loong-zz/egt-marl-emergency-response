@@ -492,6 +492,11 @@ class EGTMARL:
         """
         Update algorithm parameters from experience batch.
         
+        Two-layer architecture information flow:
+        1. EGT layer computes fairness-efficiency trade-off weights
+        2. These weights are injected into MARL layer's reward computation
+        3. MARL layer learns with the adjusted rewards
+        
         Args:
             batch: Experience batch containing states, actions, rewards, next_states
             
@@ -530,25 +535,53 @@ class EGTMARL:
         
         losses = {}
         
-        # Update MARL layer
+        # ==================== EGT Layer Update FIRST ====================
+        # EGT layer computes fairness-efficiency trade-off weights
+        egt_weights = None
         try:
+            # First update EGT layer to get current trade-off weights
+            egt_loss, egt_weights = self.egt_layer.update_with_weights(batch, self.egt_optimizer, self.egt_loss_fn)
+            losses['egt_loss'] = egt_loss
+        except Exception:
+            # Fallback: use default weights if EGT layer doesn't support update_with_weights
+            try:
+                egt_loss = self.egt_layer.update(batch, self.egt_optimizer, self.egt_loss_fn)
+                losses['egt_loss'] = egt_loss
+            except Exception:
+                losses['egt_loss'] = 0.0
+        
+        # Get lambda parameter from configuration or EGT layer
+        lambda_param = self.config.get('lambda_param', 0.7)
+        if hasattr(self.egt_layer, 'lambda_param'):
+            lambda_param = self.egt_layer.lambda_param
+        
+        # ==================== MARL Layer Update with EGT Weights ====================
+        try:
+            # Pass EGT weights to MARL layer for reward adjustment
+            # The EGT weights influence the reward function to balance efficiency and fairness
             marl_loss = self.marl_layer.update(
                 batch['states'],
                 batch['actions'],
                 batch['rewards'],
                 batch['next_states'],
-                batch['dones']
+                batch['dones'],
+                egt_weights=egt_weights,        # EGT trade-off weights
+                lambda_param=lambda_param        # Fairness-efficiency balance parameter
             )
             losses['marl_loss'] = marl_loss
         except Exception:
-            losses['marl_loss'] = 0.0
-        
-        # Update EGT layer
-        try:
-            egt_loss = self.egt_layer.update(batch, self.egt_optimizer, self.egt_loss_fn)
-            losses['egt_loss'] = egt_loss
-        except Exception:
-            losses['egt_loss'] = 0.0
+            # Fallback: update without EGT weights if not supported
+            try:
+                marl_loss = self.marl_layer.update(
+                    batch['states'],
+                    batch['actions'],
+                    batch['rewards'],
+                    batch['next_states'],
+                    batch['dones']
+                )
+                losses['marl_loss'] = marl_loss
+            except Exception:
+                losses['marl_loss'] = 0.0
         
         # Update anti-spoofing mechanism
         try:

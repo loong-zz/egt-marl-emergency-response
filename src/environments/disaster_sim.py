@@ -8,6 +8,7 @@ using managers and entities from the refactored modules.
 import numpy as np
 import networkx as nx
 from typing import Dict, Tuple, Any, Optional, List
+from scipy.stats import entropy
 from .config.constants import (
     CasualtySeverity, ResourceType, AgentType, SimulationConfig, DEFAULT_CONFIG,
     TREATMENT_DURATION, RESOURCES_NEEDED
@@ -460,6 +461,53 @@ class DisasterSim:
         for casualty in self.casualties.values():
             casualty.update_survival_probability(self.current_time)
     
+    def _calculate_gini_coefficient(self, values: np.ndarray) -> float:
+        """Calculate Gini coefficient for fairness measurement.
+        
+        Args:
+            values: Array of values to compute Gini coefficient for
+            
+        Returns:
+            Gini coefficient (0 = perfect equality, 1 = maximum inequality)
+        """
+        if len(values) == 0:
+            return 0.0
+        
+        values = np.sort(values)
+        n = len(values)
+        if np.sum(values) == 0:
+            return 0.0
+        
+        numerator = 2 * np.sum(np.arange(1, n + 1) * values)
+        denominator = n * np.sum(values)
+        
+        return float(numerator / denominator - (n + 1) / n)
+    
+    def _calculate_theil_index(self, values: np.ndarray) -> float:
+        """Calculate Theil index for fairness measurement.
+        
+        Args:
+            values: Array of values to compute Theil index for
+            
+        Returns:
+            Theil index (0 = perfect equality, higher = more inequality)
+        """
+        if len(values) == 0:
+            return 0.0
+        
+        values = values[values > 0]  # Remove zeros for log calculation
+        if len(values) == 0:
+            return 0.0
+        
+        n = len(values)
+        mean = np.mean(values)
+        
+        # Calculate Theil index using scipy entropy
+        normalized = values / mean
+        theil = float(entropy(normalized) / np.log(n))
+        
+        return theil
+    
     def _update_statistics(self) -> None:
         """Update simulation statistics."""
         rescued = sum(1 for c in self.casualties.values() if c.treated)
@@ -486,6 +534,141 @@ class DisasterSim:
                 severity_value = severity_order.get(casualty.severity.name, 2)  # Default to MODERATE
                 rescued_severities.append(severity_value)
         self.statistics['rescued_severities'] = rescued_severities
+        
+        # Calculate fairness metrics by region
+        self._calculate_fairness_metrics()
+    
+    def _calculate_fairness_metrics(self) -> None:
+        """Calculate fairness metrics including Gini coefficient and Theil index."""
+        # Calculate rescue distribution by region
+        rescue_counts_by_region = []
+        for area_id, area in self.affected_areas.items():
+            region_rescued = sum(1 for c in area.casualties if c.treated)
+            rescue_counts_by_region.append(region_rescued)
+        
+        rescue_array = np.array(rescue_counts_by_region)
+        
+        # Calculate Gini coefficient for regional rescue distribution
+        gini = self._calculate_gini_coefficient(rescue_array)
+        self.statistics['fairness_metrics']['gini'].append(gini)
+        
+        # Calculate Theil index for regional rescue distribution
+        theil = self._calculate_theil_index(rescue_array)
+        if 'theil' not in self.statistics['fairness_metrics']:
+            self.statistics['fairness_metrics']['theil'] = []
+        self.statistics['fairness_metrics']['theil'].append(theil)
+        
+        # Calculate fairness by severity
+        severity_counts = {'CRITICAL': 0, 'SEVERE': 0, 'MODERATE': 0, 'MILD': 0}
+        for casualty in self.casualties.values():
+            if casualty.treated:
+                severity_counts[casualty.severity.name] += 1
+        
+        severity_array = np.array(list(severity_counts.values()))
+        severity_gini = self._calculate_gini_coefficient(severity_array)
+        
+        if 'severity_gini' not in self.statistics['fairness_metrics']:
+            self.statistics['fairness_metrics']['severity_gini'] = []
+        self.statistics['fairness_metrics']['severity_gini'].append(severity_gini)
+        
+        # Calculate rescue distribution by agent
+        agent_rescues = []
+        for agent in self.rescue_agents.values():
+            agent_rescues.append(getattr(agent, 'rescued_count', 0))
+        
+        agent_array = np.array(agent_rescues)
+        agent_gini = self._calculate_gini_coefficient(agent_array)
+        
+        if 'agent_gini' not in self.statistics['fairness_metrics']:
+            self.statistics['fairness_metrics']['agent_gini'] = []
+        self.statistics['fairness_metrics']['agent_gini'].append(agent_gini)
+        
+        # Calculate regional fitness metrics
+        self._calculate_regional_fitness()
+    
+    def _calculate_regional_fitness(self) -> None:
+        """Calculate regional fitness metrics including cross-region Gini coefficient."""
+        if 'regional_fitness' not in self.statistics:
+            self.statistics['regional_fitness'] = {}
+        
+        # Calculate fitness for each region
+        regional_fitness = {}
+        region_rescues = []
+        region_casualties = []
+        region_efficiency = []
+        
+        for area_id, area in self.affected_areas.items():
+            # Calculate rescue rate for the region
+            total_casualties = len(area.casualties)
+            rescued_in_region = sum(1 for c in area.casualties if c.treated)
+            
+            # Survival probability weighted by severity
+            avg_survival_prob = np.mean([c.survival_probability for c in area.casualties]) if area.casualties else 0.0
+            
+            # Resource availability in region (normalized)
+            resource_availability = 0.5  # Default value
+            
+            # Calculate fitness combining multiple factors
+            fitness = 0.4 * (rescued_in_region / max(total_casualties, 1)) + \
+                     0.3 * avg_survival_prob + \
+                     0.3 * resource_availability
+            
+            regional_fitness[area_id] = {
+                'fitness': fitness,
+                'rescued': rescued_in_region,
+                'total_casualties': total_casualties,
+                'rescue_rate': rescued_in_region / max(total_casualties, 1),
+                'avg_survival_prob': avg_survival_prob
+            }
+            
+            region_rescues.append(rescued_in_region)
+            region_casualties.append(total_casualties)
+            region_efficiency.append(rescued_in_region / max(total_casualties, 1))
+        
+        self.statistics['regional_fitness'] = regional_fitness
+        
+        # Calculate cross-region Gini coefficient
+        region_rescue_array = np.array(region_rescues)
+        cross_region_gini = self._calculate_gini_coefficient(region_rescue_array)
+        
+        if 'cross_region_gini' not in self.statistics['fairness_metrics']:
+            self.statistics['fairness_metrics']['cross_region_gini'] = []
+        self.statistics['fairness_metrics']['cross_region_gini'].append(cross_region_gini)
+        
+        # Calculate regional balance index
+        region_efficiency_array = np.array(region_efficiency)
+        if len(region_efficiency_array) > 0:
+            balance_index = 1.0 - np.std(region_efficiency_array) / np.mean(region_efficiency_array) if np.mean(region_efficiency_array) > 0 else 0.0
+        else:
+            balance_index = 0.0
+        
+        if 'regional_balance_index' not in self.statistics:
+            self.statistics['regional_balance_index'] = []
+        self.statistics['regional_balance_index'].append(balance_index)
+    
+    def get_regional_fitness(self, region_id: int = None) -> Dict[str, Any]:
+        """Get regional fitness metrics.
+        
+        Args:
+            region_id: Optional region ID to filter results
+            
+        Returns:
+            Regional fitness dictionary
+        """
+        if 'regional_fitness' not in self.statistics:
+            return {}
+        
+        if region_id is not None:
+            return self.statistics['regional_fitness'].get(region_id, {})
+        
+        return self.statistics['regional_fitness']
+    
+    def get_cross_region_gini(self) -> float:
+        """Get the latest cross-region Gini coefficient."""
+        if 'cross_region_gini' in self.statistics['fairness_metrics']:
+            values = self.statistics['fairness_metrics']['cross_region_gini']
+            return values[-1] if values else 0.0
+        return 0.0
     
     def _calculate_reward(self) -> Dict[int, float]:
         """Calculate individual rewards for each agent.
@@ -552,10 +735,26 @@ class DisasterSim:
         return all_processed
     
     def get_state_dimension(self) -> int:
-        """Get the dimension of the state vector."""
-        num_agents = len(self.rescue_agents)
-        num_casualties = len(self.casualties)
-        return (num_agents + num_casualties) * 3
+        """Get the dimension of the state vector.
+        
+        According to the paper formula: dim(S) = 4M + (L+1)K + M×K + 2 + 3N
+        Where:
+        - M = number of agents
+        - L = number of resource types
+        - K = number of regions
+        - N = number of casualties
+        """
+        M = len(self.rescue_agents)
+        L = self.config.num_resources
+        K = self.config.num_regions
+        N = len(self.casualties)
+        
+        # 4M: Agent info (position 2 + resources 1 + type 1)
+        # (L+1)K: Region info (L resources + 1 region state)
+        # M×K: Agent-region interaction
+        # 2: Global state (time + disaster severity)
+        # 3N: Casualty info (position 2 + survival probability 1)
+        return 4 * M + (L + 1) * K + M * K + 2 + 3 * N
 
     def get_num_agents(self) -> int:
         """Get the number of agents in the simulation."""
@@ -564,25 +763,71 @@ class DisasterSim:
     def _generate_observation(self) -> np.ndarray:
         """Generate observation vector for the environment.
         
+        According to the paper formula: dim(S) = 4M + (L+1)K + M×K + 2 + 3N
+        
         Returns:
             2D array of shape (num_agents, state_dim) for MARL compatibility.
         """
-        num_agents = len(self.rescue_agents)
-        num_casualties = len(self.casualties)
-        state_dim = (num_agents + num_casualties) * 3
-
-        observations = np.zeros((num_agents, state_dim), dtype=np.float32)
-
+        M = len(self.rescue_agents)
+        L = self.config.num_resources
+        K = self.config.num_regions
+        N = len(self.casualties)
+        
+        state_dim = self.get_state_dimension()
+        observations = np.zeros((M, state_dim), dtype=np.float32)
+        
         agent_list = list(self.rescue_agents.values())
+        casualty_list = list(self.casualties.values())
+        
+        # 4M: Agent info (position 2 + resources 1 + type 1)
+        agent_info_dim = 4 * M
         for i, agent in enumerate(agent_list):
-            observations[i, 0:2] = agent.position
-            observations[i, 2] = sum(agent.capacity.values())
-
-        for j, casualty in enumerate(self.casualties.values()):
-            base_idx = num_agents * 3 + j * 3
+            base_idx = i * 4
+            observations[i, base_idx:base_idx+2] = agent.position / self.map_size[0]  # Normalized position
+            observations[i, base_idx+2] = sum(agent.capacity.values()) / sum(agent.max_capacity.values())  # Normalized resources
+            observations[i, base_idx+3] = float(agent.agent_type.value == 'drone') * 0.5 + \
+                                         float(agent.agent_type.value == 'vehicle') * 0.3 + \
+                                         float(agent.agent_type.value == 'personnel') * 0.2
+        
+        # (L+1)K: Region info (L resources + 1 region state)
+        region_info_dim = (L + 1) * K
+        region_base_idx = agent_info_dim
+        
+        for k in range(K):
+            region_idx = region_base_idx + k * (L + 1)
+            # Resource availability per region
+            if k < len(self.affected_areas):
+                area = self.affected_areas[k]
+                observations[:, region_idx:region_idx+L] = 0.5  # Normalized resource level
+                observations[:, region_idx+L] = area.building_damage  # Region state (damage level)
+        
+        # M×K: Agent-region interaction
+        interaction_dim = M * K
+        interaction_base_idx = region_base_idx + region_info_dim
+        
+        for i, agent in enumerate(agent_list):
+            for k in range(K):
+                idx = interaction_base_idx + i * K + k
+                if k < len(self.affected_areas):
+                    area = self.affected_areas[k]
+                    dist = np.linalg.norm(agent.position - area.position)
+                    observations[i, idx] = min(1.0, dist / (self.map_size[0] * 0.5))  # Normalized distance
+        
+        # 2: Global state (time + disaster severity)
+        global_base_idx = interaction_base_idx + interaction_dim
+        time_normalized = self.current_time / (self.config.max_steps * self.config.time_step)
+        observations[:, global_base_idx] = time_normalized
+        severity_map = {'low': 0.2, 'medium': 0.5, 'high': 0.8}
+        observations[:, global_base_idx+1] = severity_map.get(self.config.severity, 0.5)
+        
+        # 3N: Casualty info (position 2 + survival probability 1)
+        casualty_base_idx = global_base_idx + 2
+        
+        for j, casualty in enumerate(casualty_list):
+            base_idx = casualty_base_idx + j * 3
             if base_idx + 2 < state_dim:
-                observations[:, base_idx] = casualty.position[0]
-                observations[:, base_idx + 1] = casualty.position[1]
+                observations[:, base_idx] = casualty.position[0] / self.map_size[0]  # Normalized
+                observations[:, base_idx + 1] = casualty.position[1] / self.map_size[1]  # Normalized
                 observations[:, base_idx + 2] = casualty.survival_probability
 
         return observations
