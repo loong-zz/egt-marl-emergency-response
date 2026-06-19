@@ -56,7 +56,33 @@ class MARLLayer(nn.Module):
         self.gradient_accumulation_steps = 4
         self.gradient_step_counter = 0
         
-        # Shared agent Q-network (parameter sharing for efficiency)
+        # Initialize agent networks (each agent has its own Q-network for diversity)
+        self.agent_networks = nn.ModuleList()
+        self.target_agent_networks = nn.ModuleList()
+        
+        for _ in range(num_agents):
+            agent_net = nn.Sequential(
+                nn.Linear(state_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, action_dim)
+            ).to(device)
+            
+            target_agent_net = nn.Sequential(
+                nn.Linear(state_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, action_dim)
+            ).to(device)
+            
+            target_agent_net.load_state_dict(agent_net.state_dict())
+            
+            self.agent_networks.append(agent_net)
+            self.target_agent_networks.append(target_agent_net)
+        
+        # Shared agent Q-network (parameter sharing for efficiency in batch processing)
         self.shared_agent_net = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
             nn.ReLU(),
@@ -232,15 +258,19 @@ class MARLLayer(nn.Module):
         return joint_q.squeeze(-1)
     
     def forward(self, states: torch.Tensor) -> torch.Tensor:
-        """Forward pass for MARL layer. Optimized batch processing using shared network."""
+        """Forward pass for MARL layer. Uses individual agent networks for diversity."""
         # Apply sparse communication
         if self.communication_enabled:
             states = self._compute_communication(states)
         
         batch_size, num_agents, state_dim = states.shape
-        states_flat = states.view(batch_size * num_agents, state_dim)
-        q_values_flat = self.shared_agent_net(states_flat)
-        q_values = q_values_flat.view(batch_size, num_agents, self.action_dim)
+        
+        # Use individual agent networks for diverse decision making
+        q_values = torch.zeros(batch_size, num_agents, self.action_dim, device=self.device)
+        for agent_id in range(num_agents):
+            agent_states = states[:, agent_id, :]  # (B, state_dim)
+            q_values[:, agent_id, :] = self.agent_networks[agent_id](agent_states)
+        
         return q_values
     
     def select_actions(self, states: torch.Tensor, deterministic: bool = False, epsilon: float = None) -> torch.Tensor:
@@ -314,6 +344,12 @@ class MARLLayer(nn.Module):
     
     def _update_target_networks(self, tau: float) -> None:
         """Update target networks with soft update."""
+        # Update individual agent target networks
+        for i in range(self.num_agents):
+            for target_param, param in zip(self.target_agent_networks[i].parameters(),
+                                         self.agent_networks[i].parameters()):
+                target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
+        
         # Update shared target network
         for target_param, param in zip(self.shared_target_agent_net.parameters(),
                                      self.shared_agent_net.parameters()):
@@ -354,30 +390,41 @@ class MARLLayer(nn.Module):
     
     def get_communication_matrix(self) -> torch.Tensor:
         """Get communication matrix showing agent interactions."""
-        if not self.communication_enabled or self.communication_network is None:
+        if not self.communication_enabled:
             return torch.zeros((self.num_agents, self.num_agents), device=self.device)
         
         # Create dummy input to extract communication patterns
-        dummy_state = torch.randn(1, self.state_dim, device=self.device)
+        dummy_states = torch.randn(1, self.num_agents, self.state_dim, device=self.device)
         
         with torch.no_grad():
-            # Pass through communication network
-            output = self.communication_network(dummy_state)
+            # Pass through communication mechanism
+            enhanced_states = self._compute_communication(dummy_states)
             
-            # Reshape to get agent-wise communication
-            # This is simplified - actual implementation would depend on network architecture
-            comm_matrix = output.view(self.num_agents, -1)
+            # Compute communication influence as difference
+            comm_influence = (enhanced_states - dummy_states).abs().sum(dim=-1)  # (1, N)
+            comm_matrix = torch.matmul(comm_influence, comm_influence.transpose(-2, -1))  # (1, N, N)
         
-        return comm_matrix
+        return comm_matrix.squeeze(0)  # (N, N)
     
     def save(self, path: str) -> None:
         """Save MARL layer state."""
         torch.save({
             'agent_networks_state': [net.state_dict() for net in self.agent_networks],
             'target_agent_networks_state': [net.state_dict() for net in self.target_agent_networks],
-            'mixing_network_state': self.mixing_network.state_dict(),
-            'target_mixing_network_state': self.target_mixing_network.state_dict(),
-            'communication_network_state': self.communication_network.state_dict() if self.communication_enabled else None,
+            'shared_agent_net_state': self.shared_agent_net.state_dict(),
+            'shared_target_agent_net_state': self.shared_target_agent_net.state_dict(),
+            'hyper_w1_state': self.hyper_w1.state_dict(),
+            'hyper_b1_state': self.hyper_b1.state_dict(),
+            'hyper_w2_state': self.hyper_w2.state_dict(),
+            'hyper_b2_state': self.hyper_b2.state_dict(),
+            'target_hyper_w1_state': self.target_hyper_w1.state_dict(),
+            'target_hyper_b1_state': self.target_hyper_b1.state_dict(),
+            'target_hyper_w2_state': self.target_hyper_w2.state_dict(),
+            'target_hyper_b2_state': self.target_hyper_b2.state_dict(),
+            'comm_key_state': self.comm_key.state_dict() if self.communication_enabled else None,
+            'comm_query_state': self.comm_query.state_dict() if self.communication_enabled else None,
+            'comm_value_state': self.comm_value.state_dict() if self.communication_enabled else None,
+            'comm_output_state': self.comm_output.state_dict() if self.communication_enabled else None,
             'epsilon': self.epsilon,
             'config': {
                 'state_dim': self.state_dim,
@@ -399,13 +446,30 @@ class MARLLayer(nn.Module):
         for i, net in enumerate(self.target_agent_networks):
             net.load_state_dict(checkpoint['target_agent_networks_state'][i])
         
-        # Load mixing networks
-        self.mixing_network.load_state_dict(checkpoint['mixing_network_state'])
-        self.target_mixing_network.load_state_dict(checkpoint['target_mixing_network_state'])
+        # Load shared networks
+        self.shared_agent_net.load_state_dict(checkpoint['shared_agent_net_state'])
+        self.shared_target_agent_net.load_state_dict(checkpoint['shared_target_agent_net_state'])
         
-        # Load communication network
-        if self.communication_enabled and checkpoint['communication_network_state'] is not None:
-            self.communication_network.load_state_dict(checkpoint['communication_network_state'])
+        # Load hypernetworks
+        self.hyper_w1.load_state_dict(checkpoint['hyper_w1_state'])
+        self.hyper_b1.load_state_dict(checkpoint['hyper_b1_state'])
+        self.hyper_w2.load_state_dict(checkpoint['hyper_w2_state'])
+        self.hyper_b2.load_state_dict(checkpoint['hyper_b2_state'])
+        self.target_hyper_w1.load_state_dict(checkpoint['target_hyper_w1_state'])
+        self.target_hyper_b1.load_state_dict(checkpoint['target_hyper_b1_state'])
+        self.target_hyper_w2.load_state_dict(checkpoint['target_hyper_w2_state'])
+        self.target_hyper_b2.load_state_dict(checkpoint['target_hyper_b2_state'])
+        
+        # Load communication networks
+        if self.communication_enabled:
+            if checkpoint['comm_key_state'] is not None:
+                self.comm_key.load_state_dict(checkpoint['comm_key_state'])
+            if checkpoint['comm_query_state'] is not None:
+                self.comm_query.load_state_dict(checkpoint['comm_query_state'])
+            if checkpoint['comm_value_state'] is not None:
+                self.comm_value.load_state_dict(checkpoint['comm_value_state'])
+            if checkpoint['comm_output_state'] is not None:
+                self.comm_output.load_state_dict(checkpoint['comm_output_state'])
         
         # Load epsilon
         self.epsilon = checkpoint['epsilon']

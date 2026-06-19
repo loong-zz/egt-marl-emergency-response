@@ -95,6 +95,21 @@ class EGTMARLTrainer:
                 'save_best_model': True,
                 'update_frequency': 10
             },
+            'schedule': {
+                'exploration_schedule': {
+                    'type': 'exponential',
+                    'start': 0.8,
+                    'end': 0.01,
+                    'decay': 0.997
+                },
+                'lr_schedule': {
+                    'type': 'cosine',
+                    'warmup_episodes': 100,
+                    'min_lr': 1e-6,
+                    'max_lr': 0.0001
+                },
+                'phases': []
+            },
             'environment': {
                 'map_size': (1000, 1000),
                 'num_agents': 20,
@@ -130,6 +145,16 @@ class EGTMARLTrainer:
                 for key, value in defaults[section].items():
                     if key not in config[section]:
                         config[section][key] = value
+        
+        # 从schedule.exploration_schedule读取并覆盖training中的探索率配置
+        if 'schedule' in config and 'exploration_schedule' in config['schedule']:
+            exp_sched = config['schedule']['exploration_schedule']
+            if 'start' in exp_sched:
+                config['training']['epsilon_start'] = exp_sched['start']
+            if 'end' in exp_sched:
+                config['training']['epsilon_end'] = exp_sched['end']
+            if 'decay' in exp_sched:
+                config['training']['epsilon_decay'] = exp_sched['decay']
         
         return config
     
@@ -759,6 +784,23 @@ class EGTMARLTrainer:
             'loss': []
         }
         
+        # 计算phase边界
+        phases = self.config.get('schedule', {}).get('phases', [])
+        phase_starts = []
+        phase_ends = []
+        current_start = 1
+        for phase in phases:
+            phase_starts.append(current_start)
+            current_end = current_start + phase.get('episodes', 100) - 1
+            phase_ends.append(current_end)
+            current_start = current_end + 1
+        
+        # 读取学习率调度配置
+        lr_schedule_config = self.config.get('schedule', {}).get('lr_schedule', {})
+        lr_warmup = int(lr_schedule_config.get('warmup_episodes', 100))
+        lr_min = float(lr_schedule_config.get('min_lr', 1e-6))
+        lr_max = float(lr_schedule_config.get('max_lr', 0.001))
+        
         # 检查是否需要恢复训练
         start_episode = 1
         if resume_from:
@@ -769,6 +811,30 @@ class EGTMARLTrainer:
         
         # 训练循环
         for episode in range(start_episode, num_episodes + 1):
+            # 检查是否需要切换phase
+            current_phase_idx = -1
+            for i, (start, end) in enumerate(zip(phase_starts, phase_ends)):
+                if start <= episode <= end:
+                    current_phase_idx = i
+                    break
+            
+            # 根据当前phase设置learning_rate（余弦退火）
+            if phases and current_phase_idx >= 0:
+                phase = phases[current_phase_idx]
+                if 'learning_rate' in phase:
+                    phase_lr = float(phase['learning_rate'])
+                    # 在phase内部应用余弦退火
+                    phase_start = phase_starts[current_phase_idx]
+                    phase_end = phase_ends[current_phase_idx]
+                    phase_progress = (episode - phase_start) / max(1, phase_end - phase_start)
+                    # 余弦退火：从phase_lr逐渐降到lr_min
+                    current_lr = lr_min + (phase_lr - lr_min) * (1 + math.cos(math.pi * phase_progress)) / 2
+                    # 更新optimizer的学习率
+                    if hasattr(self, 'algorithm') and hasattr(self.algorithm, 'marl_layer') and hasattr(self.algorithm.marl_layer, 'optimizer'):
+                        for param_group in self.algorithm.marl_layer.optimizer.param_groups:
+                            param_group['lr'] = current_lr
+                        logger.debug(f"Phase {phase.get('name', current_phase_idx)} - Episode {episode}: Learning rate set to {current_lr:.6f}")
+            
             # 训练一个episode
             episode_metrics = self.train_episode(episode, epsilon)
             
