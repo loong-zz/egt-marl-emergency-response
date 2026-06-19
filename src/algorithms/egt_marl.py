@@ -129,7 +129,8 @@ class EGTMARL:
         self.anti_spoofing = AntiSpoofing(
             observation_dim=self.config['anti_spoofing']['observation_dim'],
             action_dim=self.config['marl']['action_dim'],
-            device=self.device
+            device=self.device,
+            num_agents=self.config['marl']['num_agents']
         )
         
         # Dynamic Pareto frontier
@@ -629,6 +630,47 @@ class EGTMARL:
             # Select action
             action = self.select_action(state, training=True)
             
+            # Apply anti-spoofing: detect and correct strategic behavior
+            if self.config.get('anti_spoofing', {}).get('enabled', True):
+                try:
+                    # Convert state to tensor for anti-spoofing
+                    if isinstance(state, tuple):
+                        state_for_check = state[0]
+                    else:
+                        state_for_check = state
+                    
+                    if isinstance(state_for_check, np.ndarray):
+                        state_tensor = torch.tensor(state_for_check, dtype=torch.float32, device=self.device)
+                    else:
+                        state_tensor = state_for_check
+                    
+                    # Check each agent's action
+                    for agent_id in range(self.num_agents):
+                        if agent_id in action:
+                            agent_action = action[agent_id]
+                            # Convert action to tensor
+                            if isinstance(agent_action, dict):
+                                action_tensor = torch.tensor(
+                                    [agent_action.get('tactical', 0) / 8.0, 
+                                     agent_action.get('communication', 0) / 4.0],
+                                    dtype=torch.float32, device=self.device
+                                )
+                            else:
+                                action_tensor = torch.tensor(agent_action, dtype=torch.float32, device=self.device)
+                            
+                            # Detect strategic behavior
+                            strategic_result = self.anti_spoofing.detect_strategic_behavior(
+                                agent_id, state_tensor[agent_id], action_tensor
+                            )
+                            
+                            if strategic_result['is_strategic']:
+                                # Apply punishment
+                                self.anti_spoofing.apply_punishment(
+                                    agent_id, strategic_result['strategic_score']
+                                )
+                except Exception:
+                    pass  # Anti-spoofing is non-critical during training
+            
             # Take step in environment
             next_state, reward, terminated, truncated, info = self.env.step(action)
             done = terminated or truncated
@@ -705,12 +747,21 @@ class EGTMARL:
     def _calculate_episode_metrics(self, total_reward: float, 
                                   info: Dict[str, Any]) -> Dict[str, float]:
         """Calculate episode metrics."""
+        # Get anti-spoofing stats
+        detection_stats = self.anti_spoofing.get_detection_stats()
+        reputation_report = self.anti_spoofing.get_reputation_report()
+        
         metrics = {
             'total_reward': total_reward,
             'fairness_score': info.get('fairness_score', 0.0),
             'efficiency_score': info.get('efficiency_score', 0.0),
             'pareto_score': self.dynamic_frontier.get_pareto_score(),
-            'spoofing_rate': self.anti_spoofing.get_detection_rate()
+            'spoofing_rate': self.anti_spoofing.get_detection_rate(),
+            'anti_spoofing_detection_rate': detection_stats.get('detection_rate', 0.0),
+            'anti_spoofing_total_checks': detection_stats.get('total_checks', 0),
+            'anti_spoofing_detected': detection_stats.get('detected', 0),
+            'mean_reputation': reputation_report.get('mean_reputation', 0.5),
+            'correction_rate': self.anti_spoofing.get_correction_rate(),
         }
         
         # Update history
@@ -726,7 +777,8 @@ class EGTMARL:
         anti_spoofing_state = {
             'verifier': self.anti_spoofing.verifier.state_dict() if hasattr(self.anti_spoofing, 'verifier') else None,
             'spoofing_detector': self.anti_spoofing.spoofing_detector.state_dict() if hasattr(self.anti_spoofing, 'spoofing_detector') else None,
-            'corrector': self.anti_spoofing.corrector.state_dict() if hasattr(self.anti_spoofing, 'corrector') else None,
+            'correction_network': self.anti_spoofing.correction_network.state_dict() if hasattr(self.anti_spoofing, 'correction_network') else None,
+            'demand_predictor': self.anti_spoofing.demand_predictor.state_dict() if hasattr(self.anti_spoofing, 'demand_predictor') else None,
             'reputation_system': self.anti_spoofing.reputation_system if hasattr(self.anti_spoofing, 'reputation_system') else None
         }
         
@@ -777,8 +829,10 @@ class EGTMARL:
                 self.anti_spoofing.verifier.load_state_dict(anti_spoofing_state['verifier'])
             if hasattr(self.anti_spoofing, 'spoofing_detector') and anti_spoofing_state.get('spoofing_detector') is not None:
                 self.anti_spoofing.spoofing_detector.load_state_dict(anti_spoofing_state['spoofing_detector'])
-            if hasattr(self.anti_spoofing, 'corrector') and anti_spoofing_state.get('corrector') is not None:
-                self.anti_spoofing.corrector.load_state_dict(anti_spoofing_state['corrector'])
+            if hasattr(self.anti_spoofing, 'correction_network') and anti_spoofing_state.get('correction_network') is not None:
+                self.anti_spoofing.correction_network.load_state_dict(anti_spoofing_state['correction_network'])
+            if hasattr(self.anti_spoofing, 'demand_predictor') and anti_spoofing_state.get('demand_predictor') is not None:
+                self.anti_spoofing.demand_predictor.load_state_dict(anti_spoofing_state['demand_predictor'])
             if hasattr(self.anti_spoofing, 'reputation_system') and anti_spoofing_state.get('reputation_system') is not None:
                 self.anti_spoofing.reputation_system = anti_spoofing_state['reputation_system']
         

@@ -18,6 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List, Tuple, Any, Optional
+from collections import deque
 from dataclasses import dataclass
 import copy
 from scipy.spatial.distance import cdist
@@ -54,6 +55,13 @@ class DynamicParetoFrontier:
     1. Efficiency: Maximize survivors, minimize response time
     2. Fairness: Minimize inequality in resource distribution
     3. Robustness: Maximize system stability and fault tolerance
+    
+    Enhanced with:
+    - Phase-aware weight scheduling (exploration vs exploitation)
+    - Context-aware adaptation (disaster severity/type)
+    - Performance trend tracking (improvement rates)
+    - Entropy-based diversity preservation
+    - Adaptive mutation rate based on population diversity
     """
     
     def __init__(self, 
@@ -74,9 +82,36 @@ class DynamicParetoFrontier:
         
         # Evolutionary algorithm parameters
         self.mutation_strength = config.get('mutation_strength', 0.1)
+        self.base_mutation_strength = self.mutation_strength
         self.crossover_rate = config.get('crossover_rate', 0.7)
         self.elitism_rate = config.get('elitism_rate', 0.1)
         self.population_size = config.get('population_size', 100)
+        
+        # Phase-aware scheduling
+        self.training_phase = 'exploration'  # exploration, exploitation, refinement
+        self.phase_config = {
+            'exploration': {'alpha': 0.5, 'beta': 0.3, 'gamma': 0.2, 'mutation_mult': 1.5},
+            'exploitation': {'alpha': 0.3, 'beta': 0.4, 'gamma': 0.3, 'mutation_mult': 1.0},
+            'refinement': {'alpha': 0.2, 'beta': 0.3, 'gamma': 0.5, 'mutation_mult': 0.5},
+        }
+        
+        # Context-aware parameters
+        self.disaster_type = config.get('disaster_type', 'earthquake')
+        self.disaster_severity = config.get('severity', 'medium')
+        self.context_weights = self._compute_context_weights()
+        
+        # Performance trend tracking
+        self.trend_window = config.get('trend_window', 10)
+        self.objective_trends = {
+            'efficiency': deque(maxlen=self.trend_window),
+            'fairness': deque(maxlen=self.trend_window),
+            'robustness': deque(maxlen=self.trend_window),
+        }
+        self.improvement_rates = {'efficiency': 0.0, 'fairness': 0.0, 'robustness': 0.0}
+        
+        # Entropy-based diversity
+        self.diversity_threshold = config.get('diversity_threshold', 0.15)
+        self.entropy_reg_weight = config.get('entropy_reg_weight', 0.01)
         
         # Reference point for hypervolume calculation
         self.reference_point = np.array([0.0, 0.0, 0.0])
@@ -84,13 +119,155 @@ class DynamicParetoFrontier:
         # Initialize frontier
         self.frontier: List[ParetoPoint] = []
         self.archive: List[ParetoPoint] = []  # Archive of all evaluated points
+        self.best_frontier: List[ParetoPoint] = []  # Historical best frontier
         
         # Performance tracking
         self.performance_history: List[Dict[str, float]] = []
         self.weight_history: List[np.ndarray] = []
+        self.phase_transitions: List[Dict[str, Any]] = []
         
         # Initialize with random weights
         self._initialize_frontier()
+    
+    def _compute_context_weights(self) -> np.ndarray:
+        """
+        Compute context-aware base weights based on disaster type and severity.
+        
+        Different disasters have different priorities:
+        - Earthquake: rescue speed critical (efficiency heavy)
+        - Flood: resource distribution critical (fairness heavy)
+        - Fire: system robustness critical (robustness heavy)
+        - High severity: efficiency priority
+        - Low severity: robustness priority
+        """
+        # Base weights by disaster type
+        type_weights = {
+            'earthquake': np.array([0.45, 0.30, 0.25]),
+            'flood': np.array([0.30, 0.45, 0.25]),
+            'fire': np.array([0.30, 0.25, 0.45]),
+            'hurricane': np.array([0.35, 0.35, 0.30]),
+            'tsunami': np.array([0.40, 0.30, 0.30]),
+        }
+        
+        # Severity adjustments
+        severity_mult = {
+            'low': np.array([1.0, 0.9, 1.1]),
+            'medium': np.array([1.0, 1.0, 1.0]),
+            'high': np.array([1.2, 0.9, 0.9]),
+            'extreme': np.array([1.3, 0.8, 0.9]),
+        }
+        
+        base = type_weights.get(self.disaster_type, np.array([0.4, 0.3, 0.3]))
+        mult = severity_mult.get(self.disaster_severity, np.array([1.0, 1.0, 1.0]))
+        
+        weights = base * mult
+        weights = weights / weights.sum()
+        
+        return weights
+    
+    def update_training_phase(self, episode: int, total_episodes: int):
+        """
+        Update training phase based on progress.
+        
+        Phase schedule:
+        - 0-40%: exploration (focus on discovering diverse strategies)
+        - 40-80%: exploitation (focus on efficiency)
+        - 80-100%: refinement (focus on robustness and stability)
+        """
+        progress = episode / total_episodes if total_episodes > 0 else 0
+        
+        if progress < 0.4:
+            new_phase = 'exploration'
+        elif progress < 0.8:
+            new_phase = 'exploitation'
+        else:
+            new_phase = 'refinement'
+        
+        if new_phase != self.training_phase:
+            self.phase_transitions.append({
+                'episode': episode,
+                'from_phase': self.training_phase,
+                'to_phase': new_phase,
+                'progress': progress,
+            })
+            self.training_phase = new_phase
+            self._on_phase_change()
+    
+    def _on_phase_change(self):
+        """Handle phase transition."""
+        phase_cfg = self.phase_config[self.training_phase]
+        
+        # Adjust mutation based on phase
+        self.mutation_strength = self.base_mutation_strength * phase_cfg['mutation_mult']
+        
+        # Adjust elitism based on phase
+        if self.training_phase == 'exploration':
+            self.elitism_rate = 0.05  # Less elitism for more exploration
+        elif self.training_phase == 'exploitation':
+            self.elitism_rate = 0.15  # More elitism for convergence
+        else:
+            self.elitism_rate = 0.10  # Balanced
+    
+    def _update_trends(self, performance_metrics: Dict[str, float]):
+        """Update performance trend tracking."""
+        for obj in ['efficiency', 'fairness', 'robustness']:
+            score = performance_metrics.get(f'{obj}_score', 0.5)
+            self.objective_trends[obj].append(score)
+            
+            # Calculate improvement rate (slope of recent trend)
+            if len(self.objective_trends[obj]) >= 3:
+                values = list(self.objective_trends[obj])
+                x = np.arange(len(values))
+                if len(x) > 1 and np.std(x) > 0:
+                    slope = np.polyfit(x, values, 1)[0]
+                    self.improvement_rates[obj] = slope
+    
+    def _compute_diversity(self) -> float:
+        """Compute population diversity via entropy of weight distribution."""
+        if len(self.frontier) < 2:
+            return 0.0
+        
+        all_weights = np.array([p.weights for p in self.frontier])
+        # Average pairwise distance
+        distances = cdist(all_weights, all_weights)
+        avg_distance = np.mean(distances[np.triu_indices_from(distances, k=1)])
+        return float(avg_distance)
+    
+    def _adapt_mutation_rate(self):
+        """Adapt mutation rate based on population diversity."""
+        diversity = self._compute_diversity()
+        
+        if diversity < self.diversity_threshold:
+            # Low diversity - increase mutation
+            self.mutation_strength = min(
+                self.base_mutation_strength * 2.0,
+                self.mutation_strength * 1.2
+            )
+        elif diversity > self.diversity_threshold * 3:
+            # High diversity - decrease mutation
+            self.mutation_strength = max(
+                self.base_mutation_strength * 0.5,
+                self.mutation_strength * 0.9
+            )
+    
+    def _apply_entropy_regularization(self):
+        """Apply entropy regularization to maintain weight diversity."""
+        if len(self.frontier) < 2:
+            return
+        
+        all_weights = np.array([p.weights for p in self.frontier])
+        # Compute entropy-like measure
+        mean_weights = np.mean(all_weights, axis=0)
+        entropy = -np.sum(mean_weights * np.log(mean_weights + 1e-8))
+        
+        # If entropy too low, nudge weights apart
+        if entropy < 0.8:  # Low entropy threshold
+            for point in self.frontier:
+                # Add small noise proportional to regularization weight
+                noise = np.random.normal(0, self.entropy_reg_weight, size=point.weights.shape)
+                point.weights = point.weights + noise
+                point.weights = np.clip(point.weights, self.min_weight, self.max_weight)
+                point.weights = point.weights / point.weights.sum()
     
     def _initialize_frontier(self):
         """Initialize frontier with random weight vectors."""
@@ -120,6 +297,15 @@ class DynamicParetoFrontier:
             new_solutions: List of new solution evaluations
             performance_metrics: Current performance metrics
         """
+        # Update performance trends
+        self._update_trends(performance_metrics)
+        
+        # Adapt mutation rate based on diversity
+        self._adapt_mutation_rate()
+        
+        # Apply entropy regularization
+        self._apply_entropy_regularization()
+        
         # Evaluate new solutions
         new_points = []
         for solution in new_solutions:
@@ -136,7 +322,22 @@ class DynamicParetoFrontier:
         ranked_points = self._non_dominated_sorting(all_points)
         
         # Select new frontier
-        self.frontier = self._select_new_frontier(ranked_points)
+        new_frontier = self._select_new_frontier(ranked_points)
+        
+        # Update historical best frontier
+        if len(new_frontier) > 0:
+            # Check if new frontier has better hypervolume
+            if len(self.best_frontier) == 0:
+                self.best_frontier = [copy.deepcopy(p) for p in new_frontier]
+            else:
+                old_metrics = self._calculate_frontier_metrics(self.best_frontier)
+                old_hv = old_metrics.hypervolume if old_metrics else 0.0
+                new_metrics = self._calculate_frontier_metrics(new_frontier)
+                new_hv = new_metrics.hypervolume if new_metrics else 0.0
+                if new_hv > old_hv:
+                    self.best_frontier = [copy.deepcopy(p) for p in new_frontier]
+        
+        self.frontier = new_frontier
         
         # Update weights based on performance
         self._adapt_weights(performance_metrics)
@@ -145,6 +346,25 @@ class DynamicParetoFrontier:
         self.performance_history.append(performance_metrics.copy())
         if self.frontier:
             self.weight_history.append(self.frontier[0].weights.copy())
+    
+    def _calculate_frontier_metrics(self, frontier: List[ParetoPoint]) -> Optional[FrontierMetrics]:
+        """Calculate metrics for a given frontier."""
+        if len(frontier) < 2:
+            return None
+        
+        objectives = np.array([[p.efficiency, p.fairness, p.robustness] for p in frontier])
+        hv = self._calculate_hypervolume(objectives)
+        spread = self._calculate_spread(objectives)
+        conv = self._calculate_convergence(objectives)
+        unif = self._calculate_uniformity(objectives)
+        
+        return FrontierMetrics(
+            hypervolume=hv,
+            spread=spread,
+            convergence=conv,
+            uniformity=unif,
+            cardinality=len(frontier)
+        )
     
     def _evaluate_solution(self,
                           solution: Dict[str, Any],
@@ -419,15 +639,25 @@ class DynamicParetoFrontier:
                     front_sorted[i].crowding_distance += distance
     
     def _adapt_weights(self, performance_metrics: Dict[str, float]):
-        """Adapt weights based on performance feedback."""
+        """Adapt weights based on performance feedback, phase, and context."""
         if not self.frontier:
             return
         
         # Get current best point
         best_point = self._get_best_point(performance_metrics)
         
+        # Blend with context weights
+        phase_cfg = self.phase_config[self.training_phase]
+        blended = (
+            phase_cfg['alpha'] * best_point.weights +
+            phase_cfg['beta'] * self.context_weights +
+            phase_cfg['gamma'] * self._generate_weights_from_performance(performance_metrics)
+        )
+        blended = np.clip(blended, self.min_weight, self.max_weight)
+        blended = blended / blended.sum()
+        
         # Generate new weight variations
-        new_weights = self._evolve_weights(best_point.weights)
+        new_weights = self._evolve_weights(blended)
         
         # Create new points with evolved weights
         new_points = []
@@ -534,7 +764,16 @@ class DynamicParetoFrontier:
         # Get best point
         best_point = self._get_best_point(performance_metrics)
         
-        return best_point.weights.copy()
+        # Blend with phase-aware context weights
+        phase_cfg = self.phase_config[self.training_phase]
+        blended = (
+            phase_cfg['alpha'] * best_point.weights +
+            phase_cfg['beta'] * self.context_weights
+        )
+        blended = np.clip(blended, self.min_weight, self.max_weight)
+        blended = blended / blended.sum()
+        
+        return blended.copy()
     
     def get_frontier_metrics(self) -> FrontierMetrics:
         """Calculate metrics for current frontier."""
@@ -695,8 +934,13 @@ class DynamicParetoFrontier:
         state = {
             'frontier': self.frontier,
             'archive': self.archive,
+            'best_frontier': self.best_frontier,
             'performance_history': self.performance_history,
             'weight_history': self.weight_history,
+            'phase_transitions': self.phase_transitions,
+            'training_phase': self.training_phase,
+            'objective_trends': {k: list(v) for k, v in self.objective_trends.items()},
+            'improvement_rates': self.improvement_rates,
             'config': self.config
         }
         
@@ -712,9 +956,19 @@ class DynamicParetoFrontier:
         
         self.frontier = state['frontier']
         self.archive = state['archive']
+        self.best_frontier = state.get('best_frontier', [])
         self.performance_history = state['performance_history']
         self.weight_history = state['weight_history']
+        self.phase_transitions = state.get('phase_transitions', [])
+        self.training_phase = state.get('training_phase', 'exploration')
         self.config = state['config']
+        
+        # Restore trend tracking
+        if 'objective_trends' in state:
+            for k, v in state['objective_trends'].items():
+                self.objective_trends[k] = deque(v, maxlen=self.trend_window)
+        if 'improvement_rates' in state:
+            self.improvement_rates = state['improvement_rates']
 
 
 class AdaptiveWeightController:

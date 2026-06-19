@@ -15,8 +15,9 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # 添加项目根目录到路径
-project_root = Path(__file__).parent.parent
+project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
+sys.path.insert(0, str(project_root / "src"))
 
 from environments.disaster_sim import DisasterSim
 from environments.config.constants import SimulationConfig
@@ -93,17 +94,45 @@ def load_model(config: Dict, checkpoint_path: str):
     # 加载检查点（设置weights_only=False以支持numpy对象）
     checkpoint = torch.load(checkpoint_path, map_location=torch.device('cpu'), weights_only=False)
     
-    # 转换checkpoint格式以匹配load_state_dict期望的格式
-    state_dict = {}
+    # 加载模型参数（使用strict=False处理可能的参数不匹配）
     if 'marl_layer_state' in checkpoint:
-        state_dict['marl_layer'] = checkpoint['marl_layer_state']
-    if 'egt_layer_state' in checkpoint:
-        state_dict['egt_layer'] = checkpoint['egt_layer_state']
-    if 'anti_spoofing_state' in checkpoint:
-        state_dict['anti_spoofing'] = checkpoint['anti_spoofing_state']
-    # 注意：dynamic_frontier没有load_state_dict方法，跳过
+        try:
+            algorithm.marl_layer.load_state_dict(checkpoint['marl_layer_state'])
+        except RuntimeError:
+            # 如果参数不匹配，尝试使用strict=False
+            algorithm.marl_layer.load_state_dict(checkpoint['marl_layer_state'], strict=False)
     
-    algorithm.load_state_dict(state_dict)
+    if 'egt_layer_state' in checkpoint:
+        try:
+            algorithm.egt_layer.load_state_dict(checkpoint['egt_layer_state'])
+        except RuntimeError:
+            algorithm.egt_layer.load_state_dict(checkpoint['egt_layer_state'], strict=False)
+    
+    if 'anti_spoofing_state' in checkpoint:
+        anti_spoofing_state = checkpoint['anti_spoofing_state']
+        try:
+            # AntiSpoofing使用自定义的load方法
+            if hasattr(algorithm.anti_spoofing, 'load_state_dict'):
+                algorithm.anti_spoofing.load_state_dict(anti_spoofing_state)
+            else:
+                # 手动加载各个子组件
+                if 'verifier' in anti_spoofing_state:
+                    algorithm.anti_spoofing.verifier.load_state_dict(anti_spoofing_state['verifier'], strict=False)
+                if 'spoofing_detector' in anti_spoofing_state:
+                    algorithm.anti_spoofing.spoofing_detector.load_state_dict(anti_spoofing_state['spoofing_detector'], strict=False)
+                if 'corrector' in anti_spoofing_state:
+                    # 兼容旧版本的corrector属性（现已重命名为correction_network）
+                    if hasattr(algorithm.anti_spoofing, 'corrector'):
+                        algorithm.anti_spoofing.corrector.load_state_dict(anti_spoofing_state['corrector'], strict=False)
+                    elif hasattr(algorithm.anti_spoofing, 'correction_network'):
+                        algorithm.anti_spoofing.correction_network.load_state_dict(anti_spoofing_state['corrector'], strict=False)
+                if 'correction_network' in anti_spoofing_state:
+                    if hasattr(algorithm.anti_spoofing, 'correction_network'):
+                        algorithm.anti_spoofing.correction_network.load_state_dict(anti_spoofing_state['correction_network'], strict=False)
+                if 'reputation_system' in anti_spoofing_state:
+                    algorithm.anti_spoofing.reputation_system = anti_spoofing_state['reputation_system']
+        except Exception as e:
+            logger.warning(f"Failed to load anti_spoofing state: {e}")
     
     return algorithm, env
 

@@ -75,13 +75,19 @@ class ManagerIntegration:
         self.agent_fitness = {i: 0.0 for i in range(num_agents)}
         self.episode_rewards = []
 
-        # Reset all managers
-        self.egt_manager.reset()
-        self.reputation_manager.reset()
-        self.communication_manager.reset()
-        self.communication_interference.reset()
-        self.strategy_detection_manager.reset()
-        self.fairness_metrics_manager.reset()
+        # Reset all managers (with None check for ablation experiments)
+        if self.egt_manager is not None:
+            self.egt_manager.reset()
+        if self.reputation_manager is not None:
+            self.reputation_manager.reset()
+        if self.communication_manager is not None:
+            self.communication_manager.reset()
+        if self.communication_interference is not None:
+            self.communication_interference.reset()
+        if self.strategy_detection_manager is not None:
+            self.strategy_detection_manager.reset()
+        if self.fairness_metrics_manager is not None:
+            self.fairness_metrics_manager.reset()
         
         # Initialize or reset region manager
         if map_size is not None:
@@ -177,7 +183,8 @@ class ManagerIntegration:
             reward = agent_rewards.get(agent_id, 0.0)
             # Positive reward = good performance = honest behavior
             is_honest = reward >= 0
-            self.reputation_manager.update_reputation(agent_id, is_honest)
+            if self.reputation_manager is not None:
+                self.reputation_manager.update_reputation(agent_id, is_honest)
             
             # Update agent position in region manager
             if self.region_manager is not None:
@@ -186,7 +193,7 @@ class ManagerIntegration:
                     self.region_manager.update_agent_position(agent_id, position)
 
         # Update EGT lambda based on fitness distribution
-        if len(fitness_values) > 0:
+        if len(fitness_values) > 0 and self.egt_manager is not None:
             new_lambda = self.egt_manager.update_lambda(fitness_values, self.current_time_step)
 
         # Store rewards
