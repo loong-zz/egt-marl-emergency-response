@@ -5,3 +5,4 @@ src/.venv/*
 src/*_results/*
 src/*/*_results/*
 *.pyc
+.venv/*

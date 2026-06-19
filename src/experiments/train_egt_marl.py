@@ -12,7 +12,6 @@ import yaml
 import numpy as np
 import torch
 import torch.multiprocessing as mp
-import math
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
@@ -761,20 +760,13 @@ class EGTMARLTrainer:
             num_episodes = sum(phase['episodes'] for phase in phases)
             logger.info(f"Multi-phase training enabled: {len(phases)} phases, total episodes: {num_episodes}")
             for phase in phases:
-                logger.info(f"  - {phase['name']}: {phase['episodes']} episodes (exploration_rate={phase.get('exploration_rate', 'N/A')}, lr={phase.get('learning_rate', 'N/A')})")
+                logger.info(f"  - {phase['name']}: {phase['episodes']} episodes")
         else:
             num_episodes = training_config['num_episodes']
-            phases = []
         
         epsilon = training_config['epsilon_start']
         epsilon_decay = training_config['epsilon_decay']
         epsilon_end = training_config['epsilon_end']
-        
-        # 从schedule读取lr_schedule配置
-        lr_schedule_config = self.config.get('schedule', {}).get('lr_schedule', {})
-        lr_warmup = int(lr_schedule_config.get('warmup_episodes', 100))
-        lr_min = float(lr_schedule_config.get('min_lr', 1e-6))
-        lr_max = float(lr_schedule_config.get('max_lr', 0.001))
         
         checkpoint_interval = training_config['checkpoint_interval']
         eval_interval = training_config['eval_interval']
@@ -792,6 +784,23 @@ class EGTMARLTrainer:
             'loss': []
         }
         
+        # 计算phase边界
+        phases = self.config.get('schedule', {}).get('phases', [])
+        phase_starts = []
+        phase_ends = []
+        current_start = 1
+        for phase in phases:
+            phase_starts.append(current_start)
+            current_end = current_start + phase.get('episodes', 100) - 1
+            phase_ends.append(current_end)
+            current_start = current_end + 1
+        
+        # 读取学习率调度配置
+        lr_schedule_config = self.config.get('schedule', {}).get('lr_schedule', {})
+        lr_warmup = int(lr_schedule_config.get('warmup_episodes', 100))
+        lr_min = float(lr_schedule_config.get('min_lr', 1e-6))
+        lr_max = float(lr_schedule_config.get('max_lr', 0.001))
+        
         # 检查是否需要恢复训练
         start_episode = 1
         if resume_from:
@@ -800,35 +809,17 @@ class EGTMARLTrainer:
             epsilon = max(epsilon_end, epsilon * (epsilon_decay ** (start_episode - 1)))
             logger.info(f"Resuming training from episode {start_episode} with epsilon={epsilon:.4f}")
         
-        # 计算每个phase的起始episode
-        phase_starts = []
-        phase_ends = []
-        current_episode = 1
-        for phase in phases:
-            phase_starts.append(current_episode)
-            phase_ends.append(current_episode + phase['episodes'] - 1)
-            current_episode += phase['episodes']
-        
-        # 当前phase索引
-        current_phase_idx = 0
-        
         # 训练循环
         for episode in range(start_episode, num_episodes + 1):
-            # 检测phase切换
-            if phases and current_phase_idx < len(phases) - 1:
-                if episode > phase_ends[current_phase_idx]:
-                    current_phase_idx += 1
-                    logger.info(f"Phase transition: Episode {episode} -> {phases[current_phase_idx]['name']}")
-            
-            # 根据当前phase设置exploration_rate
-            if phases and current_phase_idx < len(phases):
-                phase = phases[current_phase_idx]
-                if 'exploration_rate' in phase:
-                    epsilon = phase['exploration_rate']
-                    logger.debug(f"Episode {episode}: Set epsilon to {epsilon} from phase config")
+            # 检查是否需要切换phase
+            current_phase_idx = -1
+            for i, (start, end) in enumerate(zip(phase_starts, phase_ends)):
+                if start <= episode <= end:
+                    current_phase_idx = i
+                    break
             
             # 根据当前phase设置learning_rate（余弦退火）
-            if phases and current_phase_idx < len(phases):
+            if phases and current_phase_idx >= 0:
                 phase = phases[current_phase_idx]
                 if 'learning_rate' in phase:
                     phase_lr = float(phase['learning_rate'])
@@ -839,15 +830,16 @@ class EGTMARLTrainer:
                     # 余弦退火：从phase_lr逐渐降到lr_min
                     current_lr = lr_min + (phase_lr - lr_min) * (1 + math.cos(math.pi * phase_progress)) / 2
                     # 更新optimizer的学习率
-                    for param_group in self.algorithm.marl_layer.optimizer.param_groups:
-                        param_group['lr'] = current_lr
+                    if hasattr(self, 'algorithm') and hasattr(self.algorithm, 'marl_layer') and hasattr(self.algorithm.marl_layer, 'optimizer'):
+                        for param_group in self.algorithm.marl_layer.optimizer.param_groups:
+                            param_group['lr'] = current_lr
+                        logger.debug(f"Phase {phase.get('name', current_phase_idx)} - Episode {episode}: Learning rate set to {current_lr:.6f}")
             
             # 训练一个episode
             episode_metrics = self.train_episode(episode, epsilon)
             
-            # 更新探索率（仅在没有phase配置时使用指数衰减）
-            if not phases or current_phase_idx >= len(phases) or 'exploration_rate' not in phases[current_phase_idx]:
-                epsilon = max(epsilon_end, epsilon * epsilon_decay)
+            # 更新探索率
+            epsilon = max(epsilon_end, epsilon * epsilon_decay)
             
             # 记录训练历史
             training_history['episodes'].append(episode)

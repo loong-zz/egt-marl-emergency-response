@@ -124,7 +124,7 @@ class DisasterSim:
     
     def _initialize_resource_depots(self) -> None:
         """Initialize resource depots with dynamic resource calculation based on num_victims."""
-        from environments.config.constants import (
+        from src.environments.config.constants import (
             RESOURCE_SUPPLY_RATIO, EXPECTED_SEVERITY_DISTRIBUTION,
             RESOURCES_NEEDED, ResourceType, CasualtySeverity
         )
