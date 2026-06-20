@@ -808,7 +808,7 @@ class EGTMARL:
     
     def load_checkpoint(self, path: str) -> None:
         """Load model checkpoint."""
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         
         self.episode = checkpoint['episode']
         self.total_steps = checkpoint['total_steps']

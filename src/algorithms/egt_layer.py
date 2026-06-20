@@ -399,7 +399,7 @@ class EGTLayer(nn.Module):
     
     def load(self, path: str) -> None:
         """Load EGT layer state."""
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         
         self.payoff_matrix.load_state_dict(checkpoint['payoff_matrix_state'])
         self.strategy_distribution.load_state_dict(checkpoint['strategy_distribution_state'])

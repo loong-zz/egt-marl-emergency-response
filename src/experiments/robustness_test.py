@@ -200,7 +200,7 @@ class RobustnessTester:
     def _load_algorithm_model(self, model_path: str):
         """加载算法模型"""
         try:
-            checkpoint = torch.load(model_path, map_location=self.device)
+            checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
             
             if 'algorithm_state' in checkpoint:
                 self.algorithm.load_state_dict(checkpoint['algorithm_state'])

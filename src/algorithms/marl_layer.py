@@ -436,7 +436,7 @@ class MARLLayer(nn.Module):
     
     def load(self, path: str) -> None:
         """Load MARL layer state."""
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         
         # Load agent networks
         for i, net in enumerate(self.agent_networks):

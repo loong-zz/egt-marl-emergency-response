@@ -775,7 +775,7 @@ class AntiSpoofing:
 
     def load(self, path: str, strict: bool = True):
         """Load anti-spoofing state."""
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         self.verifier.load_state_dict(checkpoint['verifier'], strict=strict)
         self.spoofing_detector.load_state_dict(checkpoint['spoofing_detector'], strict=strict)
         self.demand_predictor.load_state_dict(checkpoint['demand_predictor'], strict=strict)

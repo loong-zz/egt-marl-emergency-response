@@ -766,7 +766,7 @@ class ImprovedQMIXAgent(nn.Module):
     
     def load(self, path: str):
         """Load agent state."""
-        checkpoint = torch.load(path)
+        checkpoint = torch.load(path, weights_only=False)
         self.q_network.load_state_dict(checkpoint['q_network_state_dict'])
         self.target_q_network.load_state_dict(checkpoint['target_q_network_state_dict'])
         self.hierarchical_policy.load_state_dict(checkpoint['hierarchical_policy_state_dict'])
@@ -1033,13 +1033,13 @@ class ImprovedQMIX:
         # Load mixing network
         mixing_path = os.path.join(directory, 'mixing_network.pt')
         if os.path.exists(mixing_path):
-            checkpoint = torch.load(mixing_path)
+            checkpoint = torch.load(mixing_path, weights_only=False)
             self.mixing_network.load_state_dict(checkpoint['state_dict'])
         
         # Load target mixing network
         target_mixing_path = os.path.join(directory, 'target_mixing_network.pt')
         if os.path.exists(target_mixing_path):
-            checkpoint = torch.load(target_mixing_path)
+            checkpoint = torch.load(target_mixing_path, weights_only=False)
             self.target_mixing_network.load_state_dict(checkpoint['state_dict'])
         
         # Load training stats

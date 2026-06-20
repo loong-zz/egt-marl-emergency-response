@@ -74,7 +74,7 @@ class EGTMARLTrainer:
     def _load_config(self, config_path: str) -> Dict[str, Any]:
         """加载配置文件"""
         with open(config_path, 'r', encoding='utf-8') as f:
-            config = yaml.safe_load(f)
+            config = yaml.load(f, Loader=yaml.FullLoader)
         
         # 设置默认值
         defaults = {
@@ -159,39 +159,62 @@ class EGTMARLTrainer:
         
         return config
     
-    def setup_directories(self):
-        """设置目录结构"""
+    def setup_directories(self, experiment_dir: str = None):
+        """设置目录结构
+
+        Args:
+            experiment_dir: 可选，指定现有的实验目录（用于恢复训练）。
+                          如果为 None，则根据时间戳创建新目录。
+        """
         # 使用项目根目录作为基准，确保结果目录位置一致
         project_root = Path(__file__).parent.parent
-        base_dir = project_root / self.config.get('output_dir', 'experiment_results')
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        self.experiment_dir = base_dir / f'egt_marl_{timestamp}'
-        
-        # 创建目录
-        self.experiment_dir.mkdir(parents=True, exist_ok=True)
+
+        if experiment_dir:
+            # 恢复训练：复用已有实验目录
+            self.experiment_dir = Path(experiment_dir)
+            if not self.experiment_dir.exists():
+                logger.warning(f"Specified experiment directory does not exist: {self.experiment_dir}")
+                self.experiment_dir.mkdir(parents=True, exist_ok=True)
+            else:
+                logger.info(f"Reusing existing experiment directory: {self.experiment_dir}")
+        else:
+            # 新训练：创建带时间戳的新目录
+            base_dir = project_root / self.config.get('output_dir', 'experiment_results')
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            self.experiment_dir = base_dir / f'egt_marl_{timestamp}'
+            self.experiment_dir.mkdir(parents=True, exist_ok=True)
+
+        # 创建子目录
         (self.experiment_dir / 'models').mkdir(exist_ok=True)
         (self.experiment_dir / 'checkpoints').mkdir(exist_ok=True)
         (self.experiment_dir / 'logs').mkdir(exist_ok=True)
         (self.experiment_dir / 'visualizations').mkdir(exist_ok=True)
-        
-        # 配置日志
+
+        # 配置日志（恢复训练时追加写入，避免覆盖旧日志）
         log_file = self.experiment_dir / 'logs' / 'training.log'
         log_level_str = self.config.get('logging', {}).get('level', 'INFO')
         log_level = getattr(logging, log_level_str.upper(), logging.INFO)
-        logging.basicConfig(
-            level=log_level,
-            format='%(asctime)s %(name)s:%(lineno)d %(levelname)s %(message)s',
-            handlers=[
-                logging.FileHandler(str(log_file), encoding='utf-8'),
-                logging.StreamHandler()
-            ]
-        )
-        
-        # 保存配置
+
+        # 避免重复添加 handler（当多次调用时）
+        root_logger = logging.getLogger()
+        if not any(isinstance(h, logging.FileHandler)
+                  and getattr(h, 'baseFilename', None) == str(log_file)
+                  for h in root_logger.handlers):
+            file_handler = logging.FileHandler(str(log_file), mode='a', encoding='utf-8')
+            file_handler.setFormatter(logging.Formatter('%(asctime)s %(name)s:%(lineno)d %(levelname)s %(message)s'))
+            root_logger.addHandler(file_handler)
+
+            stream_handler = logging.StreamHandler()
+            stream_handler.setFormatter(logging.Formatter('%(asctime)s %(name)s:%(lineno)d %(levelname)s %(message)s'))
+            root_logger.addHandler(stream_handler)
+
+        root_logger.setLevel(log_level)
+
+        # 保存配置（新训练时覆盖；恢复训练时重新写入，以便保存最新配置）
         config_path = self.experiment_dir / 'config.yaml'
         with open(config_path, 'w', encoding='utf-8') as f:
             yaml.dump(self.config, f, default_flow_style=False)
-        
+
         logger.info(f"Experiment directory: {self.experiment_dir}")
         logger.info(f"Log file: {log_file}")
     
@@ -742,9 +765,15 @@ class EGTMARLTrainer:
     def train(self, resume_from: str = None):
         """主训练循环"""
         logger.info("Starting training...")
-        
-        # 设置目录（在参数覆盖后）
-        self.setup_directories()
+
+        # 设置目录（恢复训练时复用checkpoint所在的实验目录
+        if resume_from:
+            ckpt_path = Path(resume_from)
+            # checkpoints 位于 experiment_dir/checkpoints/checkpoint_epXXX.pt
+            experiment_dir = ckpt_path.parent.parent
+            self.setup_directories(str(experiment_dir))
+        else:
+            self.setup_directories()
         
         # 设置组件（包括Manager集成）
         self.setup_manager_integration()
