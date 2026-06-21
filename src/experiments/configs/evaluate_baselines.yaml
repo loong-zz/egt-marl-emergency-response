@@ -1,6 +1,6 @@
 # 基准算法比较配置文件
 
-output_dir: evaluation_results
+output_dir: src/evaluation_results
 
 # 评估配置
 evaluation:
@@ -26,7 +26,7 @@ environment:
 algorithms:
   egt_marl:
     enabled: true
-    model_path: "E:/studio/workspace/egt-marl-emergency-response/src/experiment_results/egt_marl_20260427_152624/models/best_model.pt"
+    model_path: "E:/studio/workspace/egt-marl-emergency-response/src/experiment_results/egt_marl_20260620_210828/models/best_model.pt"
   qmix:
     enabled: true
     model_path: ""
