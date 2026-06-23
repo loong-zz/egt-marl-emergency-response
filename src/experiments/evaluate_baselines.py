@@ -178,39 +178,53 @@ class BaselineEvaluator:
         
         # 初始化 EGT-MARL
         if algo_config['egt_marl']['enabled']:
-            # 为EGT-MARL创建完整配置 - 使用与训练相同的参数（从checkpoint推断）
+            # 先尝试加载checkpoint获取配置
+            model_path = algo_config['egt_marl'].get('model_path')
+            checkpoint_config = None
+            
+            if model_path and os.path.exists(model_path):
+                try:
+                    checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
+                    if 'config' in checkpoint:
+                        checkpoint_config = checkpoint['config']
+                        logger.info(f"Loaded config from checkpoint: state_dim={checkpoint_config.get('marl', {}).get('state_dim')}, "
+                                   f"num_strategies={checkpoint_config.get('egt', {}).get('num_strategies')}")
+                except Exception as e:
+                    logger.warning(f"Failed to load checkpoint config: {e}")
+            
+            # 为EGT-MARL创建完整配置
             egt_config = {
                 'marl': {
-                    'num_agents': num_agents,
-                    'state_dim': state_dim,
-                    'action_dim': action_dim,
-                    'hidden_dim': 128,      # 与训练一致
-                    'mixing_hidden_dim': 64,  # 与训练一致
-                    'attention_heads': 4,    # 与训练一致（从checkpoint推断）
-                    'learning_rate': 0.0001,
+                    'num_agents': checkpoint_config.get('marl', {}).get('num_agents', num_agents),
+                    'state_dim': checkpoint_config.get('marl', {}).get('state_dim', state_dim),
+                    'action_dim': checkpoint_config.get('marl', {}).get('action_dim', action_dim),
+                    'hidden_dim': checkpoint_config.get('marl', {}).get('hidden_dim', 128),
+                    'mixing_hidden_dim': checkpoint_config.get('marl', {}).get('mixing_hidden_dim', 64),
+                    'attention_heads': checkpoint_config.get('marl', {}).get('attention_heads', 4),
+                    'learning_rate': checkpoint_config.get('marl', {}).get('learning_rate', 0.001),
                     'epsilon_start': 1.0,
                     'epsilon_decay': 0.995,
                     'epsilon_min': 0.01,
                     'gamma': 0.99,
                     'tau': 0.005,
-                    'batch_size': 32,
-                    'buffer_size': 10000,
+                    'batch_size': checkpoint_config.get('marl', {}).get('batch_size', 32),
+                    'buffer_size': checkpoint_config.get('marl', {}).get('buffer_size', 5000),
                     'update_frequency': 4
                 },
                 'egt': {
                     'fairness_weight': 0.3,
                     'efficiency_weight': 0.7,
                     'anti_spoofing_threshold': 0.1,
-                    'num_strategies': 5,  # 与训练一致
-                    'learning_rate': 0.001,
+                    'num_strategies': checkpoint_config.get('egt', {}).get('num_strategies', 3),
+                    'learning_rate': checkpoint_config.get('egt', {}).get('learning_rate', 0.01),
                     'mutation_rate': 0.01,
                     'selection_intensity': 1.0,
                     'egt_lambda': 0.5
                 },
                 'anti_spoofing': {
-                    'observation_dim': 128,  # 与训练一致（注意：这是内部观察维度，不是环境state_dim）
-                    'hidden_dim': 64,         # 与训练一致
-                    'detection_threshold': 0.8,  # 与训练一致
+                    'observation_dim': checkpoint_config.get('anti_spoofing', {}).get('observation_dim', state_dim),
+                    'hidden_dim': 64,
+                    'detection_threshold': 0.8,
                     'prior_belief': 0.5,
                     'evidence_strength': 0.7,
                     'reputation_decay': 0.99,
@@ -222,15 +236,15 @@ class BaselineEvaluator:
                     'detection_reward': 0.2
                 },
                 'dynamic_frontier': {
-                    'num_objectives': 3,           # 与训练一致
-                    'frontier_size': 50,           # 与训练一致
-                    'update_frequency': 100,        # 与训练一致
-                    'weight_adaptation_rate': 0.05,  # 与训练一致
-                    'min_weight': 0.1,             # 与训练一致
-                    'max_weight': 0.8,             # 与训练一致
-                    'mutation_strength': 0.1,       # 与训练一致
-                    'crossover_rate': 0.7,         # 与训练一致
-                    'elitism_rate': 0.1            # 与训练一致
+                    'num_objectives': 3,
+                    'frontier_size': 50,
+                    'update_frequency': 100,
+                    'weight_adaptation_rate': 0.05,
+                    'min_weight': 0.1,
+                    'max_weight': 0.8,
+                    'mutation_strength': 0.1,
+                    'crossover_rate': 0.7,
+                    'elitism_rate': 0.1
                 }
             }
             
@@ -239,10 +253,34 @@ class BaselineEvaluator:
                 config=egt_config
             )
             
-            # 加载预训练模型（如果提供）
-            model_path = algo_config['egt_marl'].get('model_path')
+            # 加载预训练模型
             if model_path and os.path.exists(model_path):
                 self._load_algorithm_model('EGT-MARL', model_path)
+        
+        # 初始化 QMIX
+        if algo_config['qmix']['enabled']:
+            qmix_config = {
+                'num_agents': num_agents,
+                'state_dim': state_dim,
+                'action_dim': action_dim,
+                'hidden_dim': 128,
+                'mixing_hidden_dim': 64,
+                'attention_heads': 4,
+                'learning_rate': 0.0001,
+                'gamma': 0.99,
+                'tau': 0.005,
+                'batch_size': 32,
+                'buffer_size': 10000
+            }
+            self.algorithms['QMIX'] = ImprovedQMIX(
+                env=self.env,
+                config=qmix_config
+            )
+            
+            # 加载预训练模型（如果有）
+            qmix_model_path = algo_config['qmix'].get('model_path')
+            if qmix_model_path and os.path.exists(qmix_model_path):
+                self._load_algorithm_model('QMIX', qmix_model_path)
         
         # 初始化传统方法
         if algo_config['fcfs']['enabled']:
@@ -403,7 +441,7 @@ class BaselineEvaluator:
         
         return PriorityPolicy(self.env.num_agents, self.env)
     def _create_greedy_policy(self):
-        """创建局部贪心算法"""
+        """创建局部贪心算法 - 贪心选择最近受害者"""
         class GreedyPolicy:
             def __init__(self, num_agents: int, env):
                 self.num_agents = num_agents
@@ -413,7 +451,31 @@ class BaselineEvaluator:
             def select_actions(self, state, epsilon=0.0):
                 actions = []
                 for i in range(self.num_agents):
-                    action = np.random.randint(0, 5)
+                    if hasattr(self.env, 'rescue_agents') and i < len(self.env.rescue_agents):
+                        agent = list(self.env.rescue_agents.values())[i]
+                        nearest_casualty = None
+                        min_distance = float('inf')
+                        
+                        # 贪心选择最近的未处理受害者
+                        for casualty in self.env.casualties.values():
+                            if not casualty.treated:
+                                distance = np.linalg.norm(agent.position - casualty.position)
+                                if distance < min_distance:
+                                    min_distance = distance
+                                    nearest_casualty = casualty
+                        
+                        if nearest_casualty:
+                            direction = nearest_casualty.position - agent.position
+                            if np.linalg.norm(direction) > 0:
+                                direction = direction / np.linalg.norm(direction)
+                                angle = np.arctan2(direction[1], direction[0])
+                                action = int((angle + np.pi) / (2 * np.pi) * 8) % 8
+                            else:
+                                action = 0
+                        else:
+                            action = 0
+                    else:
+                        action = 0
                     actions.append(action)
                 return actions
             
@@ -423,21 +485,59 @@ class BaselineEvaluator:
         return GreedyPolicy(self.env.num_agents, self.env)
     
     def _create_proportional_fair_policy(self):
-        """创建比例公平算法"""
+        """创建比例公平算法 - 平衡效率和公平性"""
         class ProportionalFairPolicy:
             def __init__(self, num_agents: int, env):
                 self.num_agents = num_agents
                 self.env = env
                 self.name = "Proportional-Fair"
                 self.fairness_weight = 0.3
+                self.agent_rescue_count = {}  # 跟踪每个agent的救援次数
             
             def select_actions(self, state, epsilon=0.0):
                 actions = []
                 for i in range(self.num_agents):
-                    if np.random.random() < self.fairness_weight:
-                        action = np.random.randint(0, 5)
+                    if hasattr(self.env, 'rescue_agents') and i < len(self.env.rescue_agents):
+                        agent = list(self.env.rescue_agents.values())[i]
+                        best_casualty = None
+                        best_score = -float('inf')
+                        
+                        # 比例公平评分 = 效率得分 - λ * 公平性惩罚
+                        lambda_fair = self.fairness_weight
+                        
+                        for casualty in self.env.casualties.values():
+                            if not casualty.treated:
+                                # 效率得分：基于距离和严重程度
+                                distance = np.linalg.norm(agent.position - casualty.position)
+                                severity_score = {
+                                    'critical': 4, 'severe': 3, 'moderate': 2, 'mild': 1
+                                }.get(casualty.severity.value, 1)
+                                efficiency = severity_score / max(distance, 1)
+                                
+                                # 公平性惩罚：避免重复救援同一区域
+                                fairness_penalty = 0
+                                if hasattr(casualty, 'assigned_agent'):
+                                    fairness_penalty = 0.5  # 已分配过的受害者惩罚
+                                
+                                # 综合得分
+                                score = efficiency - lambda_fair * fairness_penalty
+                                
+                                if score > best_score:
+                                    best_score = score
+                                    best_casualty = casualty
+                        
+                        if best_casualty:
+                            direction = best_casualty.position - agent.position
+                            if np.linalg.norm(direction) > 0:
+                                direction = direction / np.linalg.norm(direction)
+                                angle = np.arctan2(direction[1], direction[0])
+                                action = int((angle + np.pi) / (2 * np.pi) * 8) % 8
+                            else:
+                                action = 0
+                        else:
+                            action = 0
                     else:
-                        action = np.random.randint(0, 5)
+                        action = 0
                     actions.append(action)
                 return actions
             
@@ -447,31 +547,114 @@ class BaselineEvaluator:
         return ProportionalFairPolicy(self.env.num_agents, self.env)
     
     def _create_standard_marl_policy(self):
-        """创建标准MARL算法"""
+        """
+        创建标准MARL算法 (Standard-MARL)
+        
+        根据论文，Standard-MARL是标准QMIX：
+        - 只有MARL层，无EGT调节
+        - 无抗欺骗机制
+        - 无动态帕累托前沿
+        - 仅使用全局存活人数作为奖励
+        """
         class StandardMARLPolicy:
             def __init__(self, num_agents: int, env):
                 self.num_agents = num_agents
                 self.env = env
                 self.name = "Standard-MARL"
-                self.agent_policies = [self._create_single_agent_policy(i) for i in range(num_agents)]
+                # Q-learning表，用于简单的基于值函数的策略
+                self.q_table = {}
+                self.learning_rate = 0.1
+                self.gamma = 0.99
+                self.epsilon = 0.1
+                
+            def _get_q_value(self, state_key, action):
+                """获取Q值"""
+                if state_key not in self.q_table:
+                    self.q_table[state_key] = np.zeros(8)  # 8个动作
+                return self.q_table[state_key][action]
             
-            def _create_single_agent_policy(self, agent_id: int):
-                """为单个智能体创建策略"""
-                def policy(state):
-                    # 基于状态选择动作的简单策略
-                    # 随机选择一个动作
-                    return np.random.randint(0, 8)
-                return policy
+            def _get_state_key(self):
+                """从环境获取简化的状态键"""
+                # 简化的状态表示：最近的受害者位置区域
+                if not hasattr(self.env, 'casualties'):
+                    return "default"
+                
+                active_casualties = [c for c in self.env.casualties.values() if not c.treated]
+                if not active_casualties:
+                    return "no_casualties"
+                
+                # 按区域聚合受害者
+                regions = {}
+                for c in active_casualties:
+                    region = (int(c.position[0] // 200), int(c.position[1] // 200))
+                    if region not in regions:
+                        regions[region] = []
+                    regions[region].append(c)
+                
+                # 找到受害者最多的区域
+                best_region = max(regions.keys(), key=lambda r: len(regions[r]))
+                return f"region_{best_region}_{len(regions[best_region])}"
             
             def select_actions(self, state, epsilon=0.0):
                 actions = []
+                state_key = self._get_state_key()
+                
                 for i in range(self.num_agents):
-                    if np.random.random() < epsilon:
-                        action = np.random.randint(0, 8)
+                    if hasattr(self.env, 'rescue_agents') and i < len(self.env.rescue_agents):
+                        agent = list(self.env.rescue_agents.values())[i]
+                        
+                        # ε-贪心策略
+                        if np.random.random() < (epsilon if epsilon > 0 else self.epsilon):
+                            # 探索：随机动作
+                            action = np.random.randint(0, 8)
+                        else:
+                            # 利用：选择Q值最高的动作
+                            q_values = [self._get_q_value(f"{state_key}_agent{i}", a) for a in range(8)]
+                            action = np.argmax(q_values)
+                        
+                        # 根据动作移动
+                        if action == 0:  # 北
+                            direction = np.array([0, 1])
+                        elif action == 1:  # 东北
+                            direction = np.array([0.707, 0.707])
+                        elif action == 2:  # 东
+                            direction = np.array([1, 0])
+                        elif action == 3:  # 东南
+                            direction = np.array([0.707, -0.707])
+                        elif action == 4:  # 南
+                            direction = np.array([0, -1])
+                        elif action == 5:  # 西南
+                            direction = np.array([-0.707, -0.707])
+                        elif action == 6:  # 西
+                            direction = np.array([-1, 0])
+                        elif action == 7:  # 西北
+                            direction = np.array([-0.707, 0.707])
+                        
+                        actions.append(action)
                     else:
-                        action = self.agent_policies[i](state)
-                    actions.append(action)
+                        actions.append(0)
+                
                 return actions
+            
+            def update(self, state, actions, reward, next_state):
+                """Q-learning更新"""
+                state_key = self._get_state_key()
+                next_state_key = self._get_state_key()
+                
+                for i, action in enumerate(actions):
+                    key = f"{state_key}_agent{i}"
+                    if key not in self.q_table:
+                        self.q_table[key] = np.zeros(8)
+                    
+                    # 获取当前和最大Q值
+                    current_q = self.q_table[key][action]
+                    next_qs = [self._get_q_value(f"{next_state_key}_agent{i}", a) for a in range(8)]
+                    max_next_q = max(next_qs) if next_qs else 0
+                    
+                    # Q-learning更新
+                    self.q_table[key][action] = current_q + self.learning_rate * (
+                        reward + self.gamma * max_next_q - current_q
+                    )
             
             def get_name(self):
                 return self.name
@@ -479,19 +662,106 @@ class BaselineEvaluator:
         return StandardMARLPolicy(self.env.num_agents, self.env)
     
     def _create_mpc_policy(self):
-        """创建集中式MPC算法"""
+        """
+        创建集中式MPC算法 (Centralized-MPC)
+        
+        根据论文，Centralized-MPC假设完美信息：
+        - 使用集中式优化（贪婪近似）
+        - 假设全局信息已知
+        - 优化全局资源分配
+        """
         class MPCPolicy:
             def __init__(self, num_agents: int, env):
                 self.num_agents = num_agents
                 self.env = env
                 self.name = "Centralized-MPC"
-                self.horizon = 72
+                self.horizon = 20  # 预测范围
+            
+            def _score_casualty(self, casualty, agent):
+                """计算受害者-智能体对的得分"""
+                # 距离得分（越近越高）
+                distance = np.linalg.norm(casualty.position - agent.position)
+                distance_score = 1.0 / (1.0 + distance / 100)
+                
+                # 严重程度得分
+                severity_score = {
+                    'critical': 1.0,
+                    'severe': 0.75,
+                    'moderate': 0.5,
+                    'mild': 0.25
+                }.get(casualty.severity.value, 0.25)
+                
+                # 生存概率得分（越低越紧急）
+                survival_prob = casualty.survival_probability if hasattr(casualty, 'survival_probability') else 0.5
+                urgency_score = 1.0 - survival_prob
+                
+                return 0.4 * distance_score + 0.4 * severity_score + 0.2 * urgency_score
             
             def select_actions(self, state, epsilon=0.0):
+                """
+                集中式选择：假设完美信息，全局最优分配
+                使用贪婪近似求解分配问题
+                """
                 actions = []
+                
+                if not hasattr(self.env, 'casualties') or not hasattr(self.env, 'rescue_agents'):
+                    return [0] * self.num_agents
+                
+                # 获取未处理受害者
+                unassigned_casualties = []
+                for c in self.env.casualties.values():
+                    if not c.treated and not hasattr(c, 'assigned') or not c.assigned:
+                        unassigned_casualties.append(c)
+                
+                # 获取可用智能体
+                available_agents = list(self.env.rescue_agents.values())[:self.num_agents]
+                
+                # 贪婪分配：每个受害者分配给得分最高的智能体
+                assignments = {}  # agent_id -> casualty
+                assigned_casualties = set()
+                
+                for casualty in sorted(unassigned_casualties, 
+                                       key=lambda c: {'critical': 0, 'severe': 1, 'moderate': 2, 'mild': 3}.get(c.severity.value, 4)):
+                    if casualty in assigned_casualties:
+                        continue
+                    
+                    best_agent = None
+                    best_score = -float('inf')
+                    
+                    for agent in available_agents:
+                        score = self._score_casualty(casualty, agent)
+                        if score > best_score:
+                            best_score = score
+                            best_agent = agent
+                    
+                    if best_agent is not None:
+                        agent_id = list(self.env.rescue_agents.keys())[list(self.env.rescue_agents.values()).index(best_agent)]
+                        assignments[agent_id] = casualty
+                        assigned_casualties.add(casualty)
+                
+                # 为每个智能体生成动作
                 for i in range(self.num_agents):
-                    action = np.random.randint(0, 5)
+                    if i < len(available_agents):
+                        agent = available_agents[i]
+                        agent_id = list(self.env.rescue_agents.keys())[i]
+                        
+                        if agent_id in assignments:
+                            target = assignments[agent_id]
+                            direction = target.position - agent.position
+                            if np.linalg.norm(direction) > 0:
+                                direction = direction / np.linalg.norm(direction)
+                                angle = np.arctan2(direction[1], direction[0])
+                                action = int((angle + np.pi) / (2 * np.pi) * 8) % 8
+                            else:
+                                action = 0
+                        else:
+                            # 没有分配受害者，留在原地或随机移动
+                            action = 0
+                    else:
+                        action = 0
+                    
                     actions.append(action)
+                
                 return actions
             
             def get_name(self):

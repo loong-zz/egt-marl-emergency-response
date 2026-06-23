@@ -615,6 +615,7 @@ class RobustnessTester:
             'steps': 0,
             'rescued': 0,
             'deaths': 0,
+            'resources_used': 0,
             'resource_shock': 0,
             'adaptation_steps': 0
         }

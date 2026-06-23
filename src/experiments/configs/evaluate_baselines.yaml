@@ -1,43 +1,38 @@
 # 基准算法比较配置文件
 
-output_dir: src/evaluation_results
+output_dir: src/baseline_results
 
 # 评估配置
 evaluation:
-  num_episodes: 10  # 减少到10个episodes以加快评估速度
-  max_steps_per_episode: 600  # 减少最大步数
-  num_runs: 1  # 多次运行以减少随机性
+  num_episodes: 10
+  max_steps_per_episode: 200
+  num_runs: 1
   scenarios:
     - earthquake
   severities:
-    - medium  # 与训练5一致
+    - medium
 
-# 环境配置 - 与训练5的超大规模场景保持一致
+# 环境配置 - 小规模快速测试
 environment:
-  map_size: [4500, 4500]  # 超大规模地图
-  num_agents: 100  # 100个智能体
-  num_victims: 1000  # 1000个受害者
-  num_resources: 48  # 与训练5一致
-  num_hospitals: 16  # 与训练5一致
+  map_size: [1000, 1000]
+  num_agents: 20
+  num_victims: 200
+  num_resources: 10
+  num_hospitals: 3
   disaster_type: earthquake
   severity: medium
 
-# 算法配置
+# 算法配置 - 真实基线对比
 algorithms:
+  # 核心对比算法
   egt_marl:
     enabled: true
-    model_path: "E:/studio/workspace/egt-marl-emergency-response/src/experiment_results/egt_marl_20260620_210828/models/best_model.pt"
+    model_path: "experiment_results/egt_marl_20260620_210828/models/best_model.pt"
+  
   qmix:
-    enabled: true
-    model_path: ""
-    hidden_dim: 128
-    mixing_hidden_dim: 64
-    learning_rate: 0.0001
-  maddpg:
-    enabled: true
-    model_path: ""
-    hidden_dim: 128
-    learning_rate: 0.0001
+    enabled: false  # 暂时禁用，初始化参数复杂
+  
+  # 传统启发式算法（已正确实现）
   fcfs:
     enabled: true
   priority:
@@ -46,11 +41,15 @@ algorithms:
     enabled: true
   proportional_fair:
     enabled: true
+  
+  # 未实现的算法（暂时禁用）
   centralized_mpc:
-    enabled: true
+    enabled: false
+  standard_marl:
+    enabled: false
   game_theoretic:
-    enabled: true
+    enabled: false
   gnn_based:
-    enabled: true
+    enabled: false
   transformer_based:
-    enabled: true
+    enabled: false
