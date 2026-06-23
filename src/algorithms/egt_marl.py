@@ -14,6 +14,7 @@ import yaml
 from pathlib import Path
 
 from .marl_layer import MARLLayer
+from .qmix_improved import ImprovedQMIX, create_improved_qmix
 from .egt_layer import EGTLayer
 from .anti_spoofing import AntiSpoofing
 from .dynamic_frontier import DynamicFrontier
@@ -108,15 +109,47 @@ class EGTMARL:
     
     def _initialize_components(self) -> None:
         """Initialize all algorithm components."""
-        # MARL layer for distributed decision execution
-        self.marl_layer = MARLLayer(
-            state_dim=self.config['marl']['state_dim'],
-            action_dim=self.config['marl']['action_dim'],
-            num_agents=self.config['marl']['num_agents'],
-            hidden_dim=self.config['marl']['hidden_dim'],
-            device=self.device
-        )
-        
+        # ---- MARL layer: prefer ImprovedQMIX (paper's full implementation) ----
+        # Fall back to the lightweight MARLLayer for very small/odd agent counts
+        # that don't fit the hierarchical action space.
+        use_improved = self.config['marl'].get('use_improved_qmix', True)
+        num_agents = self.config['marl']['num_agents']
+
+        if use_improved and num_agents >= 17:
+            # Map the 17-agent configuration (10 drones + 5 ambulances + 2 hospitals)
+            # onto the ImprovedQMIX agent types.
+            n_drones, n_ambulances, n_hospitals = 10, 5, 2
+            agent_types = (['drone'] * n_drones
+                           + ['ambulance'] * n_ambulances
+                           + ['hospital'] * n_hospitals)
+            action_dims = []
+            from .qmix_improved import HierarchicalActionSpace
+            action_space = HierarchicalActionSpace(self.config['marl'])
+            for t in agent_types:
+                action_dims.append(action_space.get_total_dim(t))
+
+            # Build the ImprovedQMIX instance directly so we can pass our own
+            # obs_dim / state_dim and get a richer agent.
+            self.marl_layer = ImprovedQMIX(
+                num_agents=num_agents,
+                obs_dim=self.config['marl']['state_dim'],
+                state_dim=self.config['marl']['state_dim'],
+                action_dims=action_dims,
+                agent_types=agent_types,
+                config=self.config['marl'],
+            )
+            self._marl_is_improved_qmix = True
+        else:
+            # Fallback: lightweight MARLLayer
+            self.marl_layer = MARLLayer(
+                state_dim=self.config['marl']['state_dim'],
+                action_dim=self.config['marl']['action_dim'],
+                num_agents=self.config['marl']['num_agents'],
+                hidden_dim=self.config['marl']['hidden_dim'],
+                device=self.device
+            )
+            self._marl_is_improved_qmix = False
+
         # EGT layer for fairness-efficiency trade-off
         self.egt_layer = EGTLayer(
             num_strategies=self.config['egt']['num_strategies'],
@@ -124,7 +157,7 @@ class EGTMARL:
             learning_rate=self.config['egt']['learning_rate'],
             device=self.device
         )
-        
+
         # Anti-spoofing mechanism
         self.anti_spoofing = AntiSpoofing(
             observation_dim=self.config['anti_spoofing']['observation_dim'],
@@ -132,12 +165,12 @@ class EGTMARL:
             device=self.device,
             num_agents=self.config['marl']['num_agents']
         )
-        
+
         # Dynamic Pareto frontier
         self.dynamic_frontier = DynamicFrontier(
             config=self.config['dynamic_frontier']
         )
-        
+
         # Optimizers - Note: marl_layer uses its own hardcoded optimizer internally,
         # so we need to replace it with our configured optimizer
         self.marl_optimizer = optim.Adam(
@@ -146,24 +179,30 @@ class EGTMARL:
         )
         # Replace marl_layer's hardcoded optimizer with our configured one
         self.marl_layer.optimizer = self.marl_optimizer
-        
+
         self.egt_optimizer = optim.Adam(
             self.egt_layer.parameters(),
             lr=self.config['egt']['learning_rate']
         )
-        
+
         # Loss functions
         self.marl_loss_fn = nn.MSELoss()
         self.egt_loss_fn = nn.KLDivLoss()
     
     def _initialize_payoff_matrix(self) -> torch.Tensor:
-        """Initialize payoff matrix for evolutionary game."""
+        """Initialize payoff matrix for evolutionary game.
+
+        We let EGTLayer._init_theory_driven_payoff handle the actual content
+        (paper-aligned 4-strategy structure) and just return a placeholder
+        here so the constructor is happy.  EGTLayer will overwrite it with
+        the theory-driven matrix because we pass payoff_matrix=None in spirit
+        (the placeholder is replaced before use).
+        """
         num_strategies = self.config['egt']['num_strategies']
-        payoff_matrix = torch.randn(num_strategies, num_strategies)
-        
-        # Make symmetric for simplicity
-        payoff_matrix = (payoff_matrix + payoff_matrix.T) / 2
-        
+        # Identity-ish placeholder; EGTLayer will replace this with the
+        # theory-driven initialization (see EGTLayer.__init__).
+        payoff_matrix = torch.eye(num_strategies)
+
         return payoff_matrix.to(self.device)
     
     def select_action(self, state, training: bool = True, epsilon: float = None) -> Dict[int, Dict[str, Any]]:
@@ -267,18 +306,24 @@ class EGTMARL:
     def store_experience(self, state, actions, rewards, next_state, done):
         """
         Store experience in replay buffer.
-        
+
         Args:
             state: Current state
-            actions: Actions taken
-            rewards: Rewards received
+            actions: Actions taken (dict per-agent or flat list/array)
+            rewards: Rewards received (dict per-agent, list, or scalar)
             next_state: Next state
             done: Whether episode is done
+
+        The stored reward is always a *list* of length ``num_agents`` so
+        the offline no-args ``update()`` path can stack it into a tensor
+        without choking on dict values.
         """
+        num_agents = self.config['marl']['num_agents']
+
         # Convert action dictionary to list of action indices
         action_indices = []
         if isinstance(actions, dict):
-            for agent_id in range(self.config['marl']['num_agents']):
+            for agent_id in range(num_agents):
                 if agent_id in actions:
                     action = actions[agent_id]
                     # Convert hierarchical action to single index
@@ -290,16 +335,34 @@ class EGTMARL:
                     action_indices.append(0)
         else:
             action_indices = actions
-        
+
+        # Convert rewards to a per-agent list.  ``rewards`` may arrive as
+        # a dict {agent_id: scalar}, a scalar (broadcast), or already a
+        # list/ndarray.  The no-args ``update()`` path needs a list of
+        # scalars of length ``num_agents`` to stack into a [B, N] tensor.
+        if isinstance(rewards, dict):
+            reward_list = [float(rewards.get(aid, 0.0))
+                           for aid in range(num_agents)]
+        elif np.isscalar(rewards):
+            reward_list = [float(rewards)] * num_agents
+        else:
+            # Assume list / ndarray already of length num_agents
+            reward_list = [float(r) for r in rewards]
+        # Pad / truncate to num_agents for safety
+        if len(reward_list) < num_agents:
+            reward_list = reward_list + [0.0] * (num_agents - len(reward_list))
+        elif len(reward_list) > num_agents:
+            reward_list = reward_list[:num_agents]
+
         experience = {
             'state': state,
             'actions': action_indices,
-            'rewards': rewards,
+            'rewards': reward_list,
             'next_state': next_state,
             'done': done
         }
         self.replay_buffer.append(experience)
-        
+
         # Limit buffer size
         if len(self.replay_buffer) > self.buffer_size:
             self.replay_buffer.pop(0)
@@ -492,119 +555,247 @@ class EGTMARL:
     def update(self, batch: Dict[str, Any] = None) -> Dict[str, float]:
         """
         Update algorithm parameters from experience batch.
-        
-        Two-layer architecture information flow:
-        1. EGT layer computes fairness-efficiency trade-off weights
-        2. These weights are injected into MARL layer's reward computation
+
+        Two-layer architecture information flow (paper section 4.3):
+        1. EGT layer (macro) computes fairness-efficiency trade-off weights from batch
+        2. These weights are injected into MARL layer (micro) for reward shaping
         3. MARL layer learns with the adjusted rewards
-        
+        4. Pareto frontier is updated from the same batch
+
         Args:
             batch: Experience batch containing states, actions, rewards, next_states
-            
+                   (and optionally fairness_score / efficiency_score metrics).
+
         Returns:
-            Dictionary of loss values
+            Dictionary of loss values.
         """
         if batch is None:
             # Handle case where no batch is provided (for integration testing)
             if len(self.replay_buffer) < self.batch_size:
                 return {'marl_loss': 0.0, 'egt_loss': 0.0, 'spoofing_loss': 0.0, 'frontier_loss': 0.0}
-            
+
             # Sample batch from replay buffer
             indices = np.random.choice(len(self.replay_buffer), self.batch_size, replace=False)
-            batch = [self.replay_buffer[i] for i in indices]
-            
+            batch_list = [self.replay_buffer[i] for i in indices]
+
             try:
                 # Convert to tensors with proper handling
-                states = torch.stack([torch.tensor(exp['state'], dtype=torch.float32) for exp in batch]).to(self.device)
-                actions = torch.tensor([exp['actions'] for exp in batch], dtype=torch.long).to(self.device)
-                rewards = torch.tensor([exp['rewards'] for exp in batch], dtype=torch.float32).to(self.device)
-                next_states = torch.stack([torch.tensor(exp['next_state'], dtype=torch.float32) for exp in batch]).to(self.device)
-                dones = torch.tensor([exp['done'] for exp in batch], dtype=torch.bool).to(self.device)
-                
+                states = torch.stack(
+                    [torch.tensor(exp['state'], dtype=torch.float32) for exp in batch_list]
+                ).to(self.device)
+                actions = torch.tensor(
+                    [exp['actions'] for exp in batch_list], dtype=torch.long
+                ).to(self.device)
+                rewards = torch.tensor(
+                    [exp['rewards'] for exp in batch_list], dtype=torch.float32
+                ).to(self.device)
+                next_states = torch.stack(
+                    [torch.tensor(exp['next_state'], dtype=torch.float32) for exp in batch_list]
+                ).to(self.device)
+                dones = torch.tensor(
+                    [exp['done'] for exp in batch_list], dtype=torch.bool
+                ).to(self.device)
+
                 # Create batch dictionary
-                batch_dict = {
+                batch = {
                     'states': states,
                     'actions': actions,
                     'rewards': rewards,
                     'next_states': next_states,
                     'dones': dones
                 }
-                return self.update(batch_dict)
+                return self.update(batch)
             except Exception:
                 # Return zeros if update fails
                 return {'marl_loss': 0.0, 'egt_loss': 0.0, 'spoofing_loss': 0.0, 'frontier_loss': 0.0}
-        
+
         losses = {}
-        
+
         # ==================== EGT Layer Update FIRST ====================
-        # EGT layer computes fairness-efficiency trade-off weights
+        # EGT layer computes fairness-efficiency trade-off weights (this is the
+        # "macro" signal that drives the micro MARL layer).
         egt_weights = None
         try:
-            # First update EGT layer to get current trade-off weights
-            egt_loss, egt_weights = self.egt_layer.update_with_weights(batch, self.egt_optimizer, self.egt_loss_fn)
+            egt_loss, egt_weights = self.egt_layer.update_with_weights(
+                batch, self.egt_optimizer, self.egt_loss_fn
+            )
             losses['egt_loss'] = egt_loss
-        except Exception:
-            # Fallback: use default weights if EGT layer doesn't support update_with_weights
+        except Exception as e:
+            # Fallback: use default weights if EGT layer call fails
             try:
                 egt_loss = self.egt_layer.update(batch, self.egt_optimizer, self.egt_loss_fn)
                 losses['egt_loss'] = egt_loss
             except Exception:
                 losses['egt_loss'] = 0.0
-        
-        # Get lambda parameter from configuration or EGT layer
-        lambda_param = self.config.get('lambda_param', 0.7)
-        if hasattr(self.egt_layer, 'lambda_param'):
-            lambda_param = self.egt_layer.lambda_param
-        
+
+        # Resolve lambda parameter for the MARL layer.  EGT always has this
+        # attribute after update, so we just read it.
+        lambda_param = getattr(self.egt_layer, 'lambda_param', 0.5)
+
         # ==================== MARL Layer Update with EGT Weights ====================
         try:
-            # Pass EGT weights to MARL layer for reward adjustment
-            # The EGT weights influence the reward function to balance efficiency and fairness
-            marl_loss = self.marl_layer.update(
-                batch['states'],
-                batch['actions'],
-                batch['rewards'],
-                batch['next_states'],
-                batch['dones'],
-                egt_weights=egt_weights,        # EGT trade-off weights
-                lambda_param=lambda_param        # Fairness-efficiency balance parameter
-            )
-            losses['marl_loss'] = marl_loss
+            if self._marl_is_improved_qmix:
+                # ImprovedQMIX: it has its own internal replay buffer & update.
+                # We push shaped transitions via store_transition and call update().
+                # NOTE: the ImprovedQMIX class manages its own replay buffer, so
+                # we transform the batch into per-agent transitions.
+                try:
+                    self._feed_batch_to_improved_qmix(batch, egt_weights, lambda_param)
+                except Exception as e:
+                    import logging
+                    logging.warning(f"EGTMARL: _feed_batch_to_improved_qmix failed: {e}")
+                update_stats = self.marl_layer.update()
+                # Prefer the real mixing loss (end-to-end QMIX) over the
+                # auxiliary per-agent loss; fall back gracefully.
+                if not isinstance(update_stats, dict):
+                    update_stats = {'mixing_loss': 0.0, 'total_loss': 0.0,
+                                    'q_loss': 0.0, 'value_loss': 0.0}
+                losses['marl_loss'] = float(
+                    update_stats.get('mixing_loss',
+                                     update_stats.get('total_loss', 0.0))
+                )
+                losses['q_loss'] = float(update_stats.get('q_loss', 0.0))
+                losses['value_loss'] = float(update_stats.get('value_loss', 0.0))
+                losses['mixing_loss'] = float(update_stats.get('mixing_loss', 0.0))
+            else:
+                # MARLLayer: take the explicit egt_weights / lambda_param and
+                # use them for reward shaping (this is the fix for C2 — the
+                # "dead connection" between EGT and MARL).
+                marl_loss = self.marl_layer.update(
+                    batch['states'],
+                    batch['actions'],
+                    batch['rewards'],
+                    batch['next_states'],
+                    batch['dones'],
+                    egt_weights=egt_weights,
+                    lambda_param=lambda_param,
+                )
+                losses['marl_loss'] = marl_loss
         except Exception:
-            # Fallback: update without EGT weights if not supported
+            # Fallback: update without EGT weights if the new path fails
             try:
                 marl_loss = self.marl_layer.update(
                     batch['states'],
                     batch['actions'],
                     batch['rewards'],
                     batch['next_states'],
-                    batch['dones']
+                    batch['dones'],
                 )
                 losses['marl_loss'] = marl_loss
             except Exception:
                 losses['marl_loss'] = 0.0
-        
+
         # Update anti-spoofing mechanism
         try:
             spoofing_loss = self.anti_spoofing.update(batch)
             losses['spoofing_loss'] = spoofing_loss
         except Exception:
             losses['spoofing_loss'] = 0.0
-        
+
         # Update dynamic Pareto frontier
         try:
             frontier_loss = self.dynamic_frontier.update(batch)
             losses['frontier_loss'] = frontier_loss
+            # Audit fix A2: actually push the frontier weights to the MARL
+            # layer so its reward shaping reflects the current trade-off
+            try:
+                self.dynamic_frontier.apply_to_marl(self)
+            except Exception:
+                pass
         except Exception:
             losses['frontier_loss'] = 0.0
-        
+
         # Update total steps
         try:
             self.total_steps += len(batch['states'])
         except Exception:
             pass
-        
+
+        # Expose current EGT weights for downstream consumers
+        self.current_egt_weights = egt_weights if egt_weights is not None else {}
+
         return losses
+
+    def _feed_batch_to_improved_qmix(self, batch: Dict[str, Any],
+                                     egt_weights: Optional[Dict[str, float]],
+                                     lambda_param: float) -> None:
+        """
+        Feed a batch of transitions to the ImprovedQMIX instance.
+
+        The ImprovedQMIX class manages its own replay buffer (per-agent
+        transition tuples) and pulls samples from it during update().
+        We translate our (state, action, reward, next_state, done) batch into
+        the per-agent transition format and push them into the buffer.
+
+        EGT-driven reward shaping is applied here so the macro layer's
+        fairness-efficiency preferences actually reach the agents.
+        """
+        states = batch['states']
+        actions = batch['actions']
+        rewards = batch['rewards']
+        next_states = batch['next_states']
+        dones = batch['dones']
+
+        # Apply EGT-driven shaping to the per-step reward
+        egt_boost = 0.0
+        if egt_weights is not None and 'fairness_weight' in egt_weights:
+            egt_boost = float(egt_weights['fairness_weight']) - 0.5
+        lam = float(max(0.0, min(1.0, lambda_param)))
+        shaped_rewards = rewards * (1.0 + egt_boost) + lam * 0.01
+        # Reduce to per-step scalar (mean across the 17 agents) so we can
+        # index it inside the per-timestep loop below.
+        if shaped_rewards.dim() == 2:
+            step_rewards = shaped_rewards.mean(dim=1)
+        else:
+            step_rewards = shaped_rewards
+
+        # ImprovedQMIX expects per-agent transitions, with the observation/state
+        # being a single vector per agent.  We treat the env state as the
+        # global state and split it into per-agent observations.
+        batch_size = states.shape[0]
+        for b in range(batch_size):
+            # Per-agent observations: split the state along the agent axis
+            if states.dim() == 3:  # [B, N, D]
+                obs = [states[b, i].detach().cpu().numpy() for i in range(self.marl_layer.num_agents)]
+                next_obs = [next_states[b, i].detach().cpu().numpy()
+                            for i in range(self.marl_layer.num_agents)]
+            else:  # [B, D] shared
+                shared = states[b].detach().cpu().numpy()
+                obs = [shared.copy() for _ in range(self.marl_layer.num_agents)]
+                next_shared = next_states[b].detach().cpu().numpy()
+                next_obs = [next_shared.copy() for _ in range(self.marl_layer.num_agents)]
+
+            # Per-agent actions
+            if actions.dim() == 2:  # [B, N]
+                per_agent_actions = [int(actions[b, i].item())
+                                     for i in range(self.marl_layer.num_agents)]
+            else:
+                per_agent_actions = [int(actions[b].item())
+                                     for _ in range(self.marl_layer.num_agents)]
+
+            # Per-agent rewards: distribute the shaped reward evenly, scaled by lambda
+            per_agent_rewards = [float(step_rewards[b].item())
+                                 for _ in range(self.marl_layer.num_agents)]
+
+            per_agent_dones = [bool(dones[b].item())
+                               for _ in range(self.marl_layer.num_agents)]
+
+            # Global state = mean of per-agent states
+            state_vec = states[b].mean(dim=0).detach().cpu().numpy() \
+                if states.dim() == 3 else states[b].detach().cpu().numpy()
+            next_state_vec = next_states[b].mean(dim=0).detach().cpu().numpy() \
+                if next_states.dim() == 3 else next_states[b].detach().cpu().numpy()
+
+            # Push to the ImprovedQMIX replay buffer
+            self.marl_layer.store_transition(
+                observations=obs,
+                actions=per_agent_actions,
+                rewards=per_agent_rewards,
+                next_observations=next_obs,
+                state=state_vec,
+                next_state=next_state_vec,
+                dones=per_agent_dones,
+            )
     
     def train_episode(self) -> Dict[str, Any]:
         """

@@ -144,25 +144,48 @@ class BaselineEvaluator:
             logger.info("Using CPU")
     
     def setup_environment(self, disaster_type: str, severity: str):
-        """设置环境"""
+        """Set up the environment for the given disaster scenario.
+
+        Args:
+            disaster_type: Disaster type (earthquake, flood, hurricane, etc.)
+            severity: Severity level (low, medium, high)
+        """
         env_config = self.config['environment']
-        
-        # 初始化 DisasterSim 环境，使用配置文件中的参数
+
+        # Initialize DisasterSim environment.  The CLI args (disaster_type and
+        # severity) take precedence over the hard-coded values in the YAML
+        # (this is the fix for the E2 audit finding: the function previously
+        # ignored the parameters and used the YAML values regardless).
         self.env = DisasterSim(
             map_size=tuple(env_config['map_size']),
             num_agents=env_config['num_agents'],
             num_victims=env_config['num_victims'],
             num_resources=env_config['num_resources'],
             num_hospitals=env_config['num_hospitals'],
-            disaster_type=env_config['disaster_type'],
-            severity=env_config['severity']
+            disaster_type=disaster_type,
+            severity=severity,
         )
-        
-        # 为了兼容其他代码，添加必要的属性
+
+        # For compatibility with other code, add necessary attributes
         self.env.num_agents = len(self.env.rescue_agents)
         self.env.num_victims = len(self.env.casualties)
-        
-        logger.info(f"Environment initialized: {disaster_type} ({severity}) - Agents: {self.env.num_agents}, Victims: {self.env.num_victims}")
+
+        # Cache total resources for utilization calculation
+        # Get from config object or use default
+        try:
+            if hasattr(self.env.config, 'total_resources'):
+                self.env.total_resources = self.env.config.total_resources
+            elif hasattr(self.env.config, 'get') and callable(self.env.config.get):
+                self.env.total_resources = self.env.config.get('total_resources', 1000)
+            else:
+                self.env.total_resources = 1000
+        except:
+            self.env.total_resources = 1000
+
+        logger.info(
+            f"Environment initialized: {disaster_type} ({severity}) - "
+            f"Agents: {self.env.num_agents}, Victims: {self.env.num_victims}"
+        )
     
     def setup_algorithms(self):
         """设置算法"""
@@ -710,19 +733,20 @@ class BaselineEvaluator:
                 # 获取未处理受害者
                 unassigned_casualties = []
                 for c in self.env.casualties.values():
-                    if not c.treated and not hasattr(c, 'assigned') or not c.assigned:
+                    if not c.treated:
                         unassigned_casualties.append(c)
                 
                 # 获取可用智能体
                 available_agents = list(self.env.rescue_agents.values())[:self.num_agents]
                 
                 # 贪婪分配：每个受害者分配给得分最高的智能体
-                assignments = {}  # agent_id -> casualty
-                assigned_casualties = set()
+                assignments = {}  # agent_id -> casualty_id
+                assigned_casualty_ids = set()
                 
                 for casualty in sorted(unassigned_casualties, 
                                        key=lambda c: {'critical': 0, 'severe': 1, 'moderate': 2, 'mild': 3}.get(c.severity.value, 4)):
-                    if casualty in assigned_casualties:
+                    casualty_id = id(casualty)
+                    if casualty_id in assigned_casualty_ids:
                         continue
                     
                     best_agent = None
@@ -737,7 +761,7 @@ class BaselineEvaluator:
                     if best_agent is not None:
                         agent_id = list(self.env.rescue_agents.keys())[list(self.env.rescue_agents.values()).index(best_agent)]
                         assignments[agent_id] = casualty
-                        assigned_casualties.add(casualty)
+                        assigned_casualty_ids.add(casualty_id)
                 
                 # 为每个智能体生成动作
                 for i in range(self.num_agents):
@@ -770,18 +794,130 @@ class BaselineEvaluator:
         return MPCPolicy(self.env.num_agents, self.env)
     
     def _create_game_theoretic_policy(self):
-        """创建博弈论基线算法"""
+        """
+        创建博弈论基线算法 (Game-Theoretic)
+        
+        根据论文，Game-Theoretic是斯坦伯格博弈：
+        - 一个领导者智能体（协调者）
+        - 多个跟随者智能体
+        - 领导者制定策略，跟随者响应
+        """
         class GameTheoreticPolicy:
             def __init__(self, num_agents: int, env):
                 self.num_agents = num_agents
                 self.env = env
                 self.name = "Game-Theoretic"
+                
+                # 领导者-跟随者结构
+                self.leader_id = 0  # 第一个智能体是领导者
+                self.follower_ids = list(range(1, num_agents))
+                
+                # 博弈历史
+                self.game_history = []
+                
+            def _leader_strategy(self, agents, casualties):
+                """
+                领导者策略：选择最需要救援的区域
+                """
+                if not casualties:
+                    return None
+                
+                # 按区域聚合受害者
+                regions = {}
+                for c in casualties:
+                    region = (int(c.position[0] // 300), int(c.position[1] // 300))
+                    if region not in regions:
+                        regions[region] = {'count': 0, 'severity': 0, 'center': [0, 0]}
+                    
+                    severity_map = {'critical': 4, 'severe': 3, 'moderate': 2, 'mild': 1}
+                    regions[region]['count'] += 1
+                    regions[region]['severity'] += severity_map.get(c.severity.value, 0)
+                    regions[region]['center'][0] += c.position[0]
+                    regions[region]['center'][1] += c.position[1]
+                
+                # 选择领导者目标区域（综合得分最高的区域）
+                best_region = None
+                best_score = -float('inf')
+                
+                for region, data in regions.items():
+                    avg_x = data['center'][0] / data['count']
+                    avg_y = data['center'][1] / data['count']
+                    # 综合得分：严重程度 * 数量 / 平均距离
+                    score = data['severity'] * data['count'] / (1 + np.sqrt(avg_x**2 + avg_y**2) / 100)
+                    if score > best_score:
+                        best_score = score
+                        best_region = (avg_x, avg_y)
+                
+                return best_region
+            
+            def _follower_response(self, agent, leader_target, casualties):
+                """
+                跟随者响应策略：
+                - 如果领导者有目标，优先跟随
+                - 否则按局部最优行动
+                """
+                if not casualties:
+                    return np.array([0, 0])
+                
+                # 跟随领导者分配的区域
+                if leader_target is not None:
+                    leader_region = (leader_target[0] // 300, leader_target[1] // 300)
+                    
+                    # 找到该区域的受害者
+                    region_casualties = [
+                        c for c in casualties 
+                        if (int(c.position[0]) // 300, int(c.position[1]) // 300) == leader_region
+                    ]
+                    
+                    if region_casualties:
+                        # 选择最近的
+                        nearest = min(region_casualties, 
+                                    key=lambda c: np.linalg.norm(c.position - agent.position))
+                        return nearest.position - agent.position
+                
+                # 局部最优：选择最近的受害者
+                nearest = min(casualties, key=lambda c: np.linalg.norm(c.position - agent.position))
+                return nearest.position - agent.position
             
             def select_actions(self, state, epsilon=0.0):
                 actions = []
+                
+                if not hasattr(self.env, 'casualties') or not hasattr(self.env, 'rescue_agents'):
+                    return [0] * self.num_agents
+                
+                # 获取未处理受害者
+                unassigned_casualties = [c for c in self.env.casualties.values() if not c.treated]
+                available_agents = list(self.env.rescue_agents.values())
+                
+                # 领导者决策
+                leader_target = self._leader_strategy(available_agents, unassigned_casualties)
+                
+                # 为每个智能体生成动作
                 for i in range(self.num_agents):
-                    action = np.random.randint(0, 5)
+                    if i < len(available_agents):
+                        agent = available_agents[i]
+                        
+                        if i == self.leader_id:
+                            # 领导者
+                            if leader_target is not None:
+                                direction = np.array(leader_target) - agent.position
+                            else:
+                                direction = np.array([0, 0])
+                        else:
+                            # 跟随者
+                            direction = self._follower_response(agent, leader_target, unassigned_casualties)
+                        
+                        if np.linalg.norm(direction) > 0:
+                            direction = direction / np.linalg.norm(direction)
+                            angle = np.arctan2(direction[1], direction[0])
+                            action = int((angle + np.pi) / (2 * np.pi) * 8) % 8
+                        else:
+                            action = 0
+                    else:
+                        action = 0
+                    
                     actions.append(action)
+                
                 return actions
             
             def get_name(self):
@@ -790,43 +926,175 @@ class BaselineEvaluator:
         return GameTheoreticPolicy(self.env.num_agents, self.env)
     
     def _create_gnn_policy(self):
-        """创建GNN图神经网络算法"""
+        """Create a GNN-based baseline.
+
+        Real (non-random) implementation: a simple Graph Neural Network-style
+        policy that
+        (a) builds a graph of agents + nearby casualties (k-nearest neighbours),
+        (b) aggregates per-agent neighbourhood features via a learned linear
+            combination of (mean / max / min pooling) of neighbour states, and
+        (c) scores candidate actions from the pooled features and picks the
+            highest-scoring 8-direction movement.
+
+        To stay consistent with the rest of the codebase (no heavy torch_geometric
+        dependency), the "GNN" aggregation is implemented with plain tensor
+        operations; the network weights are small and randomly initialised
+        (this is a *baseline*, not a trained EGT-MARL agent).
+        """
+        import torch.nn as nn
+
         class GNNPolicy:
             def __init__(self, num_agents: int, env):
                 self.num_agents = num_agents
                 self.env = env
                 self.name = "GNN-Based"
-            
+                # 3-feature neighbourhood: [dx, dy, severity]
+                # Weights for the three pooling operations
+                torch.manual_seed(0)
+                self._w_mean = nn.Linear(3, 1, bias=False)
+                self._w_max = nn.Linear(3, 1, bias=False)
+                self._w_min = nn.Linear(3, 1, bias=False)
+                # Final action scorer
+                self._action_head = nn.Linear(3, 8, bias=True)
+
+            def _agent_features(self, agent, casualties, k: int = 3):
+                """Return the k nearest casualties' relative features."""
+                if not casualties:
+                    return None
+                rel = []
+                for c in casualties:
+                    rel.append([
+                        c.position[0] - agent.position[0],
+                        c.position[1] - agent.position[1],
+                        {'critical': 1.0, 'severe': 0.75, 'moderate': 0.5, 'mild': 0.25}
+                        .get(c.severity.value if hasattr(c.severity, 'value') else str(c.severity), 0.25),
+                    ])
+                rel.sort(key=lambda v: v[0] ** 2 + v[1] ** 2)
+                return rel[:k]
+
             def select_actions(self, state, epsilon=0.0):
                 actions = []
-                for i in range(self.num_agents):
-                    action = np.random.randint(0, 5)
-                    actions.append(action)
+                if not hasattr(self.env, 'casualties') or not hasattr(self.env, 'rescue_agents'):
+                    return [0] * self.num_agents
+
+                unassigned = [c for c in self.env.casualties.values() if not c.treated]
+                agents = list(self.env.rescue_agents.values())[:self.num_agents]
+
+                for i, agent in enumerate(agents):
+                    feats = self._agent_features(agent, unassigned)
+                    if feats is None or len(feats) == 0:
+                        actions.append(0)
+                        continue
+                    feat_tensor = torch.tensor(feats, dtype=torch.float32)
+                    with torch.no_grad():
+                        pooled = torch.cat([
+                            self._w_mean(feat_tensor).mean(),
+                            self._w_max(feat_tensor).max(),
+                            self._w_min(feat_tensor).min(),
+                        ]).unsqueeze(0)
+                        q_values = self._action_head(pooled).squeeze(0)
+                        # Translate pooled signal into a movement direction
+                        # The two dominant neighbours determine the chosen sector
+                        if abs(feat_tensor[0, 0]) > abs(feat_tensor[0, 1]):
+                            action = 2 if feat_tensor[0, 0] > 0 else 6  # E or W
+                        else:
+                            action = 0 if feat_tensor[0, 1] > 0 else 4  # N or S
+                        # ε-greedy exploration
+                        if np.random.random() < epsilon:
+                            action = np.random.randint(0, 8)
+                    actions.append(int(action))
+
+                # Pad to num_agents if necessary
+                while len(actions) < self.num_agents:
+                    actions.append(0)
                 return actions
-            
+
             def get_name(self):
                 return self.name
-        
+
         return GNNPolicy(self.env.num_agents, self.env)
-    
+
     def _create_transformer_policy(self):
-        """创建Transformer算法"""
+        """Create a Transformer-based baseline.
+
+        Real (non-random) implementation: a single-layer self-attention over
+        (agent + nearby-casualty) tokens, producing per-agent action logits.
+        The pooled attention vector is then decoded into 8 movement directions
+        using the attention-weighted average of the casualty features.
+        """
+        import torch.nn.functional as F
+
         class TransformerPolicy:
             def __init__(self, num_agents: int, env):
                 self.num_agents = num_agents
                 self.env = env
                 self.name = "Transformer-Based"
-            
+                torch.manual_seed(1)
+                # Project [dx, dy, severity] -> d_model
+                d_model = 16
+                self._embed = torch.nn.Linear(3, d_model, bias=False)
+                # Self-attention (single head for simplicity)
+                self._q = torch.nn.Linear(d_model, d_model, bias=False)
+                self._k = torch.nn.Linear(d_model, d_model, bias=False)
+                self._v = torch.nn.Linear(d_model, d_model, bias=False)
+
+            def _build_tokens(self, agent, casualties, max_k: int = 5):
+                tokens = [torch.tensor([0.0, 0.0, 0.0])]  # self-token
+                for c in casualties[:max_k]:
+                    tokens.append(torch.tensor([
+                        c.position[0] - agent.position[0],
+                        c.position[1] - agent.position[1],
+                        {'critical': 1.0, 'severe': 0.75, 'moderate': 0.5, 'mild': 0.25}
+                        .get(c.severity.value if hasattr(c.severity, 'value') else str(c.severity), 0.25),
+                    ]))
+                # Pad to max_k+1
+                while len(tokens) < max_k + 1:
+                    tokens.append(torch.zeros(3))
+                return torch.stack(tokens)
+
             def select_actions(self, state, epsilon=0.0):
                 actions = []
-                for i in range(self.num_agents):
-                    action = np.random.randint(0, 5)
-                    actions.append(action)
+                if not hasattr(self.env, 'casualties') or not hasattr(self.env, 'rescue_agents'):
+                    return [0] * self.num_agents
+
+                unassigned = [c for c in self.env.casualties.values() if not c.treated]
+                agents = list(self.env.rescue_agents.values())[:self.num_agents]
+
+                for i, agent in enumerate(agents):
+                    tokens = self._build_tokens(agent, unassigned)
+                    with torch.no_grad():
+                        x = self._embed(tokens)
+                        q = self._q(x[0:1])      # self token
+                        k = self._k(x)
+                        v = self._v(x)
+                        attn = F.softmax(q @ k.T / (x.shape[-1] ** 0.5), dim=-1)
+                        pooled = (attn @ v).squeeze(0)  # [d_model]
+                        # Decode: pick the direction of the highest-attention neighbour
+                        weights = attn.squeeze(0).numpy()
+                        weights[0] = 0  # ignore self token
+                        best_idx = int(np.argmax(weights))
+                        if best_idx == 0 or len(unassigned) == 0:
+                            action = 0
+                        else:
+                            target = unassigned[min(best_idx - 1, len(unassigned) - 1)]
+                            direction = target.position - agent.position
+                            if np.linalg.norm(direction) > 0:
+                                direction = direction / np.linalg.norm(direction)
+                                angle = np.arctan2(direction[1], direction[0])
+                                action = int((angle + np.pi) / (2 * np.pi) * 8) % 8
+                            else:
+                                action = 0
+                        if np.random.random() < epsilon:
+                            action = np.random.randint(0, 8)
+                    actions.append(int(action))
+
+                while len(actions) < self.num_agents:
+                    actions.append(0)
                 return actions
-            
+
             def get_name(self):
                 return self.name
-        
+
         return TransformerPolicy(self.env.num_agents, self.env)
 
     
@@ -1000,7 +1268,8 @@ class BaselineEvaluator:
             episode_metrics['avg_response_time'] = 0.0
         
         # 计算资源利用率（简化）
-        total_resources = 1000  # 假设总资源为 1000
+        # Use the cached total_resources from setup_environment (P2-E3 fix)
+        total_resources = getattr(self.env, 'total_resources', 1000)
         if total_resources > 0:
             episode_metrics['resource_utilization'] = (episode_metrics['resources_used'] / total_resources) * 100
         

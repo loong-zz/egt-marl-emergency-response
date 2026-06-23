@@ -946,11 +946,143 @@ class DynamicParetoFrontier:
         
         with open(path, 'wb') as f:
             pickle.dump(state, f)
-    
+
+    # ------------------------------------------------------------------ #
+    # A2-audit-fix: integration helpers for the EGTMARL wrapper
+    # ------------------------------------------------------------------ #
+    def update(self, batch: Dict[str, Any]) -> float:
+        """
+        Convenience wrapper used by EGTMARL.update().
+
+        Extracts performance metrics from the batch, updates the frontier,
+        caches the metrics for later use (get_frontier_weights, etc.), and
+        returns a scalar loss (distance to the nearest frontier point).
+
+        Args:
+            batch: Experience batch containing optional 'fairness_score',
+                'efficiency_score', 'rewards', 'gini_coefficient',
+                'robustness_score' keys.
+
+        Returns:
+            frontier_loss (float).  0.0 if the frontier is empty.
+        """
+        try:
+            performance_metrics = {}
+
+            if 'rewards' in batch:
+                rewards = batch['rewards']
+                if isinstance(rewards, torch.Tensor):
+                    rewards = rewards.detach().cpu().numpy()
+                performance_metrics['efficiency_score'] = float(np.mean(rewards))
+
+            if 'gini_coefficient' in batch:
+                gini = batch['gini_coefficient']
+                if isinstance(gini, torch.Tensor):
+                    gini = gini.detach().cpu().numpy()
+                performance_metrics['fairness_score'] = float(1.0 - gini)
+
+            for key in ('fairness_score', 'efficiency_score', 'robustness_score'):
+                if key in batch:
+                    performance_metrics[key] = float(batch[key])
+
+            for key in ('efficiency_score', 'fairness_score', 'robustness_score'):
+                performance_metrics.setdefault(key, 0.5)
+
+            # Cache for downstream weight calculations
+            self._last_metrics = dict(performance_metrics)
+
+            # Update the frontier with empty solutions list (we use metrics directly)
+            self.update_frontier([], performance_metrics)
+
+            # Compute and return the loss (distance to nearest frontier point)
+            if not self.frontier:
+                return 0.0
+            current_objectives = np.array([
+                performance_metrics['efficiency_score'],
+                performance_metrics['fairness_score'],
+                performance_metrics['robustness_score'],
+            ])
+            min_distance = float('inf')
+            for point in self.frontier:
+                frontier_objectives = np.array(
+                    [point.efficiency, point.fairness, point.robustness]
+                )
+                distance = float(np.linalg.norm(current_objectives - frontier_objectives))
+                if distance < min_distance:
+                    min_distance = distance
+            return min_distance if np.isfinite(min_distance) else 0.0
+        except Exception:
+            return 0.0
+
+    def get_marl_reward_weights(self) -> Dict[str, float]:
+        """
+        Provide weights in the format expected by the MARL layer / EGTMARL.
+
+        Uses the DynamicParetoFrontier's own recommended-weights logic
+        (which considers the current frontier and most-recent performance
+        metrics), falling back to neutral defaults if the frontier is empty.
+
+        Returns:
+            Dict with keys: 'efficiency_weight', 'fairness_weight',
+            'robustness_weight', 'lambda_param' (scalar fairness priority).
+        """
+        if self.frontier and getattr(self, '_last_metrics', None):
+            w = self.get_recommended_weights(self._last_metrics)
+        elif self.frontier:
+            w = self.get_recommended_weights({
+                'efficiency_score': 0.5,
+                'fairness_score': 0.5,
+                'robustness_score': 0.5,
+            })
+        else:
+            w = np.array([0.4, 0.3, 0.3])
+        w = np.asarray(w, dtype=float).flatten()
+        if w.size < 3:
+            w = np.array([0.4, 0.3, 0.3])
+        return {
+            'efficiency_weight': float(w[0]),
+            'fairness_weight': float(w[1]),
+            'robustness_weight': float(w[2]),
+            'lambda_param': float(w[1]),  # alias for EGT-style lambda
+        }
+
+    def apply_to_marl(self, marl_or_egt_marl) -> None:
+        """
+        Push the current frontier weights into an EGTMARL / MARL instance.
+
+        Sets ``marl_or_egt_marl.pareto_weights`` and (if present)
+        ``marl_or_egt_marl.egt_lambda`` so that downstream code can use them
+        for reward shaping.  This is the explicit connection that was missing
+        in the original code (audit finding A2).
+        """
+        try:
+            weights = self.get_marl_reward_weights()
+            marl_or_egt_marl.pareto_weights = {
+                'efficiency': weights['efficiency_weight'],
+                'fairness': weights['fairness_weight'],
+                'robustness': weights['robustness_weight'],
+            }
+            if hasattr(marl_or_egt_marl, 'egt_lambda'):
+                marl_or_egt_marl.egt_lambda = weights['lambda_param']
+            # If the object has a reward_structure with weights, sync that too
+            if hasattr(marl_or_egt_marl, 'reward_structure') and hasattr(
+                marl_or_egt_marl.reward_structure, 'weights'
+            ):
+                marl_or_egt_marl.reward_structure.weights = {
+                    'efficiency': weights['efficiency_weight'],
+                    'fairness': weights['fairness_weight'],
+                    'robustness': weights['robustness_weight'],
+                }
+        except Exception:
+            # Defensive: if anything goes wrong, surface as empty dict so
+            # the caller can still access algo.pareto_weights.
+            if not hasattr(marl_or_egt_marl, 'pareto_weights'):
+                marl_or_egt_marl.pareto_weights = {}
+
     def load(self, path: str):
         """Load frontier state."""
         import pickle
-        
+
         with open(path, 'rb') as f:
             state = pickle.load(f)
         
@@ -1073,47 +1205,55 @@ class AdaptiveWeightController:
     def update(self, batch: Dict[str, Any]) -> float:
         """
         Update dynamic frontier and compute frontier loss for integration with EGT-MARL.
-        
+
         Args:
             batch: Experience batch containing performance metrics
-            
+
         Returns:
             frontier_loss: Loss value to be fed back to EGT-MARL
         """
         try:
             # Extract performance metrics from batch
             performance_metrics = {}
-            
+
             # Calculate efficiency score from rewards
             if 'rewards' in batch:
                 rewards = batch['rewards']
                 if isinstance(rewards, torch.Tensor):
                     rewards = rewards.detach().cpu().numpy()
                 performance_metrics['efficiency_score'] = float(np.mean(rewards))
-            
+
             # Calculate fairness score from Gini coefficient
             if 'gini_coefficient' in batch:
                 gini = batch['gini_coefficient']
                 if isinstance(gini, torch.Tensor):
                     gini = gini.detach().cpu().numpy()
                 performance_metrics['fairness_score'] = float(1.0 - gini)
-            
+
+            # Use explicit fairness/efficiency_score if provided
+            if 'fairness_score' in batch:
+                performance_metrics['fairness_score'] = float(batch['fairness_score'])
+            if 'efficiency_score' in batch:
+                performance_metrics['efficiency_score'] = float(batch['efficiency_score'])
+            if 'robustness_score' in batch:
+                performance_metrics['robustness_score'] = float(batch['robustness_score'])
+
             # Default values
-            if 'efficiency_score' not in performance_metrics:
-                performance_metrics['efficiency_score'] = 0.5
-            if 'fairness_score' not in performance_metrics:
-                performance_metrics['fairness_score'] = 0.5
-            if 'robustness_score' not in performance_metrics:
-                performance_metrics['robustness_score'] = 0.5
-            
+            for key in ('efficiency_score', 'fairness_score', 'robustness_score'):
+                if key not in performance_metrics:
+                    performance_metrics[key] = 0.5
+
+            # Cache for later use by get_frontier_weights / apply_to_marl
+            self._last_metrics = dict(performance_metrics)
+
             # Update frontier with empty solutions list (will use performance metrics)
             self.update_frontier([], performance_metrics)
-            
+
             # Calculate frontier loss
             frontier_loss = self._calculate_frontier_loss(performance_metrics)
-            
+
             return float(frontier_loss)
-        
+
         except Exception as e:
             # Return 0.0 if update fails
             return 0.0
@@ -1155,16 +1295,6 @@ class AdaptiveWeightController:
         total_loss = min_distance + dominated_penalty
         
         return float(total_loss)
-    
-    def get_frontier_weights(self) -> np.ndarray:
-        """Get current frontier weights for integration with EGT-MARL."""
-        # Get recommended weights based on current state
-        dummy_metrics = {
-            'efficiency_score': 0.5,
-            'fairness_score': 0.5,
-            'robustness_score': 0.5
-        }
-        return self.get_recommended_weights(dummy_metrics)
 
 
 # Integration with EGT-MARL

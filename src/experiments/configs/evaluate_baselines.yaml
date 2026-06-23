@@ -2,11 +2,11 @@
 
 output_dir: src/baseline_results
 
-# 评估配置
+# 评估配置 - 严格评估（论文标准）
 evaluation:
-  num_episodes: 10
+  num_episodes: 30
   max_steps_per_episode: 200
-  num_runs: 1
+  num_runs: 3
   scenarios:
     - earthquake
   severities:
@@ -22,7 +22,7 @@ environment:
   disaster_type: earthquake
   severity: medium
 
-# 算法配置 - 真实基线对比
+# 算法配置 - 完整基线对比
 algorithms:
   # 核心对比算法
   egt_marl:
@@ -30,9 +30,9 @@ algorithms:
     model_path: "experiment_results/egt_marl_20260620_210828/models/best_model.pt"
   
   qmix:
-    enabled: false  # 暂时禁用，初始化参数复杂
+    enabled: false
   
-  # 传统启发式算法（已正确实现）
+  # 传统启发式算法
   fcfs:
     enabled: true
   priority:
@@ -42,13 +42,15 @@ algorithms:
   proportional_fair:
     enabled: true
   
-  # 未实现的算法（暂时禁用）
+  # 论文定义的基线算法
   centralized_mpc:
-    enabled: false
+    enabled: true
   standard_marl:
-    enabled: false
+    enabled: true
   game_theoretic:
-    enabled: false
+    enabled: true
+  
+  # 未实现
   gnn_based:
     enabled: false
   transformer_based:

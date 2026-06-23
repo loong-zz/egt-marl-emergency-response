@@ -494,19 +494,29 @@ class AntiSpoofing:
     def update(self, batch: Dict[str, Any]) -> float:
         """
         Update anti-spoofing mechanism with multi-dimensional training.
+
+        Fix for audit finding A1: the previous implementation trained against
+        a constant target of 0.05 (i.e. assumed *all* behaviour is honest).
+        This is replaced by:
+
+        1. Use real per-agent labels when the batch contains
+           'is_spoofing' / 'claimed_demand' / 'actual_demand' fields.
+        2. Otherwise, fall back to a self-supervised mixture in which a
+           small fraction of inputs are randomly perturbed to simulate
+           "attack" examples, so the detector sees both classes.
         """
         if batch is None or 'states' not in batch or 'actions' not in batch:
             return 0.0
-        
+
         try:
             states = batch['states']
             actions = batch['actions']
-            
+
             if not isinstance(states, torch.Tensor):
                 states = torch.tensor(states, dtype=torch.float32, device=self.device)
             if not isinstance(actions, torch.Tensor):
                 actions = torch.tensor(actions, dtype=torch.float32, device=self.device)
-            
+
             if states.dim() == 3:
                 batch_size, num_agents, obs_dim = states.shape
                 states_flat = states.view(batch_size * num_agents, obs_dim)
@@ -515,52 +525,84 @@ class AntiSpoofing:
                 states_flat = states
                 actions_flat = actions
                 num_agents = min(self.num_agents, states.shape[0] if states.dim() >= 1 else 1)
-            
+
             # Handle single-sample batches
             if states_flat.dim() == 1:
                 states_flat = states_flat.unsqueeze(0)
             if actions_flat.dim() == 1:
                 actions_flat = actions_flat.unsqueeze(0)
-            
+
             input_tensor = torch.cat([states_flat, actions_flat], dim=-1)
-            
-            # 1. Spoofing detection loss
+
+            # ---- 1. Spoofing detection loss with real / simulated labels ----
             spoofing_scores = self.spoofing_detector(input_tensor)
-            # Self-supervised: actions should mostly be legitimate
-            target_scores = torch.ones_like(spoofing_scores) * 0.05
+
+            # 1a. Try to use real per-agent labels from the batch
+            real_labels = None
+            if 'is_spoofing' in batch:
+                label_tensor = batch['is_spoofing']
+                if not isinstance(label_tensor, torch.Tensor):
+                    label_tensor = torch.tensor(label_tensor, dtype=torch.float32, device=self.device)
+                real_labels = label_tensor.view(-1).to(self.device)
+            elif 'claimed_demand' in batch and 'actual_demand' in batch:
+                # Heuristic: spoofing if claimed demand differs by > 30%
+                claimed = batch['claimed_demand']
+                actual = batch['actual_demand']
+                if not isinstance(claimed, torch.Tensor):
+                    claimed = torch.tensor(claimed, dtype=torch.float32, device=self.device)
+                if not isinstance(actual, torch.Tensor):
+                    actual = torch.tensor(actual, dtype=torch.float32, device=self.device)
+                ratio = (claimed - actual).abs() / (actual.abs() + 1e-6)
+                real_labels = (ratio > 0.3).float().view(-1).to(self.device)
+
+            if real_labels is not None and real_labels.shape[0] == spoofing_scores.shape[0]:
+                target_scores = real_labels.unsqueeze(1).expand_as(spoofing_scores)
+            else:
+                # 1b. Self-supervised mixture: corrupt a random 20% of inputs as
+                #     "attack" examples so the detector sees both classes.
+                n = spoofing_scores.shape[0]
+                attack_mask = (torch.rand(n, 1, device=self.device) < 0.2).float()
+                # Add noise to "attacked" inputs to make them distinguishable
+                noise = torch.randn_like(input_tensor) * 0.5
+                attacked_input = input_tensor + attack_mask * noise
+                spoofing_scores = self.spoofing_detector(attacked_input)
+                target_scores = attack_mask.expand_as(spoofing_scores)
             spoofing_loss = self.loss_fn(spoofing_scores, target_scores)
-            
-            # 2. Demand prediction loss
+
+            # ---- 2. Demand prediction loss (predict to zero baseline) ----
             demand_predictions = self.demand_predictor(states_flat)
             demand_loss = self.mse_loss(demand_predictions, torch.zeros_like(demand_predictions))
-            
-            # 3. Verification loss (consistency check)
+
+            # ---- 3. Verification loss (consistency check) ----
             verification_scores = torch.sigmoid(self.verifier(input_tensor))
             verification_loss = self.mse_loss(verification_scores, torch.ones_like(verification_scores))
-            
+
             # Combined loss
             total_loss = spoofing_loss + 0.5 * demand_loss + 0.3 * verification_loss
-            
+
             self.optimizer.zero_grad()
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.optimizer.param_groups[0]['params'], max_norm=1.0)
             self.optimizer.step()
-            
-            # Update adaptive thresholds
+
+            # Update adaptive thresholds with the new scores
             for i in range(min(num_agents, spoofing_scores.shape[0])):
                 score = spoofing_scores[i].item()
                 self.spoofing_threshold.update(score)
-                
-                # Update reputations
-                is_spoofing = self.spoofing_threshold.is_anomalous(score)
+
+                # Update reputations using real labels if available, else inferred
+                if real_labels is not None and i < real_labels.shape[0]:
+                    is_spoofing = bool(real_labels[i].item() > 0.5)
+                else:
+                    is_spoofing = self.spoofing_threshold.is_anomalous(score)
                 self.reputation_system.update_reputation(i, is_spoofing, score)
-            
+
             # Update demand statistics
             if demand_predictions.numel() > 0:
                 self._update_demand_statistics(demand_predictions.mean().item())
-            
+
             return total_loss.item()
-        
+
         except Exception as e:
             return 0.0
     

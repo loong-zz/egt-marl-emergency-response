@@ -405,10 +405,59 @@ class EGTMARLTrainer:
                     per_agent_reward = rewards / num_agents if num_agents > 0 else 0.0
                     rewards = {aid: per_agent_reward for aid in self.env.rescue_agents}
             
+            # M1 audit fix: forward resource claim / allocation callbacks
+            # to the ManagerIntegration so the reputation system and EGT layer
+            # can react to anti-spoofing events.
+            if self.manager_integration is not None and isinstance(info, dict):
+                # Pull per-agent claim/usage from info when the env exposes it
+                for agent_id, agent in self.env.rescue_agents.items():
+                    claimed = info.get('claimed_demand', {}).get(agent_id)
+                    actual = info.get('actual_demand', {}).get(agent_id)
+                    if claimed is not None and actual is not None:
+                        try:
+                            self.manager_integration.on_resource_claim(
+                                agent_id=agent_id,
+                                claimed_demand=float(claimed),
+                                actual_demand=float(actual),
+                                context={'severity': info.get('severity'),
+                                         'time': step},
+                            )
+                        except Exception:
+                            pass
+                    allocated = info.get('allocated', {}).get(agent_id)
+                    if allocated is not None:
+                        try:
+                            self.manager_integration.on_resource_allocation(
+                                agent_id=agent_id,
+                                allocated_amount=float(allocated),
+                            )
+                        except Exception:
+                            pass
+
             # 存储经验并更新算法
             self.algorithm.store_experience(state, actions, rewards, next_state, done)
             if step % self.config['training']['update_frequency'] == 0:
-                self.algorithm.update()
+                update_out = self.algorithm.update()
+                if not isinstance(update_out, dict):
+                    update_out = {}
+                # Track the most informative training signal for the
+                # episode-level loss field.  We prefer mixing_loss (the
+                # end-to-end QMIX signal), then egt_loss, then marl_loss.
+                ep_loss = update_out.get(
+                    'mixing_loss',
+                    update_out.get(
+                        'marl_loss',
+                        update_out.get('egt_loss', 0.0),
+                    ),
+                )
+                if isinstance(ep_loss, (int, float)) and ep_loss != 0.0:
+                    running = episode_metrics.get('__loss_buf', [])
+                    if not isinstance(running, list):
+                        running = []
+                    running.append(float(ep_loss))
+                    episode_metrics['__loss_buf'] = running
+                # Stash the last raw update dict for episode-end logging.
+                episode_metrics['__last_update'] = update_out
             
             # Manager集成：记录新救援的伤员
             if self.manager_integration is not None:
@@ -495,7 +544,21 @@ class EGTMARLTrainer:
         
         # 记录Manager指标
         self._log_manager_metrics(episode_idx)
-        
+
+        # Aggregate the per-step loss buffer into a single episode-level
+        # 'loss' field (mean of non-zero updates; 0.0 if none fired).
+        loss_buf = episode_metrics.pop('__loss_buf', None)
+        last_update = episode_metrics.pop('__last_update', None)
+        if isinstance(loss_buf, list) and loss_buf:
+            episode_metrics['loss'] = float(np.mean(loss_buf))
+        else:
+            episode_metrics['loss'] = 0.0
+        # Stash the most-recent raw update dict for the trainer's history
+        if isinstance(last_update, dict):
+            for k, v in last_update.items():
+                if isinstance(v, (int, float)):
+                    episode_metrics[f"last_{k}"] = float(v)
+
         return episode_metrics
     
     def _log_entity_info(self, step: int) -> None:
@@ -785,14 +848,40 @@ class EGTMARLTrainer:
         training_config = self.config['training']
         
         # 检查是否有阶段配置，如果有则计算总 episode 数
-        if 'schedule' in self.config and 'phases' in self.config['schedule']:
+        if ('schedule' in self.config
+                and self.config['schedule'].get('phases')):
             phases = self.config['schedule']['phases']
             num_episodes = sum(phase['episodes'] for phase in phases)
             logger.info(f"Multi-phase training enabled: {len(phases)} phases, total episodes: {num_episodes}")
             for phase in phases:
                 logger.info(f"  - {phase['name']}: {phase['episodes']} episodes")
         else:
+            # Audit fix T1: default 4-stage curriculum
+            # (Warmup / Transition / Main / FineTune) when no explicit phases
+            # are configured.  Stages progress from random exploration to
+            # fairness-aware fine-tuning.
             num_episodes = training_config['num_episodes']
+            warmup = int(num_episodes * 0.10)
+            transition = int(num_episodes * 0.20)
+            main = int(num_episodes * 0.55)
+            finetune = num_episodes - warmup - transition - main
+            base_lr = training_config.get('learning_rate', 0.0005)
+            phases = [
+                {'name': 'Warmup',     'episodes': warmup,
+                 'learning_rate': base_lr * 2.0,   'epsilon_scale': 1.0},
+                {'name': 'Transition', 'episodes': transition,
+                 'learning_rate': base_lr,          'epsilon_scale': 0.7},
+                {'name': 'Main',       'episodes': main,
+                 'learning_rate': base_lr * 0.5,    'epsilon_scale': 0.3},
+                {'name': 'FineTune',   'episodes': finetune,
+                 'learning_rate': base_lr * 0.1,    'epsilon_scale': 0.05},
+            ]
+            self.config.setdefault('schedule', {})['phases'] = phases
+            logger.info(
+                f"Default 4-stage curriculum: Warmup={warmup}, "
+                f"Transition={transition}, Main={main}, FineTune={finetune} "
+                f"(total={num_episodes})"
+            )
         
         epsilon = training_config['epsilon_start']
         epsilon_decay = training_config['epsilon_decay']
@@ -864,6 +953,29 @@ class EGTMARLTrainer:
                         for param_group in self.algorithm.marl_layer.optimizer.param_groups:
                             param_group['lr'] = current_lr
                         logger.debug(f"Phase {phase.get('name', current_phase_idx)} - Episode {episode}: Learning rate set to {current_lr:.6f}")
+
+                # Audit fix T1: also scale epsilon per-stage (curriculum)
+                if 'epsilon_scale' in phase:
+                    # When the phase changes, snap epsilon to the per-phase scale
+                    if 'current_phase_idx' not in dir():
+                        pass
+                    # Recompute target epsilon for this phase (relative to epsilon_end)
+                    phase_epsilon = max(
+                        epsilon_end,
+                        epsilon * float(phase['epsilon_scale'])
+                    )
+                    if current_phase_idx != getattr(self, '_last_phase_idx', -2):
+                        # Phase transition — log and apply
+                        self._last_phase_idx = current_phase_idx
+                        logger.info(
+                            f"=== Entering phase '{phase.get('name', current_phase_idx)}' "
+                            f"(eps {epsilon:.3f} → target {phase_epsilon:.3f}, "
+                            f"lr={current_lr:.6f}) ==="
+                        )
+                        # Snap epsilon down at the start of each new phase
+                        # (subsequent episodes continue the exponential decay
+                        # from this snapped value)
+                        epsilon = phase_epsilon
             
             # 训练一个episode
             episode_metrics = self.train_episode(episode, epsilon)

@@ -294,52 +294,111 @@ class MARLLayer(nn.Module):
         
         return actions
     
-    def update(self, batch_states: torch.Tensor, batch_actions: torch.Tensor, 
-               batch_rewards: torch.Tensor, batch_next_states: torch.Tensor, 
-               batch_dones: torch.Tensor, egt_weights=None, lambda_param=None) -> float:
-        """Update MARL layer using experience batch with hypernetwork mixing."""
+    def update(self, batch_states: torch.Tensor, batch_actions: torch.Tensor,
+               batch_rewards: torch.Tensor, batch_next_states: torch.Tensor,
+               batch_dones: torch.Tensor, egt_weights=None, lambda_param=None,
+               fairness_metrics: Optional[Dict[str, torch.Tensor]] = None) -> float:
+        """
+        Update MARL layer using experience batch with hypernetwork mixing.
+
+        Args:
+            batch_states: Current states [B, N, state_dim]
+            batch_actions: Actions [B, N]
+            batch_rewards: Rewards [B, N] (or [B])
+            batch_next_states: Next states [B, N, state_dim]
+            batch_dones: Done flags [B]
+            egt_weights: Optional dict from EGT layer with keys:
+                - 'fairness_weight', 'efficiency_weight', 'lambda_param', 'strategy_distribution'
+            lambda_param: Scalar override of lambda in [0, 1] (0=efficiency, 1=fairness).
+                          Takes precedence over egt_weights['lambda_param'] if provided.
+            fairness_metrics: Optional dict of fairness signals per agent
+                (e.g. {'gini': tensor[B], 'region_save_rates': tensor[B, N]}).
+
+        Returns:
+            Loss value.
+        """
+        # ====== EGT-driven reward shaping (the "handshake" with the macro layer) ======
+        # Resolve lambda (0 = pure efficiency, 1 = pure fairness)
+        if lambda_param is not None:
+            lam = float(max(0.0, min(1.0, lambda_param)))
+        elif egt_weights is not None and 'lambda_param' in egt_weights:
+            lam = float(max(0.0, min(1.0, egt_weights['lambda_param'])))
+        else:
+            lam = 0.5  # neutral default
+
+        # EGT-derived per-agent shaping factors.
+        # If we have per-agent fairness signals (e.g. region save rates), use them to
+        # boost rewards for under-served agents.  Otherwise fall back to a constant
+        # bias on the shared weight.
+        egt_fairness_boost = 0.0
+        if egt_weights is not None and 'fairness_weight' in egt_weights:
+            egt_fairness_boost = float(egt_weights['fairness_weight']) - 0.5
+
+        # Reshape rewards: [B] -> [B, N] if necessary
+        if batch_rewards.dim() == 1:
+            rewards_per_agent = batch_rewards.unsqueeze(1).expand(-1, self.num_agents)
+        elif batch_rewards.dim() == 2 and batch_rewards.shape[1] == 1:
+            rewards_per_agent = batch_rewards.expand(-1, self.num_agents)
+        else:
+            rewards_per_agent = batch_rewards
+
+        # Apply EGT-driven reward shaping:
+        #   shaped_r = (1 + egt_boost) * r + lam * fairness_bonus
+        if fairness_metrics is not None and 'region_save_rates' in fairness_metrics:
+            save_rates = fairness_metrics['region_save_rates']  # [B, N]
+            mean_save = save_rates.mean(dim=1, keepdim=True)
+            # Agents with below-average save rate get a positive fairness bonus
+            fairness_bonus = (mean_save - save_rates).clamp(min=0.0) * lam
+            shaped_rewards = rewards_per_agent * (1.0 + egt_fairness_boost) + fairness_bonus
+        else:
+            # No per-agent fairness info: apply a uniform shift proportional to lambda
+            shaped_rewards = rewards_per_agent * (1.0 + egt_fairness_boost) + lam * 0.01
+
+        # ====== Standard QMIX-style update using shaped rewards ======
         # Get current Q-values
         current_qs = self.forward(batch_states)
-        
+
         # Get action indices and selected Q-values
         action_indices = batch_actions.long().unsqueeze(2)
         selected_qs = current_qs.gather(2, action_indices).squeeze(2)  # (B, N)
-        
+
         # Compute global state by averaging agent observations
         global_state = batch_states.mean(dim=1)  # (B, state_dim)
-        
+
         # Get current joint Q-value using hypernetwork mixing
         current_joint_q = self._hypernetwork_mixing(selected_qs, global_state, use_target=False)
-        
+
         # Get next Q-values from target networks
         with torch.no_grad():
             next_qs = self.forward(batch_next_states)
             max_next_qs = next_qs.max(dim=2)[0]  # (B, N)
-            
+
             # Get target joint Q-value
             next_global_state = batch_next_states.mean(dim=1)
             target_joint_q = self._hypernetwork_mixing(max_next_qs, next_global_state, use_target=True)
-            
-            # Compute target
-            target = batch_rewards + self.gamma * target_joint_q * (1 - batch_dones.float())
-        
+
+            # Compute target using shaped rewards (EGT-driven)
+            # Aggregate per-agent shaped rewards into per-step reward
+            step_reward = shaped_rewards.mean(dim=1)  # [B]
+            target = step_reward + self.gamma * target_joint_q * (1 - batch_dones.float())
+
         # Compute loss
         loss_fn = nn.MSELoss()
         loss = loss_fn(current_joint_q, target)
-        
+
         # Gradient accumulation
         loss = loss / self.gradient_accumulation_steps
         loss.backward()
-        
+
         self.gradient_step_counter += 1
         if self.gradient_step_counter % self.gradient_accumulation_steps == 0:
             torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=10.0)
             self.optimizer.step()
             self.optimizer.zero_grad()
-            
+
             # Update target networks
             self._update_target_networks(self.tau)
-        
+
         return loss.item() * self.gradient_accumulation_steps
     
     def _update_target_networks(self, tau: float) -> None:

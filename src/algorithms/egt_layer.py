@@ -31,48 +31,99 @@ class EGTLayer(nn.Module):
         self.num_strategies = num_strategies
         self.device = device
         
-        # Payoff matrix (strategies x strategies)
+        # Payoff matrix (strategies x strategies) - theory-driven initialization
+        # Based on the disaster resource allocation game structure:
+        # Strategy 0: Fairness-focused - high payoff against fairness strategies, low against efficiency
+        # Strategy 1: Efficiency-focused - high payoff against efficiency, moderate against balanced
+        # Strategy 2: Balanced - moderate payoffs in most interactions
+        # Strategy 3: Adaptive - payoff depends on context, but generally cooperative
         if payoff_matrix is None:
-            # Initialize with random payoffs
             self.payoff_matrix = nn.Parameter(
-                torch.randn(num_strategies, num_strategies, device=device)
+                self._init_theory_driven_payoff(num_strategies, device)
             )
-            # Make symmetric
-            with torch.no_grad():
-                self.payoff_matrix.data = (self.payoff_matrix.data + self.payoff_matrix.data.T) / 2
         else:
             self.payoff_matrix = nn.Parameter(payoff_matrix.to(device))
-        
+
         # Strategy distribution (population shares)
         self.strategy_distribution = nn.Parameter(
             torch.ones(num_strategies, device=device) / num_strategies
         )
-        
+
         # Historical strategy distributions for convergence analysis
         self.strategy_history = []
         self.max_history_length = 100
-        
+
         # Learning parameters
         self.learning_rate = learning_rate
         self.mutation_rate = 0.01
         self.selection_strength = 1.0
-        
-        # Strategy definitions
+
+        # Strategy definitions (must align with paper section 4.3)
         self.strategy_names = [
             "Fairness-focused",
-            "Efficiency-focused", 
+            "Efficiency-focused",
             "Balanced",
             "Adaptive"
         ]
-        
+
         # Convergence tracking
         self.convergence_threshold = 1e-4
         self.convergence_steps = 0
         self.is_converged = False
-        
+
         # Performance metrics
         self.fitness_history = []
         self.diversity_history = []
+
+        # Lambda parameter (fairness-efficiency balance, dynamically adjusted)
+        # This is the core parameter passed to MARL layer for reward shaping
+        self.lambda_param = 0.5  # 0=full efficiency, 1=full fairness
+
+    def _init_theory_driven_payoff(self, num_strategies: int,
+                                    device: torch.device) -> torch.Tensor:
+        """
+        Initialize a theory-driven payoff matrix based on game-theoretic reasoning
+        for disaster resource allocation.
+
+        Structure (4 strategies):
+        - Fairness-focused vs Fairness-focused: mutual cooperation (3.0)
+        - Fairness-focused vs Efficiency-focused: tension (1.0 for F, 2.0 for E)
+        - Fairness-focused vs Balanced: cooperation (2.5)
+        - Fairness-focused vs Adaptive: moderate (2.0)
+
+        - Efficiency-focused vs Efficiency-focused: competition (2.0)
+        - Efficiency-focused vs Balanced: moderate (2.0)
+        - Efficiency-focused vs Adaptive: moderate (2.0)
+
+        - Balanced vs Balanced: cooperation (2.5)
+        - Balanced vs Adaptive: cooperation (2.5)
+
+        - Adaptive vs Adaptive: high cooperation (3.0)
+        """
+        if num_strategies == 4:
+            # Paper-aligned 4-strategy payoff structure
+            # Rows/cols: [Fairness, Efficiency, Balanced, Adaptive]
+            base_payoff = torch.tensor([
+                # F-vs-F, F-vs-E, F-vs-B, F-vs-A
+                [3.0, 1.0, 2.5, 2.0],
+                # E-vs-F, E-vs-E, E-vs-B, E-vs-A
+                [2.0, 2.0, 2.0, 2.0],
+                # B-vs-F, B-vs-E, B-vs-B, B-vs-A
+                [2.5, 2.0, 2.5, 2.5],
+                # A-vs-F, A-vs-E, A-vs-B, A-vs-A
+                [2.0, 2.0, 2.5, 3.0],
+            ], device=device)
+        else:
+            # Fallback for other num_strategies: identity + small noise
+            base_payoff = torch.eye(num_strategies, device=device) * 2.5
+            # Add small random perturbation
+            base_payoff += torch.randn(num_strategies, num_strategies, device=device) * 0.1
+            # Force symmetry
+            base_payoff = (base_payoff + base_payoff.T) / 2
+
+        # Make symmetric (payoffs are mutual in symmetric games)
+        payoff = (base_payoff + base_payoff.T) / 2
+        return payoff
     
     def get_strategy_distribution(self) -> torch.Tensor:
         """Get current strategy distribution."""
@@ -330,50 +381,167 @@ class EGTLayer(nn.Module):
             'diversity': self.diversity_history[-1] if self.diversity_history else 0.0
         }
     
+    def _extract_performance_metrics(self, batch: Dict[str, Any]) -> Dict[str, float]:
+        """
+        Extract real performance metrics from the experience batch.
+
+        Looks for metrics in the batch under the following keys:
+        - 'fairness_score' / 'gini_coefficient' (lower gini = higher fairness)
+        - 'efficiency_score' / 'survival_rate' / 'rescue_rate'
+        - 'total_reward' / 'rewards'
+        - 'resource_utilization'
+        - 'response_time'
+        - 'queue_length'
+
+        Falls back to derived metrics if explicit fields are missing.
+        """
+        metrics: Dict[str, float] = {}
+
+        # Fairness: prefer explicit fairness_score, else derive from gini (1-gini)
+        if 'fairness_score' in batch:
+            metrics['fairness_score'] = float(batch['fairness_score'])
+        elif 'gini_coefficient' in batch:
+            gini = float(batch['gini_coefficient'])
+            metrics['fairness_score'] = max(0.0, min(1.0, 1.0 - gini))
+        elif 'fairness' in batch:
+            metrics['fairness_score'] = float(batch['fairness'])
+        else:
+            metrics['fairness_score'] = 0.5  # neutral default
+
+        # Efficiency: prefer explicit, else derive from survival/rescue rate
+        if 'efficiency_score' in batch:
+            metrics['efficiency_score'] = float(batch['efficiency_score'])
+        elif 'survival_rate' in batch:
+            metrics['efficiency_score'] = float(batch['survival_rate'])
+        elif 'rescue_rate' in batch:
+            metrics['efficiency_score'] = float(batch['rescue_rate'])
+        else:
+            metrics['efficiency_score'] = 0.5  # neutral default
+
+        # Total reward (used by adaptive strategy)
+        if 'rewards' in batch:
+            rewards_tensor = batch['rewards']
+            if torch.is_tensor(rewards_tensor):
+                metrics['total_reward'] = rewards_tensor.mean().item()
+            else:
+                metrics['total_reward'] = float(np.mean(rewards_tensor))
+        elif 'total_reward' in batch:
+            metrics['total_reward'] = float(batch['total_reward'])
+        else:
+            metrics['total_reward'] = 0.0
+
+        # Optional additional signals (kept for downstream use)
+        if 'resource_utilization' in batch:
+            metrics['resource_utilization'] = float(batch['resource_utilization'])
+        if 'response_time' in batch:
+            metrics['response_time'] = float(batch['response_time'])
+        if 'queue_length' in batch:
+            metrics['queue_length'] = float(batch['queue_length'])
+
+        return metrics
+
     def update(self, batch: Dict[str, Any], optimizer: torch.optim.Optimizer,
               loss_fn: nn.Module) -> float:
         """
         Update EGT layer parameters.
-        
+
         Args:
-            batch: Experience batch
+            batch: Experience batch containing states, actions, rewards, and (optionally)
+                   explicit performance metrics such as 'fairness_score'/'efficiency_score'.
             optimizer: Optimizer
             loss_fn: Loss function
-            
+
         Returns:
             Loss value
         """
-        # Extract performance metrics from batch
-        # In practice, would extract from environment info
-        performance_metrics = {
-            'fairness_score': 0.5,  # Placeholder
-            'efficiency_score': 0.5,  # Placeholder
-            'total_reward': batch.get('rewards', torch.tensor([0.0])).mean().item()
-        }
-        
-        # Evolve strategies
+        # Extract real performance metrics from batch (no more hardcoded 0.5)
+        performance_metrics = self._extract_performance_metrics(batch)
+
+        # Evolve strategies based on real performance
         self.evolve_strategies(performance_metrics)
-        
+
+        # Update lambda parameter based on strategy distribution
+        self._update_lambda()
+
         # Calculate loss (encourage diversity and performance)
         distribution = self.get_strategy_distribution()
-        
+
         # Diversity loss (encourage exploration)
         entropy = -torch.sum(distribution * torch.log(distribution + 1e-8))
         diversity_loss = -entropy  # Maximize entropy
-        
+
         # Performance loss (based on fitness)
         avg_fitness = np.mean(self.fitness_history[-5:]) if self.fitness_history else 0.5
         performance_loss = -avg_fitness  # Maximize fitness
-        
+
         # Combined loss
         loss = 0.3 * diversity_loss + 0.7 * performance_loss
-        
+
         # Optimize (though EGT typically doesn't use gradient descent)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        
+
         return loss.item()
+
+    def _update_lambda(self) -> None:
+        """
+        Update the lambda parameter (fairness-efficiency balance) based on the
+        current strategy distribution. This implements the dynamic adjustment
+        described in the paper.
+
+        - lambda = 1.0: full fairness focus
+        - lambda = 0.0: full efficiency focus
+        """
+        distribution = self.get_strategy_distribution()
+
+        # Use the explicit fairness/efficiency weights from strategy distribution
+        fairness_weight, efficiency_weight = self.get_fairness_efficiency_weights()
+
+        # If system is under stress (low fitness), shift toward efficiency
+        # If system is stable, shift toward fairness
+        if self.fitness_history:
+            recent_fitness = np.mean(self.fitness_history[-5:])
+            # Adaptive shifting: stress reduces fairness priority
+            if recent_fitness < 0.4:
+                # Crisis mode: shift toward efficiency
+                efficiency_weight = min(1.0, efficiency_weight * 1.2)
+                fairness_weight = max(0.0, 1.0 - efficiency_weight)
+
+        # lambda represents the fairness weight (0=efficiency, 1=fairness)
+        self.lambda_param = float(fairness_weight)
+
+    def update_with_weights(self, batch: Dict[str, Any],
+                            optimizer: torch.optim.Optimizer,
+                            loss_fn: nn.Module) -> Tuple[float, Dict[str, float]]:
+        """
+        Update EGT layer and return trade-off weights for the MARL layer.
+
+        This method is the "handshake" between EGT (macro) and MARL (micro):
+        it produces the weights that the MARL layer should use to shape rewards.
+
+        Returns:
+            (loss, weights_dict) where weights_dict contains:
+            - 'fairness_weight': emphasis on fairness
+            - 'efficiency_weight': emphasis on efficiency
+            - 'lambda_param': scalar fairness-efficiency balance in [0, 1]
+            - 'strategy_distribution': full distribution over strategies
+        """
+        # Run the standard update
+        loss = self.update(batch, optimizer, loss_fn)
+
+        # Compute weights from current strategy distribution
+        distribution = self.get_strategy_distribution()
+        fairness_weight, efficiency_weight = self.get_fairness_efficiency_weights()
+
+        weights = {
+            'fairness_weight': fairness_weight,
+            'efficiency_weight': efficiency_weight,
+            'lambda_param': self.lambda_param,
+            'strategy_distribution': distribution.detach().cpu().numpy().tolist(),
+        }
+
+        return loss, weights
     
     def reset_convergence(self) -> None:
         """Reset convergence tracking."""

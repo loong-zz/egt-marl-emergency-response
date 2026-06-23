@@ -9,7 +9,13 @@ marl:
   num_agents: 17  # 10 drones + 5 ambulances + 2 hospitals
   hidden_dim: 128
   mixing_hidden_dim: 64
-  
+
+  # ---- Algorithm selection ----
+  # use_improved_qmix=true: 启用论文描述的 ImprovedQMIX（含分层动作空间、
+  #                          5维增强奖励、AttentionMixingNetwork、多步自举等）
+  # use_improved_qmix=false: 回退到轻量级 MARLLayer
+  use_improved_qmix: true
+
   # QMIX improvements
   improved_reward_structure: true
   hierarchical_action_space: true

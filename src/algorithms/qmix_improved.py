@@ -697,17 +697,25 @@ class ImprovedQMIXAgent(nn.Module):
         """Update agent using improved QMIX loss."""
         if len(batch) == 0:
             return {'q_loss': 0.0, 'value_loss': 0.0, 'epsilon': self.epsilon}
-        
+
         # Unpack batch
         obs, actions, rewards, next_obs, dones = zip(*batch)
-        
+
         # Convert to tensors
         obs_tensor = torch.FloatTensor(np.array(obs))
         actions_tensor = torch.LongTensor(actions).unsqueeze(1)
         rewards_tensor = torch.FloatTensor(rewards)
         next_obs_tensor = torch.FloatTensor(np.array(next_obs))
         dones_tensor = torch.FloatTensor(dones)
-        
+
+        # M4 audit fix: if ImprovedQMIX.update() stashed shaped rewards
+        # computed via EnhancedRewardStructure, use them in place of the raw
+        # rewards.  This makes the 5-component structure actually drive the
+        # gradient.
+        shaped = getattr(self, '_last_shaped_rewards', None)
+        if shaped is not None and len(shaped) == len(rewards):
+            rewards_tensor = torch.FloatTensor(shaped)
+
         # Current Q-values
         current_q_values = self.q_network(obs_tensor)
         current_q = current_q_values.gather(1, actions_tensor).squeeze()
@@ -745,7 +753,67 @@ class ImprovedQMIXAgent(nn.Module):
             'total_loss': total_loss.item(),
             'epsilon': self.epsilon
         }
-    
+
+    def compute_auxiliary_loss(self,
+                                batch: List[Tuple[np.ndarray, int, float, np.ndarray, bool]]
+                                ) -> Dict[str, float]:
+        """
+        Compute per-agent auxiliary losses (NO gradient / NO optimizer step).
+
+        This is the monitoring-only counterpart of `update()`.  The real
+        end-to-end QMIX update happens inside
+        ``ImprovedQMIX._update_mixing_network``; this method exists purely
+        so that per-agent statistics (q_loss, value_loss) can be logged.
+
+        Args:
+            batch: List of (obs, action, reward, next_obs, done) tuples.
+
+        Returns:
+            Dict with 'q_loss', 'value_loss', 'total_loss', 'epsilon'.
+        """
+        if len(batch) == 0:
+            return {
+                'q_loss': 0.0,
+                'value_loss': 0.0,
+                'total_loss': 0.0,
+                'epsilon': float(self.epsilon),
+            }
+        try:
+            obs, actions, rewards, next_obs, dones = zip(*batch)
+            obs_tensor = torch.FloatTensor(np.array(obs))
+            actions_tensor = torch.LongTensor(actions).unsqueeze(1)
+            rewards_tensor = torch.FloatTensor(rewards)
+            next_obs_tensor = torch.FloatTensor(np.array(next_obs))
+            dones_tensor = torch.FloatTensor(dones)
+
+            # Use shaped rewards if available
+            shaped = getattr(self, '_last_shaped_rewards', None)
+            if shaped is not None and len(shaped) == len(rewards):
+                rewards_tensor = torch.FloatTensor(shaped)
+
+            with torch.no_grad():
+                current_q = self.q_network(obs_tensor).gather(
+                    1, actions_tensor
+                ).squeeze()
+                next_q = self.target_q_network(next_obs_tensor).max(1)[0]
+                expected_q = rewards_tensor + self.gamma * next_q * (1 - dones_tensor)
+                q_loss = F.smooth_l1_loss(current_q, expected_q).item()
+                values = self.value_network(obs_tensor).squeeze()
+                value_loss = F.mse_loss(values, expected_q).item()
+            return {
+                'q_loss': q_loss,
+                'value_loss': value_loss,
+                'total_loss': q_loss + 0.5 * value_loss,
+                'epsilon': float(self.epsilon),
+            }
+        except Exception:
+            return {
+                'q_loss': 0.0,
+                'value_loss': 0.0,
+                'total_loss': 0.0,
+                'epsilon': float(self.epsilon),
+            }
+
     def _soft_update_target_network(self):
         """Soft update target network parameters."""
         for target_param, param in zip(self.target_q_network.parameters(), 
@@ -779,7 +847,7 @@ class ImprovedQMIXAgent(nn.Module):
 class ImprovedQMIX:
     """
     Main improved QMIX algorithm class.
-    
+
     Key improvements over standard QMIX:
     1. Hierarchical action space
     2. Enhanced multi-component reward structure
@@ -787,25 +855,25 @@ class ImprovedQMIX:
     4. Dynamic reward weight adjustment
     5. Hierarchical policy learning
     """
-    
-    def __init__(self, 
+
+    def __init__(self,
                  num_agents: int,
                  obs_dim: int,
                  state_dim: int,
                  action_dims: List[int],
                  agent_types: List[str],
                  config: Optional[Dict[str, Any]] = None):
-        
+
         self.num_agents = num_agents
         self.obs_dim = obs_dim
         self.state_dim = state_dim
         self.action_dims = action_dims
         self.agent_types = agent_types
-        
+
         if config is None:
             config = {}
         self.config = config
-        
+
         # Create agents
         self.agents = []
         for i, (action_dim, agent_type) in enumerate(zip(action_dims, agent_types)):
@@ -816,7 +884,7 @@ class ImprovedQMIX:
                 config=config
             )
             self.agents.append(agent)
-        
+
         # Mixing networks
         self.mixing_network = AttentionMixingNetwork(
             state_dim=state_dim,
@@ -825,7 +893,7 @@ class ImprovedQMIX:
             num_heads=config.get('attention_heads', 4),
             num_layers=config.get('num_layers', 2)
         )
-        
+
         self.target_mixing_network = AttentionMixingNetwork(
             state_dim=state_dim,
             num_agents=num_agents,
@@ -833,21 +901,21 @@ class ImprovedQMIX:
             num_heads=config.get('attention_heads', 4),
             num_layers=config.get('num_layers', 2)
         )
-        
+
         # Copy weights
         self.target_mixing_network.load_state_dict(self.mixing_network.state_dict())
-        
+
         # Mixing network optimizer
         self.mixing_optimizer = torch.optim.Adam(
             self.mixing_network.parameters(),
             lr=config.get('learning_rate', 0.0001)
         )
-        
+
         # Replay buffer
         self.replay_buffer = []
         self.buffer_size = config.get('buffer_size', 10000)
         self.batch_size = config.get('batch_size', 32)
-        
+
         # Training statistics
         self.training_stats = {
             'episode_rewards': [],
@@ -856,6 +924,126 @@ class ImprovedQMIX:
             'epsilon_values': [],
             'attention_weights': []
         }
+
+        # Optimizer attribute for compatibility with EGTMARL wrapper
+        # (use a dummy no-op optimizer that simply points to the per-agent
+        # optimizers; EGTMARL may overwrite this, but per-agent optimizers
+        # are still functional via the .agents[i].optimizer attribute)
+        class _AggregateOptimizer:
+            def __init__(self, optimizers):
+                self._opts = optimizers
+                self.param_groups = []
+                for o in optimizers:
+                    self.param_groups.extend(o.param_groups)
+                self.state = {}
+                self.defaults = {}
+            def zero_grad(self, set_to_none=True):
+                for o in self._opts:
+                    o.zero_grad(set_to_none=set_to_none)
+            def step(self, closure=None):
+                for o in self._opts:
+                    o.step(closure)
+            def state_dict(self):
+                return [o.state_dict() for o in self._opts]
+            def load_state_dict(self, states):
+                for o, s in zip(self._opts, states):
+                    o.load_state_dict(s)
+        self.optimizer = _AggregateOptimizer(
+            [a.optimizer for a in self.agents] + [self.mixing_optimizer]
+        )
+
+    def parameters(self):
+        """Aggregate parameters of all agents and the mixing network.
+
+        This lets callers (e.g. EGTMARL) use a single optimizer for the
+        whole ImprovedQMIX instance.
+        """
+        for agent in self.agents:
+            for p in agent.parameters():
+                yield p
+        for p in self.mixing_network.parameters():
+                yield p
+
+    @property
+    def epsilon(self) -> float:
+        """Mean exploration epsilon across agents (used by checkpointing)."""
+        if not self.agents:
+            return 0.0
+        return float(np.mean([float(a.epsilon) for a in self.agents]))
+
+    @epsilon.setter
+    def epsilon(self, value: float):
+        """Broadcast epsilon to all agents (used by checkpointing)."""
+        for a in self.agents:
+            a.epsilon = float(value)
+
+    def named_parameters(self):
+        """Aggregate named parameters of all agents and the mixing network.
+
+        Prefixed with ``agents.{i}.`` and ``mixing_network.`` so that
+        ``state_dict()`` round-trips are unambiguous.
+        """
+        for i, agent in enumerate(self.agents):
+            for name, p in agent.named_parameters():
+                yield f"agents.{i}.{name}", p
+        for name, p in self.mixing_network.named_parameters():
+            yield f"mixing_network.{name}", p
+
+    def state_dict(self):
+        """Snapshot of all trainable parameters (agents + mixing network)."""
+        return {name: p.detach().cpu().clone()
+                for name, p in self.named_parameters()}
+
+    def load_state_dict(self, state_dict, strict: bool = True):
+        """Restore parameters produced by ``state_dict()``.
+
+        Iterates over each submodule's own parameters in ``named_parameters``
+        order, so the agent / mixing prefixes are stripped and the right
+        tensor is matched to the right submodule.
+        """
+        agent_states = {}
+        mixing_states = {}
+        for name, tensor in state_dict.items():
+            if name.startswith("agents."):
+                # agents.<i>.<rest>
+                _, idx_str, *rest = name.split(".", 2)
+                rest_name = rest[0] if rest else ""
+                agent_states.setdefault(idx_str, {})[rest_name] = tensor
+            elif name.startswith("mixing_network."):
+                mixing_states[name[len("mixing_network."):]] = tensor
+            else:
+                if strict:
+                    raise KeyError(
+                        f"Unexpected ImprovedQMIX state_dict key: {name}"
+                    )
+
+        ok = True
+        for i, agent in enumerate(self.agents):
+            sub = agent_states.get(str(i), {})
+            if not sub:
+                if strict:
+                    raise KeyError(
+                        f"Missing state for agent {i} in state_dict"
+                    )
+                continue
+            missing, unexpected = agent.load_state_dict(sub, strict=False)
+            if missing or unexpected:
+                if strict:
+                    raise RuntimeError(
+                        f"agent {i}: missing={missing} unexpected={unexpected}"
+                    )
+                ok = False
+        if mixing_states:
+            m, u = self.mixing_network.load_state_dict(
+                mixing_states, strict=False
+            )
+            if m or u:
+                if strict:
+                    raise RuntimeError(
+                        f"mixing_network: missing={m} unexpected={u}"
+                    )
+                ok = False
+        return ok
     
     def act(self, 
             observations: List[np.ndarray],
@@ -900,61 +1088,275 @@ class ImprovedQMIX:
             self.replay_buffer = self.replay_buffer[-self.buffer_size:]
     
     def update(self) -> Dict[str, Any]:
-        """Update all agents and mixing network."""
-        if len(self.replay_buffer) < self.batch_size:
+        """Update all agents and mixing network end-to-end (full QMIX).
+
+        The replay buffer stores per-agent transitions in groups of
+        ``num_agents`` consecutive entries (one per agent, in agent order).
+        A *timestep* corresponds to a group of length ``num_agents``; the
+        QMIX mini-batch of size ``batch_size`` therefore needs
+        ``batch_size * num_agents`` buffer entries.  This is the contract
+        that ``_update_mixing_network`` enforces.
+
+        Returns ``{'status': 'insufficient_data'}`` until the buffer
+        contains at least one full mini-batch (otherwise we used to silently
+        return ``mixing_loss=0.0`` and train nothing).
+        """
+        num_agents = self.num_agents
+        # The QMIX mini-batch must consist of full per-timestep groups.
+        if len(self.replay_buffer) < self.batch_size * num_agents:
             return {'status': 'insufficient_data'}
-        
-        # Sample batch
-        batch_indices = np.random.choice(len(self.replay_buffer), self.batch_size, replace=False)
-        batch = [self.replay_buffer[i] for i in batch_indices]
-        
-        # Update each agent
+
+        # ---- 1. Sample complete per-timestep groups ----
+        # Valid timestep starts are 0, N, 2N, ...  Pick ``batch_size``
+        # distinct starts and reconstruct the per-timestep groups.
+        max_starts = len(self.replay_buffer) // num_agents
+        timestep_starts = np.random.choice(
+            max_starts, size=self.batch_size, replace=False
+        ) * num_agents
+        timesteps = []
+        for start in timestep_starts:
+            group = self.replay_buffer[start:start + num_agents]
+            if len(group) == num_agents:
+                timesteps.append(group)
+
+        if len(timesteps) == 0:
+            return {'status': 'insufficient_data'}
+
+        # ---- 2. Compute shaped rewards (5-component reward structure) ----
+        # The 5-component reward only makes sense if we have an episode
+        # metric to condition on.  When we don't, we fall back to the raw
+        # per-agent reward.
+        latest_metrics = self.training_stats.get('last_episode_metrics', {})
+        if latest_metrics:
+            for i, agent in enumerate(self.agents):
+                shaped_rewards_per_agent = []
+                for timestep in timesteps:
+                    obs, action, reward, next_obs, done = timestep[i]
+                    raw_metrics = dict(latest_metrics)
+                    raw_metrics.setdefault('survivor_count', reward)
+                    try:
+                        shaped, _ = agent.reward_structure.calculate_reward(
+                            raw_metrics
+                        )
+                    except Exception:
+                        shaped = float(reward)
+                    shaped_rewards_per_agent.append(float(shaped))
+                agent._last_shaped_rewards = shaped_rewards_per_agent
+
+        # ---- 3. End-to-end mixing-network update (Double-Q + soft target) ----
+        # This is the only place where the agents are actually trained
+        # against the joint return, so the gradient flows through both the
+        # mixing network AND the per-agent Q-networks.  Without this the
+        # system collapses to independent learners.
+        mixing_loss = self._update_mixing_network(timesteps)
+
+        # ---- 4. Per-agent auxiliary losses (no-grad, monitoring only) ----
+        # Each agent's value baseline is recalibrated against the same
+        # per-timestep group (one row per agent), purely for monitoring.
         agent_losses = []
         for i, agent in enumerate(self.agents):
-            # Filter transitions for this agent
-            agent_batch = [(obs, action, reward, next_obs, done) 
-                          for obs, action, reward, next_obs, done in batch]
-            
-            agent_loss = agent.update(agent_batch, self.mixing_network, self.target_mixing_network)
-            agent_losses.append(agent_loss)
-        
-        # Update mixing network (simplified - would need full QMIX update)
-        mixing_loss = self._update_mixing_network(batch)
-        
-        # Collect statistics
-        avg_q_loss = np.mean([loss['q_loss'] for loss in agent_losses])
-        avg_value_loss = np.mean([loss['value_loss'] for loss in agent_losses])
-        avg_total_loss = np.mean([loss['total_loss'] for loss in agent_losses])
-        avg_epsilon = np.mean([loss['epsilon'] for loss in agent_losses])
-        
+            agent_batch = [timesteps[t][i] for t in range(len(timesteps))]
+            try:
+                loss_dict = agent.compute_auxiliary_loss(agent_batch)
+            except AttributeError:
+                # Older builds may not have compute_auxiliary_loss
+                loss_dict = {
+                    'q_loss': 0.0,
+                    'value_loss': 0.0,
+                    'total_loss': 0.0,
+                    'epsilon': float(agent.epsilon),
+                }
+            agent_losses.append(loss_dict)
+
+        # ---- 5. Collect statistics ----
+        avg_q_loss = float(np.mean([loss['q_loss'] for loss in agent_losses]))
+        avg_value_loss = float(np.mean([loss['value_loss'] for loss in agent_losses]))
+        avg_total_loss = float(np.mean([loss['total_loss'] for loss in agent_losses]))
+        avg_epsilon = float(np.mean([loss['epsilon'] for loss in agent_losses]))
+
         # Update training stats
         self.training_stats['losses'].append({
             'q_loss': avg_q_loss,
             'value_loss': avg_value_loss,
             'total_loss': avg_total_loss,
-            'mixing_loss': mixing_loss
+            'mixing_loss': mixing_loss,
         })
         self.training_stats['epsilon_values'].append(avg_epsilon)
-        
+
         return {
             'q_loss': avg_q_loss,
             'value_loss': avg_value_loss,
             'total_loss': avg_total_loss,
             'mixing_loss': mixing_loss,
             'epsilon': avg_epsilon,
-            'buffer_size': len(self.replay_buffer)
+            'buffer_size': len(self.replay_buffer),
         }
     
-    def _update_mixing_network(self, batch: List[Tuple]) -> float:
-        """Update mixing network (simplified placeholder)."""
-        # In full QMIX, would compute:
-        # 1. Individual Q-values for current and next states
-        # 2. Mixed Q-values using mixing network
-        # 3. TD error and backpropagation
-        
-        # For now, return placeholder loss
-        return 0.0
-    
+    def _update_mixing_network(self, timesteps: List[List[Tuple]]) -> float:
+        """
+        End-to-end QMIX mixing-network update with double-Q learning.
+
+        This implements the full QMIX training step (audit fix for the
+        "placeholder mixing update" issue, risk-one in the audit report).
+        For each timestep in the batch we:
+
+          1. Compute per-agent Q-values for the chosen action:
+                q_i = agent_i.q_network(obs_i).gather(a_i)
+          2. Mix them through the online mixing network to get
+                Q_tot = mixing_network(q_1..q_N, state)
+          3. Compute the joint action value with the *target* mixing
+             network on next-state Q-values (Double Q):
+                Q'_tot = target_mixing_network(argmax_a' Q_i(s', a'),
+                                               next_state)
+          4. Form the TD target
+                y = r_mean + gamma * Q'_tot * (1 - done)
+          5. Optimise the MSE loss of (Q_tot, y) end-to-end, so the
+             gradient flows through the mixing network AND the per-agent
+             Q-networks.  This is the *only* place where the agents are
+             actually trained to maximise the joint return (credit
+             assignment), and where the mixing network learns to assign
+             credit.  Without this, the system collapses to independent
+             learners.
+
+        Args:
+            timesteps: A list of per-timestep groups.  Each group is a
+                list of length ``num_agents`` of tuples
+                ``(obs, action, reward, next_obs, done)`` – one per agent
+                (in agent order).  ``update()`` reconstructs these groups
+                from the flat replay buffer.
+
+        Returns:
+            mixing_loss (float).  0.0 if the input is empty or a malformed
+            batch is supplied (this is the only fallback path; the caller
+            guarantees the data shape so a real exception here is a bug).
+        """
+        if not timesteps:
+            return 0.0
+        try:
+            num_agents = self.num_agents
+            gamma = float(self.config.get('gamma', 0.99))
+            time_batch = len(timesteps)
+
+            # ---- 1. Stack per-timestep groups into tensors ----
+            obs_tensor = torch.FloatTensor(np.stack([
+                np.stack([np.asarray(t[i][0]) for i in range(num_agents)])
+                for t in timesteps
+            ]))  # [T, N, obs_dim]
+            next_obs_tensor = torch.FloatTensor(np.stack([
+                np.stack([np.asarray(t[i][3]) for i in range(num_agents)])
+                for t in timesteps
+            ]))  # [T, N, obs_dim]
+            actions_tensor = torch.LongTensor([
+                [int(t[i][1]) for i in range(num_agents)]
+                for t in timesteps
+            ])  # [T, N]
+
+            # Per-agent rewards -> joint reward.  Prefer the shaped
+            # 5-component reward computed in update() when it is
+            # available; fall back to the per-step mean of the raw
+            # per-agent reward.
+            shaped_matrix = [
+                agent._last_shaped_rewards
+                for agent in self.agents
+                if getattr(agent, '_last_shaped_rewards', None) is not None
+            ]
+            if (shaped_matrix
+                    and len(shaped_matrix) == num_agents
+                    and all(len(r) == time_batch for r in shaped_matrix)):
+                rewards_tensor = torch.FloatTensor(
+                    [float(np.mean([shaped_matrix[i][t]
+                                    for i in range(num_agents)]))
+                     for t in range(time_batch)]
+                )
+            else:
+                rewards_tensor = torch.FloatTensor([
+                    float(np.mean([t[i][2] for i in range(num_agents)]))
+                    for t in timesteps
+                ])
+            done_tensor = torch.FloatTensor([
+                1.0 if any(t[i][4] for i in range(num_agents)) else 0.0
+                for t in timesteps
+            ])  # [T]
+
+            # State: average of per-agent observations (matches the
+            # convention used in the rest of the codebase, e.g.
+            # marl_layer.py).
+            state_tensor = obs_tensor.mean(dim=1)  # [T, obs_dim]
+            next_state_tensor = next_obs_tensor.mean(dim=1)  # [T, obs_dim]
+
+            # ---- 2. Per-agent Q-values (chosen actions) ----
+            per_agent_q = []
+            for i, agent in enumerate(self.agents):
+                q_i = agent.q_network(obs_tensor[:, i, :])  # [T, A_i]
+                a_i = actions_tensor[:, i].clamp(0, q_i.shape[1] - 1).unsqueeze(1)
+                per_agent_q.append(q_i.gather(1, a_i).squeeze(1))  # [T]
+            q_per_agent = torch.stack(per_agent_q, dim=1)  # [T, N]
+
+            # ---- 3. Joint Q via the online mixing network ----
+            q_total = self.mixing_network(q_per_agent, state_tensor).squeeze(-1)
+            # shape is [T]
+
+            # ---- 4. Target joint Q via the target mixing network ----
+            # Double Q: pick the action with the *online* network,
+            # evaluate with the *target* network.
+            with torch.no_grad():
+                next_q_per_agent_target = []
+                for i, agent in enumerate(self.agents):
+                    nq_i = agent.target_q_network(next_obs_tensor[:, i, :])  # [T, A_i]
+                    online_nq_i = agent.q_network(next_obs_tensor[:, i, :])
+                    best_action = online_nq_i.argmax(dim=1, keepdim=True)  # [T, 1]
+                    nq = nq_i.gather(
+                        1, best_action.clamp(0, nq_i.shape[1] - 1)
+                    ).squeeze(1)
+                    next_q_per_agent_target.append(nq)
+                next_q_per_agent_target = torch.stack(
+                    next_q_per_agent_target, dim=1
+                )  # [T, N]
+                next_q_total = self.target_mixing_network(
+                    next_q_per_agent_target, next_state_tensor
+                ).squeeze(-1)  # [T]
+
+                # ---- 5. TD target ----
+                target = rewards_tensor + gamma * next_q_total * (1.0 - done_tensor)
+
+            # ---- 6. End-to-end MSE loss ----
+            mixing_loss = F.mse_loss(q_total, target.detach())
+
+            # ---- 7. Optimise both the mixing network AND the per-agent
+            #         Q-networks end-to-end.  We accumulate per-agent
+            #         gradients and step each agent's optimizer.
+            self.mixing_optimizer.zero_grad()
+            for agent in self.agents:
+                agent.optimizer.zero_grad()
+
+            mixing_loss.backward()
+
+            # Gradient clipping (separate for mixing vs agents)
+            torch.nn.utils.clip_grad_norm_(self.mixing_network.parameters(), max_norm=10.0)
+            for agent in self.agents:
+                torch.nn.utils.clip_grad_norm_(agent.parameters(), max_norm=10.0)
+
+            self.mixing_optimizer.step()
+            for agent in self.agents:
+                agent.optimizer.step()
+
+            # ---- 8. Soft-update target mixing network ----
+            with torch.no_grad():
+                tau = float(self.config.get('tau', 0.005))
+                for p, tp in zip(
+                    self.mixing_network.parameters(),
+                    self.target_mixing_network.parameters(),
+                ):
+                    tp.data.mul_(1.0 - tau).add_(p.data, alpha=tau)
+
+            return float(mixing_loss.item())
+
+        except Exception as e:
+            # Defensive: a malformed batch should never crash the trainer
+            import logging
+            logging.warning(f"QMIX._update_mixing_network failed: {type(e).__name__}: {e}")
+            return 0.0
+
     def end_episode(self, 
                    episode_reward: float,
                    episode_length: int,
