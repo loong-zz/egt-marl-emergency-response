@@ -518,6 +518,8 @@ class EGTMARLTrainer:
         episode_metrics['rescued'] = info.get('statistics', {}).get('total_rescued', 0)
         episode_metrics['deaths'] = info.get('statistics', {}).get('total_deaths', 0)
         episode_metrics['resources_used'] = info.get('statistics', {}).get('resources_used', 0)
+        # T-log: 也记录总casualty数，供 Survivors X/Y 格式使用
+        episode_metrics['total_casualties'] = getattr(self.env, 'num_victims', 0) or len(getattr(self.env, 'casualties', {}))
         
         # 计算救援成功率
         total_victims = self.env.num_victims
@@ -954,11 +956,37 @@ class EGTMARLTrainer:
                             param_group['lr'] = current_lr
                         logger.debug(f"Phase {phase.get('name', current_phase_idx)} - Episode {episode}: Learning rate set to {current_lr:.6f}")
 
-                # Audit fix T1: also scale epsilon per-stage (curriculum)
-                if 'epsilon_scale' in phase:
-                    # When the phase changes, snap epsilon to the per-phase scale
-                    if 'current_phase_idx' not in dir():
-                        pass
+                # T1 fix: when a new phase begins, also apply phase['exploration_rate']
+                # (absolute) and phase['lambda'] (injected into EGT layer), and
+                # phase['difficulty'] (drives env casualty severity mix).
+                if current_phase_idx != getattr(self, '_last_phase_idx', -2):
+                    # ----- exploration_rate (absolute, takes priority over epsilon_scale) -----
+                    if 'exploration_rate' in phase:
+                        target_eps = float(phase['exploration_rate'])
+                        epsilon = max(epsilon_end, target_eps)
+                        logger.info(
+                            f"=== Entering phase '{phase.get('name', current_phase_idx)}' "
+                            f"(eps → {epsilon:.3f}, lr={current_lr:.6f}) ==="
+                        )
+                    # ----- lambda_param (inject into EGT layer) -----
+                    if 'lambda' in phase and hasattr(self, 'algorithm') and hasattr(self.algorithm, 'egt_layer'):
+                        lam = float(phase['lambda'])
+                        self.algorithm.egt_layer.lambda_param = max(0.0, min(1.0, lam))
+                        logger.info(
+                            f"  phase lambda -> EGT layer lambda_param = {self.algorithm.egt_layer.lambda_param:.3f}"
+                        )
+                    # ----- difficulty (drive env casualty severity distribution) -----
+                    if 'difficulty' in phase and hasattr(self, 'env') and hasattr(self.env, 'set_difficulty'):
+                        diff = float(phase['difficulty'])
+                        self.env.set_difficulty(diff)
+                        logger.info(
+                            f"  phase difficulty -> env.set_difficulty({diff:.2f})"
+                        )
+                    self._last_phase_idx = current_phase_idx
+
+                # Backward-compat: epsilon_scale (relative) still works when
+                # phase['exploration_rate'] is not provided.
+                if 'epsilon_scale' in phase and 'exploration_rate' not in phase:
                     # Recompute target epsilon for this phase (relative to epsilon_end)
                     phase_epsilon = max(
                         epsilon_end,

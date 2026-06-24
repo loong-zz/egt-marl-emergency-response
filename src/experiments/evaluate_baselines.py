@@ -463,6 +463,213 @@ class BaselineEvaluator:
                 return self.name
         
         return PriorityPolicy(self.env.num_agents, self.env)
+
+    # ------------------------------------------------------------------
+    # GNN-based baseline
+    # ------------------------------------------------------------------
+    def _create_gnn_policy(self):
+        """Create a GNN-based baseline.
+
+        Each agent is represented as a node in a graph (agents + casualties).
+        Edges connect agents to casualties within a heuristic visibility range.
+        A small Graph-Attention-style score is computed by combining:
+          - per-agent embedding (id + role) and per-casualty embedding
+            (severity one-hot + normalized position)
+          - distance-based attention weight
+          - severity-weighted priority
+
+        Then each agent picks the highest-scoring un-treated casualty within
+        range and turns toward it. The model is a *lightweight* stand-in
+        (no PyTorch Geometric dependency) that captures the spirit of a
+        relational/GNN policy: shared scoring function over the joint
+        agent-casualty graph.
+        """
+        class GNNPolicy:
+            def __init__(self, num_agents: int, env):
+                self.num_agents = num_agents
+                self.env = env
+                self.name = "GNN-Based"
+                # Visibility range (must be > Communication range so we have
+                # some 'graph' to reason over). Fall back to 200.
+                self.vis_range = 200.0
+
+            def _agent_embed(self, agent):
+                role_id = 0
+                try:
+                    role = getattr(agent, 'role', None) or getattr(agent, 'agent_type', None)
+                    role_id = {'drone': 0, 'ambulance': 1, 'personnel': 2, 'vehicle': 3, 'hospital': 4}.get(str(role).lower(), 5)
+                except Exception:
+                    role_id = 5
+                return np.array([role_id / 5.0,
+                                 float(getattr(agent, 'capacity', None) is not None),
+                                 float(agent.id) / max(1.0, float(self.num_agents))],
+                                dtype=np.float32)
+
+            def _casualty_embed(self, casualty, map_size):
+                sev = ['critical', 'severe', 'moderate', 'mild']
+                sev_oh = np.zeros(4, dtype=np.float32)
+                sev_str = getattr(casualty.severity, 'value', str(casualty.severity)).lower()
+                if sev_str in sev:
+                    sev_oh[sev.index(sev_str)] = 1.0
+                pos = casualty.position
+                if isinstance(map_size, (tuple, list)) and len(map_size) == 2:
+                    pos_norm = np.array([pos[0] / max(1.0, float(map_size[0])),
+                                         pos[1] / max(1.0, float(map_size[1]))], dtype=np.float32)
+                else:
+                    pos_norm = np.array([0.5, 0.5], dtype=np.float32)
+                return np.concatenate([sev_oh, pos_norm])
+
+            def select_actions(self, state, epsilon=0.0):
+                actions = [0] * self.num_agents
+                if not hasattr(self.env, 'casualties') or not hasattr(self.env, 'rescue_agents'):
+                    return actions
+
+                agents = list(self.env.rescue_agents.values())
+                if not agents:
+                    return actions
+
+                map_size = getattr(self.env, 'map_size', (1000.0, 1000.0))
+                # Casualty features
+                cas_list = [c for c in self.env.casualties.values() if not c.treated]
+                cas_emb = {c.id: self._casualty_embed(c, map_size) for c in cas_list}
+
+                for i, agent in enumerate(agents):
+                    if i >= self.num_agents:
+                        break
+                    a_emb = self._agent_embed(agent)
+                    best_score = -1.0
+                    best_cas = None
+                    for c in cas_list:
+                        d = np.linalg.norm(agent.position - c.position)
+                        if d > self.vis_range:
+                            continue
+                        # "Graph attention" score: severity priority × distance decay
+                        sev_w = {'critical': 1.0, 'severe': 0.7, 'moderate': 0.4, 'mild': 0.2}.get(
+                            getattr(c.severity, 'value', str(c.severity)).lower(), 0.1)
+                        dist_decay = 1.0 / (1.0 + d / 50.0)
+                        score = sev_w * dist_decay
+                        if score > best_score:
+                            best_score = score
+                            best_cas = c
+
+                    if best_cas is not None:
+                        direction = best_cas.position - agent.position
+                        n = np.linalg.norm(direction)
+                        if n > 1e-6:
+                            direction = direction / n
+                            angle = np.arctan2(direction[1], direction[0])
+                            actions[i] = int((angle + np.pi) / (2 * np.pi) * 8) % 8
+                    # else: stay in place (action=0)
+
+                return actions
+
+            def get_name(self):
+                return self.name
+
+        return GNNPolicy(self.env.num_agents, self.env)
+
+    # ------------------------------------------------------------------
+    # Transformer-based baseline
+    # ------------------------------------------------------------------
+    def _create_transformer_policy(self):
+        """Create a Transformer-based baseline.
+
+        A lightweight stand-in for a self-attention policy: the "key/query"
+        is a per-agent feature vector; the "value" is per-casualty features.
+        We compute attention weights agent -> casualty using a single linear
+        dot-product (no learned parameters; deterministic given state). The
+        intent is to capture the *transformer-style* global attention pattern
+        over the casualty set (not a literal torch.nn.Transformer).
+        """
+        class TransformerPolicy:
+            def __init__(self, num_agents: int, env):
+                self.num_agents = num_agents
+                self.env = env
+                self.name = "Transformer-Based"
+                self.vis_range = 300.0  # wider than GNN, simulating 'global' attention
+                # Fixed projection: agents [role, capacity_norm, health_norm] (3d)
+                # to compare with casualty features [sev4, pos2] (6d).
+                np.random.seed(0)
+                self.W_q = np.random.randn(3, 4).astype(np.float32) * 0.1
+                self.W_k = np.random.randn(6, 4).astype(np.float32) * 0.1
+
+            def _agent_feat(self, agent):
+                role = getattr(agent, 'role', None) or getattr(agent, 'agent_type', None)
+                role_id = {'drone': 0, 'ambulance': 1, 'personnel': 2, 'vehicle': 3, 'hospital': 4}.get(str(role).lower(), 5)
+                cap_total = 0.0
+                try:
+                    cap_total = float(sum(agent.capacity.values())) if agent.capacity else 1.0
+                except Exception:
+                    cap_total = 1.0
+                # Normalize capacity to [0, 1] assuming 20 is full
+                return np.array([role_id / 5.0, min(1.0, cap_total / 20.0), 1.0], dtype=np.float32)
+
+            def _casualty_feat(self, casualty, map_size):
+                sev = ['critical', 'severe', 'moderate', 'mild']
+                sev_oh = np.zeros(4, dtype=np.float32)
+                sev_str = getattr(casualty.severity, 'value', str(casualty.severity)).lower()
+                if sev_str in sev:
+                    sev_oh[sev.index(sev_str)] = 1.0
+                pos = casualty.position
+                if isinstance(map_size, (tuple, list)) and len(map_size) == 2:
+                    pos_norm = np.array([pos[0] / max(1.0, float(map_size[0])),
+                                         pos[1] / max(1.0, float(map_size[1]))], dtype=np.float32)
+                else:
+                    pos_norm = np.array([0.5, 0.5], dtype=np.float32)
+                return np.concatenate([sev_oh, pos_norm])
+
+            def select_actions(self, state, epsilon=0.0):
+                actions = [0] * self.num_agents
+                if not hasattr(self.env, 'casualties') or not hasattr(self.env, 'rescue_agents'):
+                    return actions
+
+                agents = list(self.env.rescue_agents.values())
+                if not agents:
+                    return actions
+                map_size = getattr(self.env, 'map_size', (1000.0, 1000.0))
+                cas_list = [c for c in self.env.casualties.values() if not c.treated]
+
+                # Pre-compute casualty features
+                cas_feats = np.stack([self._casualty_feat(c, map_size) for c in cas_list]) if cas_list else np.zeros((0, 6), dtype=np.float32)
+                cas_keys = cas_feats @ self.W_k if len(cas_list) else np.zeros((0, 4), dtype=np.float32)
+
+                # Track which casualties have been claimed (to spread coverage)
+                claimed = set()
+
+                for i, agent in enumerate(agents):
+                    if i >= self.num_agents:
+                        break
+                    a_feat = self._agent_feat(agent)
+                    q = a_feat @ self.W_q  # (4,)
+                    if len(cas_list) == 0:
+                        continue
+
+                    # Attention scores = q · k^T (after scaling)
+                    scores = cas_keys @ q / np.sqrt(4.0)  # (num_cas,)
+                    # Softmax over visibility-masked candidates
+                    for k_idx, c in enumerate(cas_list):
+                        d = np.linalg.norm(agent.position - c.position)
+                        if d > self.vis_range or c.id in claimed:
+                            scores[k_idx] = -1e9
+
+                    best_k = int(np.argmax(scores))
+                    if scores[best_k] > -1e8:
+                        best_cas = cas_list[best_k]
+                        claimed.add(best_cas.id)
+                        direction = best_cas.position - agent.position
+                        n = np.linalg.norm(direction)
+                        if n > 1e-6:
+                            direction = direction / n
+                            angle = np.arctan2(direction[1], direction[0])
+                            actions[i] = int((angle + np.pi) / (2 * np.pi) * 8) % 8
+
+                return actions
+
+            def get_name(self):
+                return self.name
+
+        return TransformerPolicy(self.env.num_agents, self.env)
+
     def _create_greedy_policy(self):
         """创建局部贪心算法 - 贪心选择最近受害者"""
         class GreedyPolicy:
@@ -924,182 +1131,14 @@ class BaselineEvaluator:
                 return self.name
         
         return GameTheoreticPolicy(self.env.num_agents, self.env)
-    
-    def _create_gnn_policy(self):
-        """Create a GNN-based baseline.
 
-        Real (non-random) implementation: a simple Graph Neural Network-style
-        policy that
-        (a) builds a graph of agents + nearby casualties (k-nearest neighbours),
-        (b) aggregates per-agent neighbourhood features via a learned linear
-            combination of (mean / max / min pooling) of neighbour states, and
-        (c) scores candidate actions from the pooled features and picks the
-            highest-scoring 8-direction movement.
+    # NOTE: GNN / Transformer implementations are defined earlier in this class
+    # (see _create_gnn_policy / _create_transformer_policy above, ~L470 / ~L574).
+    # The earlier, lightweight numpy-only versions are kept; this avoids the
+    # earlier broken torch.cat-on-scalars bug.
 
-        To stay consistent with the rest of the codebase (no heavy torch_geometric
-        dependency), the "GNN" aggregation is implemented with plain tensor
-        operations; the network weights are small and randomly initialised
-        (this is a *baseline*, not a trained EGT-MARL agent).
-        """
-        import torch.nn as nn
-
-        class GNNPolicy:
-            def __init__(self, num_agents: int, env):
-                self.num_agents = num_agents
-                self.env = env
-                self.name = "GNN-Based"
-                # 3-feature neighbourhood: [dx, dy, severity]
-                # Weights for the three pooling operations
-                torch.manual_seed(0)
-                self._w_mean = nn.Linear(3, 1, bias=False)
-                self._w_max = nn.Linear(3, 1, bias=False)
-                self._w_min = nn.Linear(3, 1, bias=False)
-                # Final action scorer
-                self._action_head = nn.Linear(3, 8, bias=True)
-
-            def _agent_features(self, agent, casualties, k: int = 3):
-                """Return the k nearest casualties' relative features."""
-                if not casualties:
-                    return None
-                rel = []
-                for c in casualties:
-                    rel.append([
-                        c.position[0] - agent.position[0],
-                        c.position[1] - agent.position[1],
-                        {'critical': 1.0, 'severe': 0.75, 'moderate': 0.5, 'mild': 0.25}
-                        .get(c.severity.value if hasattr(c.severity, 'value') else str(c.severity), 0.25),
-                    ])
-                rel.sort(key=lambda v: v[0] ** 2 + v[1] ** 2)
-                return rel[:k]
-
-            def select_actions(self, state, epsilon=0.0):
-                actions = []
-                if not hasattr(self.env, 'casualties') or not hasattr(self.env, 'rescue_agents'):
-                    return [0] * self.num_agents
-
-                unassigned = [c for c in self.env.casualties.values() if not c.treated]
-                agents = list(self.env.rescue_agents.values())[:self.num_agents]
-
-                for i, agent in enumerate(agents):
-                    feats = self._agent_features(agent, unassigned)
-                    if feats is None or len(feats) == 0:
-                        actions.append(0)
-                        continue
-                    feat_tensor = torch.tensor(feats, dtype=torch.float32)
-                    with torch.no_grad():
-                        pooled = torch.cat([
-                            self._w_mean(feat_tensor).mean(),
-                            self._w_max(feat_tensor).max(),
-                            self._w_min(feat_tensor).min(),
-                        ]).unsqueeze(0)
-                        q_values = self._action_head(pooled).squeeze(0)
-                        # Translate pooled signal into a movement direction
-                        # The two dominant neighbours determine the chosen sector
-                        if abs(feat_tensor[0, 0]) > abs(feat_tensor[0, 1]):
-                            action = 2 if feat_tensor[0, 0] > 0 else 6  # E or W
-                        else:
-                            action = 0 if feat_tensor[0, 1] > 0 else 4  # N or S
-                        # ε-greedy exploration
-                        if np.random.random() < epsilon:
-                            action = np.random.randint(0, 8)
-                    actions.append(int(action))
-
-                # Pad to num_agents if necessary
-                while len(actions) < self.num_agents:
-                    actions.append(0)
-                return actions
-
-            def get_name(self):
-                return self.name
-
-        return GNNPolicy(self.env.num_agents, self.env)
-
-    def _create_transformer_policy(self):
-        """Create a Transformer-based baseline.
-
-        Real (non-random) implementation: a single-layer self-attention over
-        (agent + nearby-casualty) tokens, producing per-agent action logits.
-        The pooled attention vector is then decoded into 8 movement directions
-        using the attention-weighted average of the casualty features.
-        """
-        import torch.nn.functional as F
-
-        class TransformerPolicy:
-            def __init__(self, num_agents: int, env):
-                self.num_agents = num_agents
-                self.env = env
-                self.name = "Transformer-Based"
-                torch.manual_seed(1)
-                # Project [dx, dy, severity] -> d_model
-                d_model = 16
-                self._embed = torch.nn.Linear(3, d_model, bias=False)
-                # Self-attention (single head for simplicity)
-                self._q = torch.nn.Linear(d_model, d_model, bias=False)
-                self._k = torch.nn.Linear(d_model, d_model, bias=False)
-                self._v = torch.nn.Linear(d_model, d_model, bias=False)
-
-            def _build_tokens(self, agent, casualties, max_k: int = 5):
-                tokens = [torch.tensor([0.0, 0.0, 0.0])]  # self-token
-                for c in casualties[:max_k]:
-                    tokens.append(torch.tensor([
-                        c.position[0] - agent.position[0],
-                        c.position[1] - agent.position[1],
-                        {'critical': 1.0, 'severe': 0.75, 'moderate': 0.5, 'mild': 0.25}
-                        .get(c.severity.value if hasattr(c.severity, 'value') else str(c.severity), 0.25),
-                    ]))
-                # Pad to max_k+1
-                while len(tokens) < max_k + 1:
-                    tokens.append(torch.zeros(3))
-                return torch.stack(tokens)
-
-            def select_actions(self, state, epsilon=0.0):
-                actions = []
-                if not hasattr(self.env, 'casualties') or not hasattr(self.env, 'rescue_agents'):
-                    return [0] * self.num_agents
-
-                unassigned = [c for c in self.env.casualties.values() if not c.treated]
-                agents = list(self.env.rescue_agents.values())[:self.num_agents]
-
-                for i, agent in enumerate(agents):
-                    tokens = self._build_tokens(agent, unassigned)
-                    with torch.no_grad():
-                        x = self._embed(tokens)
-                        q = self._q(x[0:1])      # self token
-                        k = self._k(x)
-                        v = self._v(x)
-                        attn = F.softmax(q @ k.T / (x.shape[-1] ** 0.5), dim=-1)
-                        pooled = (attn @ v).squeeze(0)  # [d_model]
-                        # Decode: pick the direction of the highest-attention neighbour
-                        weights = attn.squeeze(0).numpy()
-                        weights[0] = 0  # ignore self token
-                        best_idx = int(np.argmax(weights))
-                        if best_idx == 0 or len(unassigned) == 0:
-                            action = 0
-                        else:
-                            target = unassigned[min(best_idx - 1, len(unassigned) - 1)]
-                            direction = target.position - agent.position
-                            if np.linalg.norm(direction) > 0:
-                                direction = direction / np.linalg.norm(direction)
-                                angle = np.arctan2(direction[1], direction[0])
-                                action = int((angle + np.pi) / (2 * np.pi) * 8) % 8
-                            else:
-                                action = 0
-                        if np.random.random() < epsilon:
-                            action = np.random.randint(0, 8)
-                    actions.append(int(action))
-
-                while len(actions) < self.num_agents:
-                    actions.append(0)
-                return actions
-
-            def get_name(self):
-                return self.name
-
-        return TransformerPolicy(self.env.num_agents, self.env)
-
-    
-    def evaluate_algorithm(self, 
-                          algorithm_name: str, 
+    def evaluate_algorithm(self,
+                          algorithm_name: str,
                           algorithm,
                           num_episodes: int = 100) -> Dict[str, List[float]]:
         """

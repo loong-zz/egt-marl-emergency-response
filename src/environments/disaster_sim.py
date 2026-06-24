@@ -66,7 +66,16 @@ class DisasterSim:
         self.resource_manager = ResourceManager(self.config)
         self.treatment_manager = TreatmentManager(self.config)
         self.drone_manager = DroneManager(self.config, self)
-        
+
+        # Curriculum difficulty in [0, 1]: 0 = all MILD (easy), 1 = mostly CRITICAL (hard)
+        # Linear-interpolated severity distribution:
+        #   difficulty=0.0 -> [CRITICAL=0.05, SEVERE=0.20, MODERATE=0.45, MILD=0.30]
+        #   difficulty=0.5 -> [0.15, 0.25, 0.35, 0.25]    (matches legacy default)
+        #   difficulty=1.0 -> [0.30, 0.30, 0.25, 0.15]
+        self.severity_difficulty: float = 0.5
+        # Default severity distribution kept as a class-level constant for clarity
+        self._default_severity_dist = (0.15, 0.25, 0.35, 0.25)
+
         # Components
         self.affected_areas: Dict[int, AffectedArea] = {}
         self.resource_depots: Dict[int, ResourceDepot] = {}
@@ -98,7 +107,16 @@ class DisasterSim:
             },
             'resources_used': 0.0
         }
-    
+
+    def set_difficulty(self, difficulty: float) -> None:
+        """Set curriculum difficulty for casualty severity distribution.
+
+        Args:
+            difficulty: Value in [0, 1]. 0 = easy (mostly MILD), 1 = hard
+                       (mostly CRITICAL). Values outside the range are clipped.
+        """
+        self.severity_difficulty = float(max(0.0, min(1.0, difficulty)))
+
     def _initialize_affected_areas(self) -> None:
         """Initialize affected areas based on scenario."""
         num_areas = max(3, self.config.num_hospitals)
@@ -253,13 +271,22 @@ class DisasterSim:
                 offset = (np.random.rand(2) - 0.5) * area.size * 0.5
                 position = area.position + offset
                 
-                # Random severity
+                # Random severity — distribution driven by curriculum difficulty
+                #   difficulty=0.0 -> [0.05, 0.20, 0.45, 0.30]   (easy, mostly MILD)
+                #   difficulty=0.5 -> [0.15, 0.25, 0.35, 0.25]   (legacy default)
+                #   difficulty=1.0 -> [0.30, 0.30, 0.25, 0.15]   (hard, mostly CRITICAL)
+                d = float(getattr(self, 'severity_difficulty', 0.5))
+                d = max(0.0, min(1.0, d))
+                crit = 0.05 + 0.25 * d        # 0.05 -> 0.30
+                seve = 0.20 + 0.10 * d        # 0.20 -> 0.30
+                mode = 0.45 - 0.20 * d        # 0.45 -> 0.25
+                mild = 1.0 - (crit + seve + mode)
                 severity = np.random.choice([
                     CasualtySeverity.CRITICAL,
                     CasualtySeverity.SEVERE,
                     CasualtySeverity.MODERATE,
                     CasualtySeverity.MILD
-                ], p=[0.15, 0.25, 0.35, 0.25])
+                ], p=[crit, seve, mode, mild])
                 
                 # Calculate resources needed based on severity
                 resources_needed = self._calculate_resources_needed(severity)
