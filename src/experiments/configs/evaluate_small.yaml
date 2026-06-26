@@ -1,6 +1,6 @@
 # 小规模评估配置 - 快速测试
 
-output_dir: evaluation_results
+output_dir: src/evaluation_results
 
 # 评估配置
 evaluation:

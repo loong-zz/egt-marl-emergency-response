@@ -23,6 +23,7 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from environments.disaster_sim import DisasterSim
+from environments.config.constants import NUM_STRATEGIES
 from algorithms.egt_marl import EGTMARL
 from algorithms.qmix_improved import ImprovedQMIX
 from utils.metrics import MetricsCollector
@@ -105,7 +106,8 @@ class BaselineEvaluator:
     
     def setup_directories(self):
         """设置目录结构"""
-        base_dir = Path(self.config.get('output_dir', 'evaluation_results'))
+        # 把结果目录固定在 src/ 下,与训练产物保持一致
+        base_dir = project_root / self.config.get('output_dir', 'evaluation_results')
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         self.evaluation_dir = base_dir / f'baseline_evaluation_{timestamp}'
         
@@ -238,7 +240,7 @@ class BaselineEvaluator:
                     'fairness_weight': 0.3,
                     'efficiency_weight': 0.7,
                     'anti_spoofing_threshold': 0.1,
-                    'num_strategies': checkpoint_config.get('egt', {}).get('num_strategies', 3),
+                    'num_strategies': checkpoint_config.get('egt', {}).get('num_strategies', NUM_STRATEGIES),
                     'learning_rate': checkpoint_config.get('egt', {}).get('learning_rate', 0.01),
                     'mutation_rate': 0.01,
                     'selection_intensity': 1.0,

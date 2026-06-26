@@ -209,6 +209,29 @@ INTERFERENCE_CONFIG = {
 # 区域配置（用于多区域适应度计算）
 NUM_REGIONS = 4  # 灾难场景划分为4个区域
 
+
+# ==================== EGT-MARL Algorithm Constants ====================
+# 这些是算法侧的"硬常量",与仿真侧常量(SimulationConfig)平行。
+# 在代码里改这些值会改变算法行为,所以不要随意调。
+#
+# 配置优先级(高→低):
+#   1. YAML 配置文件 (src/configs/egt_marl.yaml, src/experiments/configs/*.yaml)
+#   2. 命令行参数 (--num_episodes 等)
+#   3. 本文件常量 (作为 yaml 缺失字段时的兜底默认值)
+# 即:yaml 显式给出值时优先用 yaml,没给才回退到本常量。
+
+# EGT 演化博弈的策略数量。修改此值需同时更新:
+#   - src/configs/egt_marl.yaml 的 egt.num_strategies
+#   - 策略名顺序(见 STRATEGY_NAMES,需保持长度 == NUM_STRATEGIES)
+# 当前固定 3(Fairness / Efficiency / Balanced),这是 EGTLayer 实际
+# 跑通后被广泛使用的值。
+NUM_STRATEGIES = 3
+
+# 策略名映射,长度必须 == NUM_STRATEGIES
+# 顺序与 egt_layer.get_fairness_efficiency_weights 的索引对应:
+#   0 = Fairness, 1 = Efficiency, 2 = Balanced
+STRATEGY_NAMES = ['Fairness', 'Efficiency', 'Balanced']
+
 # ==================== Configuration Dataclass ====================
 
 @dataclass

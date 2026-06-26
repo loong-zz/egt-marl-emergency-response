@@ -112,7 +112,8 @@ class RobustnessTester:
     
     def setup_directories(self):
         """设置目录结构"""
-        base_dir = Path(self.config.get('output_dir', 'robustness_results'))
+        # 把结果目录固定在 src/ 下,与训练产物保持一致
+        base_dir = project_root / self.config.get('output_dir', 'robustness_results')
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         self.test_dir = base_dir / f'robustness_test_{timestamp}'
         

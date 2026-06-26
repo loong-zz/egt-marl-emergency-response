@@ -1,6 +1,6 @@
 # 大规模评估配置 - 扩展性测试
 
-output_dir: evaluation_results
+output_dir: src/evaluation_results
 
 # 评估配置
 evaluation:

@@ -26,8 +26,15 @@ class EGTLayer(nn.Module):
     
     def __init__(self, num_strategies: int = 4, payoff_matrix: Optional[torch.Tensor] = None,
                  learning_rate: float = 0.01, device: torch.device = torch.device("cpu")):
+        """
+        Args:
+            num_strategies: 策略数量。**生产配置应显式传入 3** (与
+                environments.config.constants.NUM_STRATEGIES 一致)。
+                这里的默认值 4 是历史遗留,仅用于单元测试。
+                推荐从 yaml 配置的 egt.num_strategies 字段读取。
+        """
         super().__init__()
-        
+
         self.num_strategies = num_strategies
         self.device = device
         
@@ -59,12 +66,21 @@ class EGTLayer(nn.Module):
         self.selection_strength = 1.0
 
         # Strategy definitions (must align with paper section 4.3)
-        self.strategy_names = [
+        # Always length == num_strategies so that get_strategy_recommendation
+        # can safely index it.  The first 4 follow the paper; any extras are
+        # labelled generically.
+        base_names = [
             "Fairness-focused",
             "Efficiency-focused",
             "Balanced",
-            "Adaptive"
+            "Adaptive",
         ]
+        if num_strategies <= len(base_names):
+            self.strategy_names = base_names[:num_strategies]
+        else:
+            self.strategy_names = base_names + [
+                f"Strategy-{i}" for i in range(len(base_names), num_strategies)
+            ]
 
         # Convergence tracking
         self.convergence_threshold = 1e-4
@@ -306,43 +322,70 @@ class EGTLayer(nn.Module):
     def get_fairness_efficiency_weights(self) -> Tuple[float, float]:
         """
         Get current fairness and efficiency weights from strategy distribution.
-        
+
+        Indexing policy (works for any num_strategies >= 2):
+        - index 0           -> fairness-focused
+        - index 1           -> efficiency-focused
+        - index 2 (if any)  -> balanced (50/50)
+        - index 3+          -> adaptive, distributed by recent fitness
+        - any remaining     -> neutral, split 50/50
+
         Returns:
             Tuple of (fairness_weight, efficiency_weight)
         """
         distribution = self.get_strategy_distribution()
-        
-        # Fairness weight from fairness-focused strategy
-        fairness_weight = distribution[0].item()
-        
-        # Efficiency weight from efficiency-focused strategy
-        efficiency_weight = distribution[1].item()
-        
-        # Add contributions from balanced and adaptive strategies
-        balanced_weight = distribution[2].item()
-        adaptive_weight = distribution[3].item()
-        
-        # Balanced strategy contributes equally
-        fairness_weight += balanced_weight * 0.5
-        efficiency_weight += balanced_weight * 0.5
-        
-        # Adaptive strategy adjusts based on performance
-        if len(self.fitness_history) > 0:
+        n = int(distribution.shape[0])
+
+        # Defensive fallback for the degenerate 1-strategy case.
+        if n < 2:
+            return 0.5, 0.5
+
+        fairness_weight = float(distribution[0].item())
+        efficiency_weight = float(distribution[1].item())
+
+        if n >= 3:
+            balanced_weight = float(distribution[2].item())
+            fairness_weight += balanced_weight * 0.5
+            efficiency_weight += balanced_weight * 0.5
+
+        # Index 3 is "adaptive" when present, but the underlying semantic
+        # (shift by recent fitness) applies to *all* remaining strategies as
+        # well so we can support any num_strategies.
+        # P10 fix: previously, when ``num_strategies=2`` (no balanced, no
+        # adaptive strategy), the fitness-based adaptive branch was
+        # *unreachable* because both ``n >= 3`` and ``n >= 4`` guards failed.
+        # Apply the adaptive shift to the residual distribution mass (any
+        # strategies beyond the first two) so the trade-off still reacts
+        # to recent fitness regardless of how many strategies are present.
+        adaptive_share = 0.0
+        if n >= 4:
+            adaptive_share += float(distribution[3].item())
+        if n > 4:
+            # Treat extra strategies as additional "adaptive" mass.
+            adaptive_share += float(distribution[4:].sum().item())
+        # n=2: use a small synthetic "adaptive" share driven by recent
+        # fitness, so the trade-off still reacts even when no explicit
+        # adaptive strategy exists.  Capped at 0.2 to avoid overpowering
+        # the dominant 2-strategy semantics.
+        if n == 2:
+            adaptive_share = 0.2
+
+        if adaptive_share > 0.0 and len(self.fitness_history) > 0:
             recent_fitness = np.mean(self.fitness_history[-5:]) if len(self.fitness_history) >= 5 else 0.5
             # If performance is good, maintain current balance; if poor, shift toward efficiency
             if recent_fitness < 0.5:
-                efficiency_weight += adaptive_weight * 0.7
-                fairness_weight += adaptive_weight * 0.3
+                efficiency_weight += adaptive_share * 0.7
+                fairness_weight += adaptive_share * 0.3
             else:
-                efficiency_weight += adaptive_weight * 0.5
-                fairness_weight += adaptive_weight * 0.5
-        
+                efficiency_weight += adaptive_share * 0.5
+                fairness_weight += adaptive_share * 0.5
+
         # Normalize
         total = fairness_weight + efficiency_weight
         if total > 0:
             fairness_weight /= total
             efficiency_weight /= total
-        
+
         return fairness_weight, efficiency_weight
     
     def get_strategy_recommendation(self) -> Dict[str, Any]:
@@ -471,8 +514,16 @@ class EGTLayer(nn.Module):
         diversity_loss = -entropy  # Maximize entropy
 
         # Performance loss (based on fitness)
-        avg_fitness = np.mean(self.fitness_history[-5:]) if self.fitness_history else 0.5
-        performance_loss = -avg_fitness  # Maximize fitness
+        # P9 fix: keep the scalar as a 0-dim tensor with the same device/dtype
+        # as the distribution so that the final ``loss = 0.3 * dl + 0.7 * pl``
+        # combines two tensors (avoids implicit float↔tensor promotion that
+        # used to be relied on, which is brittle when EGT runs on GPU).
+        avg_fitness = float(
+            np.mean(self.fitness_history[-5:]) if self.fitness_history else 0.5
+        )
+        performance_loss = torch.tensor(
+            -avg_fitness, dtype=diversity_loss.dtype, device=diversity_loss.device
+        )  # Maximize fitness
 
         # Combined loss
         loss = 0.3 * diversity_loss + 0.7 * performance_loss
@@ -558,23 +609,39 @@ class EGTLayer(nn.Module):
             'diversity_history': self.diversity_history,
             'convergence_steps': self.convergence_steps,
             'is_converged': self.is_converged,
+            # P5 fix: persist the runtime-computed lambda_param so that
+            # loading a checkpoint doesn't reset it to the constructor
+            # default (0.5) before the first update() recomputes it.
+            'lambda_param': float(self.lambda_param),
             'config': {
                 'num_strategies': self.num_strategies,
                 'learning_rate': self.learning_rate,
                 'mutation_rate': self.mutation_rate
             }
         }, path)
-    
+
     def load(self, path: str) -> None:
         """Load EGT layer state."""
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-        
+
         self.payoff_matrix.load_state_dict(checkpoint['payoff_matrix_state'])
         self.strategy_distribution.load_state_dict(checkpoint['strategy_distribution_state'])
-        
+
         self.strategy_history = checkpoint['strategy_history']
         self.fitness_history = checkpoint['fitness_history']
         self.diversity_history = checkpoint['diversity_history']
-        
+
         self.convergence_steps = checkpoint['convergence_steps']
         self.is_converged = checkpoint['is_converged']
+        # P5 fix: restore lambda_param if the checkpoint contains it
+        # (older checkpoints may not, so fall back to default 0.5).
+        if 'lambda_param' in checkpoint:
+            self.lambda_param = float(checkpoint['lambda_param'])
+        # P12 fix: restore learning_rate that was previously saved in
+        # ``config`` but never read back.  This makes optimizer
+        # reconstruction after a reload actually match the original run.
+        cfg = checkpoint.get('config', {})
+        if 'learning_rate' in cfg:
+            self.learning_rate = float(cfg['learning_rate'])
+        if 'mutation_rate' in cfg:
+            self.mutation_rate = float(cfg['mutation_rate'])

@@ -19,6 +19,7 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from environments.disaster_sim import DisasterSim
+from environments.config.constants import NUM_STRATEGIES
 from algorithms.egt_marl import EGTMARL
 from algorithms.dynamic_frontier import DynamicParetoFrontier
 import warnings
@@ -69,7 +70,7 @@ class DynamicFrontierTuner:
                 'batch_size': 32,
                 'buffer_size': 5000,
             },
-            'egt': {'lambda': config.get('egt_lambda', 0.5), 'num_strategies': 5, 'learning_rate': 0.01},
+            'egt': {'lambda': config.get('egt_lambda', 0.5), 'num_strategies': NUM_STRATEGIES, 'learning_rate': 0.01},
             'dynamic_frontier': frontier_config,
             'anti_spoofing': {'enabled': config.get('anti_spoofing', True), 'observation_dim': 64},
         }

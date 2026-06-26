@@ -38,13 +38,12 @@ marl:
 
 # EGT Layer Configuration
 egt:
-  num_strategies: 5
-  # Strategy definitions:
-  # 0: Efficiency-focused (maximize total survivors)
-  # 1: Fairness-focused (minimize inequality)
+  # 与 environments/config/constants.py 的 NUM_STRATEGIES 保持一致 (== 3)
+  num_strategies: 3
+  # Strategy definitions (顺序与 STRATEGY_NAMES 一致):
+  # 0: Fairness-focused (minimize inequality)
+  # 1: Efficiency-focused (maximize total survivors)
   # 2: Balanced approach
-  # 3: Risk-averse (prioritize certainty)
-  # 4: Adaptive (learn from environment)
   
   learning_rate: 0.01
   mutation_rate: 0.05

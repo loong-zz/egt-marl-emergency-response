@@ -18,6 +18,7 @@ from .qmix_improved import ImprovedQMIX, create_improved_qmix
 from .egt_layer import EGTLayer
 from .anti_spoofing import AntiSpoofing
 from .dynamic_frontier import DynamicFrontier
+from ..environments.config.constants import NUM_STRATEGIES
 
 
 class EGTMARL:
@@ -265,14 +266,49 @@ class EGTMARL:
                 # For smaller action spaces, map to valid ranges
                 tactical_action = action_idx % num_tactical
                 communication_action = min(action_idx // num_tactical, num_communication - 1)
-            
+
             actions_dict[agent_id] = {
-                "strategic": [0.25, 0.25, 0.25, 0.25],  # Example: equal resource allocation
+                # Pull the current EGT macro signal so the action dict actually
+                # reflects the evolutionary game state at inference time.
+                # Falls back to a uniform distribution if the EGT layer is
+                # unavailable or has not been updated yet.
+                "strategic": self._get_egt_strategic_distribution(),
                 "tactical": tactical_action,  # Movement direction (0-7)
                 "communication": communication_action  # Communication action (0-3)
             }
-        
+
         return actions_dict
+
+    def _get_egt_strategic_distribution(self) -> List[float]:
+        """Return the current EGT strategy distribution as a plain list.
+
+        Used to populate the ``strategic`` field of the action dict so that
+        downstream consumers (and the EGT macro signal) actually flow through
+        the inference path.  Falls back to a uniform distribution if the EGT
+        layer hasn't been initialised or its distribution is degenerate.
+        """
+        n = int(self.config['egt'].get('num_strategies', NUM_STRATEGIES))
+        # P8 fix: guard against a misconfigured ``num_strategies=0`` (e.g.
+        # from a typo'd YAML, or an empty ``strategy_names`` list).  The
+        # previous ``[1.0 / n] * n`` would raise ZeroDivisionError.
+        if n < 1:
+            return [1.0]
+        if n == 1:
+            return [1.0]
+        egt_layer = getattr(self, 'egt_layer', None)
+        if egt_layer is None:
+            return [1.0 / n] * n
+        try:
+            distribution = egt_layer.get_strategy_distribution().detach()
+        except Exception:
+            return [1.0 / n] * n
+        if distribution.ndim != 1 or int(distribution.shape[0]) != n:
+            return [1.0 / n] * n
+        values = [float(v) for v in distribution.cpu().tolist()]
+        total = sum(values)
+        if total <= 0:
+            return [1.0 / n] * n
+        return [v / total for v in values]
     
     def select_actions(self, state, epsilon: float = 0.1) -> List[int]:
         """
@@ -605,8 +641,14 @@ class EGTMARL:
                     'dones': dones
                 }
                 return self.update(batch)
-            except Exception:
-                # Return zeros if update fails
+            except Exception as e:
+                # Surface the failure in the log; do not silently swallow.
+                import logging
+                logging.exception(
+                    "EGTMARL: replay-buffer batch construction failed; "
+                    "update() will return zero losses for this step. "
+                    "Underlying error: %r", e,
+                )
                 return {'marl_loss': 0.0, 'egt_loss': 0.0, 'spoofing_loss': 0.0, 'frontier_loss': 0.0}
 
         losses = {}
@@ -621,12 +663,18 @@ class EGTMARL:
             )
             losses['egt_loss'] = egt_loss
         except Exception as e:
-            # Fallback: use default weights if EGT layer call fails
-            try:
-                egt_loss = self.egt_layer.update(batch, self.egt_optimizer, self.egt_loss_fn)
-                losses['egt_loss'] = egt_loss
-            except Exception:
-                losses['egt_loss'] = 0.0
+            # Log loudly so silent failures surface in the training loop.
+            # Note: egt_layer.update() is a strict subset of
+            # update_with_weights() and would fail with the same error, so
+            # we do NOT fall through to it — that just hides the bug.
+            import logging
+            logging.exception(
+                "EGTMARL: EGT layer update_with_weights failed; "
+                "EGT macro signal will be disabled for this step. "
+                "Underlying error: %r", e,
+            )
+            losses['egt_loss'] = 0.0
+            egt_weights = None
 
         # Resolve lambda parameter for the MARL layer.  EGT always has this
         # attribute after update, so we just read it.
@@ -697,12 +745,28 @@ class EGTMARL:
             frontier_loss = self.dynamic_frontier.update(batch)
             losses['frontier_loss'] = frontier_loss
             # Audit fix A2: actually push the frontier weights to the MARL
-            # layer so its reward shaping reflects the current trade-off
+            # layer so its reward shaping reflects the current trade-off.
+            # P3 fix: surface failures instead of silently swallowing them.
             try:
                 self.dynamic_frontier.apply_to_marl(self)
-            except Exception:
-                pass
-        except Exception:
+            except Exception as e:
+                import logging
+                logging.exception(
+                    "EGTMARL: dynamic_frontier.apply_to_marl failed; "
+                    "Pareto frontier weights will not reach MARL this step. "
+                    "Underlying error: %r", e,
+                )
+        except Exception as e:
+            # P3 fix: log the underlying error instead of silently swallowing
+            # it.  The frontier loss being zero is *not* normal; it should
+            # surface in the training log so it doesn't masquerade as a
+            # legitimate "0" loss.
+            import logging
+            logging.exception(
+                "EGTMARL: dynamic_frontier.update failed; "
+                "Pareto frontier signal disabled for this step. "
+                "Underlying error: %r", e,
+            )
             losses['frontier_loss'] = 0.0
 
         # Update total steps
@@ -736,12 +800,25 @@ class EGTMARL:
         next_states = batch['next_states']
         dones = batch['dones']
 
-        # Apply EGT-driven shaping to the per-step reward
+        # Apply EGT-driven shaping to the per-step reward.
+        # P2 fix: previously we did `rewards * (1 + egt_boost) + lam * 0.01`
+        # but ImprovedQMIX.update() internally computes its own shaped
+        # rewards via EnhancedRewardStructure (5-component) and stashes
+        # them in `_last_shaped_rewards`.  The two shaping steps would
+        # compound, making the EGT signal's effect unpredictable.
+        #
+        # Resolution: keep only the *multiplicative* EGT bias here
+        # (`(1 + egt_boost) * r`) and let the additive fairness bonus
+        # be computed by ImprovedQMIX's own reward structure, which has
+        # access to per-agent signals.  The scalar `lambda_param` is
+        # still propagated to MARLLayer.update() (when not using
+        # ImprovedQMIX) and to the auxiliary callbacks.
         egt_boost = 0.0
         if egt_weights is not None and 'fairness_weight' in egt_weights:
             egt_boost = float(egt_weights['fairness_weight']) - 0.5
+        shaped_rewards = rewards * (1.0 + egt_boost)
+        # Stash lambda for downstream consumers; no additive bias here.
         lam = float(max(0.0, min(1.0, lambda_param)))
-        shaped_rewards = rewards * (1.0 + egt_boost) + lam * 0.01
         # Reduce to per-step scalar (mean across the 17 agents) so we can
         # index it inside the per-timestep loop below.
         if shaped_rewards.dim() == 2:
@@ -800,7 +877,7 @@ class EGTMARL:
     def train_episode(self) -> Dict[str, Any]:
         """
         Train for one episode.
-        
+
         Returns:
             Episode statistics
         """
@@ -808,7 +885,15 @@ class EGTMARL:
         episode_reward = 0
         episode_steps = 0
         done = False
-        
+
+        # P11 fix: initialize `losses` up-front.  Previously the variable
+        # was only assigned inside the two ``if`` blocks that fire after
+        # the episode buffer fills up; if the episode ended before filling
+        # the buffer (e.g. very short episodes, or batch_size > max_steps)
+        # we would hit ``UnboundLocalError`` at the ``return`` statement
+        # below.
+        losses: Dict[str, float] = {}
+
         episode_buffer = {
             'states': [],
             'actions': [],
@@ -918,22 +1003,61 @@ class EGTMARL:
         return batch
     
     def _actions_to_tensor(self, actions: List[Dict]) -> torch.Tensor:
-        """Convert list of action dictionaries to tensor."""
-        # Simplified conversion - in practice would need proper handling
-        action_tensors = []
+        """Convert list of action dictionaries to tensor.
+
+        P13 fix: previously, the per-step ``flat_actions`` lists were
+        stacked with ``torch.tensor(..., device=self.device)`` which raises
+        if any two rows have different lengths (typical failure mode:
+        one timestep has a missing agent key, or one step has
+        ``resource_allocation`` and another does not).  Normalize each row
+        to a common length by padding with zeros and logging the
+        discrepancy, so the rest of the training loop can keep running.
+        """
+        # First pass: compute the flattened action length for each step
+        # and the global maximum (padded to it).
+        per_step_lengths = []
+        flat_per_step = []
         for action_dict in actions:
-            # Flatten action dictionary
-            flat_actions = []
+            row: list = []
             for agent_id, action in action_dict.items():
                 if isinstance(action, dict):
                     # Handle resource allocation
-                    for resource_type, amount in action.get('resource_allocation', {}).items():
-                        flat_actions.append(amount)
+                    row.extend(
+                        action.get('resource_allocation', {}).values()
+                    )
                 else:
-                    flat_actions.append(action)
-            action_tensors.append(flat_actions)
-        
-        return torch.tensor(action_tensors, device=self.device)
+                    row.append(action)
+            per_step_lengths.append(len(row))
+            flat_per_step.append(row)
+
+        if not flat_per_step:
+            # Defensive: empty input -> return a [0, 0] tensor so callers
+            # that expect a 2-D tensor (batch x action_dim) don't crash
+            # on shape assumptions downstream.
+            return torch.zeros(0, 0, device=self.device)
+
+        target_len = max(per_step_lengths)
+        if target_len == 0:
+            return torch.zeros(len(flat_per_step), 0, device=self.device)
+
+        for i, row in enumerate(flat_per_step):
+            if len(row) < target_len:
+                # P13 fix: pad missing actions with 0 rather than letting
+                # ``torch.tensor`` raise.  This is a soft failure (a real
+                # action would carry semantic meaning) so we log the gap.
+                gap = target_len - len(row)
+                import logging
+                logging.warning(
+                    "EGTMARL._actions_to_tensor: padding %d missing actions "
+                    "in step %d (had %d, expected %d)",
+                    gap, i, len(row), target_len,
+                )
+                flat_per_step[i] = row + [0] * gap
+            elif len(row) > target_len:
+                # Shouldn't happen given target_len = max, but be defensive.
+                flat_per_step[i] = row[:target_len]
+
+        return torch.tensor(flat_per_step, device=self.device)
     
     def _calculate_episode_metrics(self, total_reward: float, 
                                   info: Dict[str, Any]) -> Dict[str, float]:

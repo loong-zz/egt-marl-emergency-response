@@ -1,0 +1,40 @@
+# 消融实验配置
+# 基于 ablation_results/ablation_study_20260622_154758/config.yaml 反向生成
+# 用途:跑 ablation_study.py --config ablation.yaml
+
+ablation:
+  components:
+    egt_layer:
+      enabled: true
+      ablation_values: [0.0, 0.5, 1.0]
+    anti_spoofing:
+      enabled: false
+      ablation_values: [false, true]
+    dynamic_frontier:
+      enabled: false
+      ablation_values: [false, true]
+    attention_heads:
+      enabled: false
+      ablation_values: [2, 4]
+    mixing_network:
+      enabled: false
+      ablation_values: [standard, attention]
+  num_episodes: 50
+  max_steps_per_episode: 200
+  num_runs: 3
+  scenario: earthquake
+  severity: medium
+
+environment:
+  map_size: [1000, 1000]
+  num_agents: 20
+  num_victims: 200
+  num_resources: 10
+  num_hospitals: 3
+  disaster_type: earthquake
+  severity: medium
+
+# 预训练模型路径(根据实际训练产物修改)
+pretrained_model: src/experiment_results/egt_marl_TIMESTAMP/models/best_model.pt
+
+output_dir: src/ablation_results

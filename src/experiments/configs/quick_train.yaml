@@ -1,4 +1,5 @@
-# 训练1：EGT-MARL完整功能验证配置
+# 快速 smoke test 配置 (300 episodes,小地图)
+# 用于训练前的冒烟测试 / CI 回归 / Debug
 
 # 训练参数
 training:

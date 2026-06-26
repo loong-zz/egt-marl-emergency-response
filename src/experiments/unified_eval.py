@@ -47,7 +47,7 @@ _eval_spec.loader.exec_module(_eval_mod)
 BaselineEvaluator = _eval_mod.BaselineEvaluator
 
 from environments.disaster_sim import DisasterSim
-from environments.config.constants import SimulationConfig
+from environments.config.constants import SimulationConfig, NUM_STRATEGIES
 from algorithms.egt_marl import EGTMARL
 import logging
 logging.basicConfig(level=logging.WARNING, format='%(asctime)s %(levelname)s: %(message)s')
@@ -95,7 +95,7 @@ def make_algorithm(env, config: dict, checkpoint_path: str):
             'batch_size': training_config.get('batch_size', 32),
             'buffer_size': training_config.get('buffer_size', 10000),
         },
-        'egt': {'num_strategies': 3, 'learning_rate': 0.01},
+        'egt': {'num_strategies': NUM_STRATEGIES, 'learning_rate': 0.01},
         'anti_spoofing': {'observation_dim': env.get_state_dimension(), 'action_dim': 32},
         'dynamic_frontier': {
             'alpha': algo_config.get('pareto_weight_alpha', 0.3),

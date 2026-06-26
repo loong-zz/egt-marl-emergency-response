@@ -258,19 +258,48 @@ class MARLLayer(nn.Module):
         return joint_q.squeeze(-1)
     
     def forward(self, states: torch.Tensor) -> torch.Tensor:
-        """Forward pass for MARL layer. Uses individual agent networks for diversity."""
+        """Forward pass for MARL layer. Uses individual agent networks for diversity.
+
+        P14 fix: previously the call site assumed a 3-D tensor of shape
+        ``[B, N, state_dim]`` and would crash with a bare ``ValueError``
+        from the unpack if the caller supplied ``[B, state_dim]`` (no
+        agent axis) or anything else.  Now we:
+          1. Accept a 2-D ``[B, state_dim]`` and broadcast to ``[B, N, D]``.
+          2. Validate the per-agent axis matches ``self.num_agents``.
+          3. Validate the per-agent feature dim matches ``self.state_dim``.
+        """
+        # P14: auto-broadcast 2D shared states to 3D per-agent states.
+        if states.dim() == 2:
+            states = states.unsqueeze(1).expand(-1, self.num_agents, -1)
+        if states.dim() != 3:
+            raise ValueError(
+                f"MARLLayer.forward expects 2-D [B, D] or 3-D [B, N, D] "
+                f"states, got shape {tuple(states.shape)}"
+            )
+        if states.shape[1] != self.num_agents:
+            raise ValueError(
+                f"MARLLayer.forward: states have {states.shape[1]} agents "
+                f"but layer was constructed with num_agents={self.num_agents}"
+            )
+        if states.shape[2] != self.state_dim:
+            raise ValueError(
+                f"MARLLayer.forward: states have feature dim "
+                f"{states.shape[2]} but layer was constructed with "
+                f"state_dim={self.state_dim}"
+            )
+
         # Apply sparse communication
         if self.communication_enabled:
             states = self._compute_communication(states)
-        
+
         batch_size, num_agents, state_dim = states.shape
-        
+
         # Use individual agent networks for diverse decision making
         q_values = torch.zeros(batch_size, num_agents, self.action_dim, device=self.device)
         for agent_id in range(num_agents):
             agent_states = states[:, agent_id, :]  # (B, state_dim)
             q_values[:, agent_id, :] = self.agent_networks[agent_id](agent_states)
-        
+
         return q_values
     
     def select_actions(self, states: torch.Tensor, deterministic: bool = False, epsilon: float = None) -> torch.Tensor:
@@ -351,10 +380,31 @@ class MARLLayer(nn.Module):
             fairness_bonus = (mean_save - save_rates).clamp(min=0.0) * lam
             shaped_rewards = rewards_per_agent * (1.0 + egt_fairness_boost) + fairness_bonus
         else:
-            # No per-agent fairness info: apply a uniform shift proportional to lambda
-            shaped_rewards = rewards_per_agent * (1.0 + egt_fairness_boost) + lam * 0.01
+            # No per-agent fairness info: apply an *adaptive* uniform shift
+            # proportional to lambda, scaled to the per-batch reward scale.
+            # P1 fix: the previous constant `lam * 0.01` is dwarfed by typical
+            # reward magnitudes (O(0.1)-O(1.0)) and gets washed out by the
+            # discount factor in the TD target.  Use a scale-aware bias:
+            #   bias = lam * max(reward_std, 0.05) * 0.3
+            # The 0.05 floor prevents the bonus from vanishing when reward
+            # variance is low (e.g. all-zero batches at the start of training).
+            reward_std = float(rewards_per_agent.std().item()) if rewards_per_agent.numel() > 1 else 0.0
+            scale = max(reward_std, 0.05) * 0.3
+            shaped_rewards = rewards_per_agent * (1.0 + egt_fairness_boost) + lam * scale
 
         # ====== Standard QMIX-style update using shaped rewards ======
+        # P14 fix: also normalise both state tensors for the no-2D
+        # auto-broadcast path (forward() now handles 2-D, but we keep
+        # this defensive normalisation here so the rest of the update
+        # logic — which assumes 3-D — stays correct).
+        if batch_states.dim() == 2:
+            batch_states = batch_states.unsqueeze(1).expand(
+                -1, self.num_agents, -1
+            )
+        if batch_next_states.dim() == 2:
+            batch_next_states = batch_next_states.unsqueeze(1).expand(
+                -1, self.num_agents, -1
+            )
         # Get current Q-values
         current_qs = self.forward(batch_states)
 

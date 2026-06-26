@@ -24,7 +24,11 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from environments.disaster_sim import DisasterSim, ResourceType
-from environments.config.constants import RESOURCE_ABBR, EGT_CONFIG, REPUTATION_CONFIG, PARETO_CONFIG, COMMUNICATION_CONFIG, INTERFERENCE_CONFIG, NUM_REGIONS
+from environments.config.constants import (
+    RESOURCE_ABBR, EGT_CONFIG, REPUTATION_CONFIG, PARETO_CONFIG,
+    COMMUNICATION_CONFIG, INTERFERENCE_CONFIG, NUM_REGIONS,
+    NUM_STRATEGIES,
+)
 from algorithms.egt_marl import EGTMARL
 from algorithms.qmix_improved import ImprovedQMIX
 from algorithms.dynamic_frontier import DynamicParetoFrontier
@@ -278,7 +282,7 @@ class EGTMARLTrainer:
             },
 
             'egt': {
-                'num_strategies': 3,
+                'num_strategies': NUM_STRATEGIES,
                 'learning_rate': 0.01
             },
             'anti_spoofing': {

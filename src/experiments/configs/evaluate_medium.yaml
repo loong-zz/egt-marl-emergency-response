@@ -1,6 +1,6 @@
 # 中规模评估配置 - 标准评估
 
-output_dir: evaluation_results
+output_dir: src/evaluation_results
 
 # 评估配置
 evaluation:

@@ -27,7 +27,7 @@ algorithms:
   # 核心对比算法
   egt_marl:
     enabled: true
-    model_path: "experiment_results/egt_marl_20260620_210828/models/best_model.pt"
+    model_path: "src/experiment_results/egt_marl_20260620_210828/models/best_model.pt"
   
   qmix:
     enabled: false

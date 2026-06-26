@@ -604,6 +604,15 @@ class AntiSpoofing:
             return total_loss.item()
 
         except Exception as e:
+            # P4 fix: surface the underlying error in the log instead of
+            # silently swallowing it.  Returning 0.0 used to make anti-
+            # spoofing training signal look healthy in the logs while
+            # being effectively absent.
+            import logging
+            logging.exception(
+                "AntiSpoofing.update failed; anti-spoofing training signal "
+                "disabled for this step.  Underlying error: %r", e,
+            )
             return 0.0
     
     def detect_hoarding(self, agent_id: int, resource_history: List[Dict[str, float]]) -> Tuple[bool, float]:

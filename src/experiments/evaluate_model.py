@@ -20,7 +20,7 @@ sys.path.insert(0, str(project_root))
 sys.path.insert(0, str(project_root / "src"))
 
 from environments.disaster_sim import DisasterSim
-from environments.config.constants import SimulationConfig
+from environments.config.constants import SimulationConfig, NUM_STRATEGIES
 from algorithms.egt_marl import EGTMARL
 from utils.metrics import MetricsCollector
 import logging
@@ -74,7 +74,7 @@ def load_model(config: Dict, checkpoint_path: str):
             'buffer_size': training_config.get('buffer_size', 10000)
         },
         'egt': {
-            'num_strategies': 3,
+            'num_strategies': NUM_STRATEGIES,
             'learning_rate': 0.01
         },
         'anti_spoofing': {
