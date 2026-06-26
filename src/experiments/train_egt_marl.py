@@ -439,7 +439,8 @@ class EGTMARLTrainer:
                             pass
 
             # 存储经验并更新算法
-            self.algorithm.store_experience(state, actions, rewards, next_state, done)
+            # P0 fix: 传入 info，让 EGT 层拿到真实的 fairness_score / efficiency_score
+            self.algorithm.store_experience(state, actions, rewards, next_state, done, info=info)
             if step % self.config['training']['update_frequency'] == 0:
                 update_out = self.algorithm.update()
                 if not isinstance(update_out, dict):
@@ -972,12 +973,24 @@ class EGTMARLTrainer:
                             f"=== Entering phase '{phase.get('name', current_phase_idx)}' "
                             f"(eps → {epsilon:.3f}, lr={current_lr:.6f}) ==="
                         )
-                    # ----- lambda_param (inject into EGT layer) -----
+                    # ----- lambda_param (anchor for EGT evolution) -----
+                    # Fix audit Issue 2: previously we OVERWROTE
+                    # egt_layer.lambda_param directly, which meant phase changes
+                    # reset whatever the replicator dynamics had evolved. That
+                    # made the EGT layer's micro-→macro feedback loop useless.
+                    #
+                    # New behaviour: store the phase's target as
+                    # `lambda_anchor` and let `egt_layer._update_lambda()`
+                    # BLEND it with the evolved strategy distribution.  See
+                    # `egt_layer.py:phase_anchor_blend` for the blending rule.
                     if 'lambda' in phase and hasattr(self, 'algorithm') and hasattr(self.algorithm, 'egt_layer'):
                         lam = float(phase['lambda'])
-                        self.algorithm.egt_layer.lambda_param = max(0.0, min(1.0, lam))
+                        clamped_lam = max(0.0, min(1.0, lam))
+                        self.algorithm.egt_layer.lambda_anchor = clamped_lam
                         logger.info(
-                            f"  phase lambda -> EGT layer lambda_param = {self.algorithm.egt_layer.lambda_param:.3f}"
+                            f"  phase lambda -> EGT layer lambda_anchor = {clamped_lam:.3f} "
+                            f"(current lambda_param = "
+                            f"{self.algorithm.egt_layer.lambda_param:.3f})"
                         )
                     # ----- difficulty (drive env casualty severity distribution) -----
                     if 'difficulty' in phase and hasattr(self, 'env') and hasattr(self.env, 'set_difficulty'):

@@ -95,6 +95,21 @@ class EGTLayer(nn.Module):
         # This is the core parameter passed to MARL layer for reward shaping
         self.lambda_param = 0.5  # 0=full efficiency, 1=full fairness
 
+        # Fix audit Issue 2: optional phase-level anchor for lambda_param.
+        # When the training script enters a new phase, it sets
+        # `lambda_anchor` to the phase's target lambda. `_update_lambda()`
+        # then BLENDS the evolved value (from replicator dynamics) with this
+        # anchor instead of overwriting it. This preserves EGT's micro->macro
+        # feedback signal across phase boundaries.
+        #
+        # `None` means "no anchor; trust pure replicator dynamics output".
+        self.lambda_anchor: Optional[float] = None
+
+        # Blend weight in [0, 1]: 0.0 = pure EGT, 1.0 = pure anchor.
+        # A small bias toward the anchor keeps phases directionally aligned
+        # without erasing the evolved value.
+        self.lambda_anchor_blend: float = 0.3
+
     def _init_theory_driven_payoff(self, num_strategies: int,
                                     device: torch.device) -> torch.Tensor:
         """
@@ -129,6 +144,41 @@ class EGTLayer(nn.Module):
                 # A-vs-F, A-vs-E, A-vs-B, A-vs-A
                 [2.0, 2.0, 2.5, 3.0],
             ], device=device)
+        elif num_strategies == 3:
+            # P1 fix + Issue 1: paper-aligned 3-strategy payoff structure
+            # (deterministic AND strictly symmetric so the game stays a
+            # symmetric potential game).
+            #
+            # Previous branch fell through to a random torch.eye + randn
+            # initialisation, which let stochastic drift lock the replicator
+            # dynamics onto a single strategy (manifesting as λ=1.0 forever).
+            # Rows/cols: [Fairness, Efficiency, Balanced]
+            #
+            # Interpretation (strictly symmetric: A[i,j] == A[j,i]):
+            #   - Fairness-Fairness cooperation: 3.0
+            #   - Efficiency-Efficiency competition: 2.0  (slightly tense)
+            #   - Balanced-Balanced cooperation: 2.5
+            #   - Fairness-Efficiency tension: 1.5  (low — different goals)
+            #   - Fairness-Balanced: 2.5
+            #   - Efficiency-Balanced: 2.0
+            #
+            # Design rationale: by keeping each strategy competitive against
+            # itself (3.0 / 2.0 / 2.5) and giving cross-strategy payoffs that
+            # are neither trivially equal nor too extreme, the replicator
+            # dynamics is no longer pulled into a single dominant strategy.
+            base_payoff = torch.tensor([
+                # F-vs-F, F-vs-E, F-vs-B
+                [3.0, 1.5, 2.5],
+                # E-vs-F, E-vs-E, E-vs-B  (must mirror row 0)
+                [1.5, 2.0, 2.0],
+                # B-vs-F, B-vs-E, B-vs-B  (must mirror rows 0,1)
+                [2.5, 2.0, 2.5],
+            ], device=device)
+            # Sanity check: the matrix MUST be symmetric.  If a future edit
+            # breaks symmetry, fail loudly here rather than silently
+            # producing an asymmetric game.
+            assert torch.allclose(base_payoff, base_payoff.T), \
+                f"3-strategy payoff matrix must be symmetric, got {base_payoff.tolist()}"
         else:
             # Fallback for other num_strategies: identity + small noise
             base_payoff = torch.eye(num_strategies, device=device) * 2.5
@@ -560,7 +610,20 @@ class EGTLayer(nn.Module):
                 fairness_weight = max(0.0, 1.0 - efficiency_weight)
 
         # lambda represents the fairness weight (0=efficiency, 1=fairness)
-        self.lambda_param = float(fairness_weight)
+        evolved_lambda = float(fairness_weight)
+
+        # Fix audit Issue 2: BLEND with phase anchor instead of overwriting.
+        # `lambda_anchor` is set by the training script at each phase boundary.
+        # Without this blend, a phase change would erase whatever the replicator
+        # dynamics had evolved, breaking the EGT->MARL feedback loop.
+        if self.lambda_anchor is not None:
+            anchor = float(self.lambda_anchor)
+            blend = float(self.lambda_anchor_blend)
+            # Clamp blend to [0, 1] to be defensive.
+            blend = max(0.0, min(1.0, blend))
+            self.lambda_param = (1.0 - blend) * evolved_lambda + blend * anchor
+        else:
+            self.lambda_param = evolved_lambda
 
     def update_with_weights(self, batch: Dict[str, Any],
                             optimizer: torch.optim.Optimizer,
@@ -601,9 +664,13 @@ class EGTLayer(nn.Module):
     
     def save(self, path: str) -> None:
         """Save EGT layer state."""
+        # Fix audit Finding N (long-standing, masked by other paths):
+        # payoff_matrix and strategy_distribution are ``nn.Parameter``, not
+        # ``nn.Module``, so they have no ``state_dict()`` method. Persist
+        # them as detached tensors instead so save/load round-trips work.
         torch.save({
-            'payoff_matrix_state': self.payoff_matrix.state_dict(),
-            'strategy_distribution_state': self.strategy_distribution.state_dict(),
+            'payoff_matrix_state': self.payoff_matrix.detach().clone(),
+            'strategy_distribution_state': self.strategy_distribution.detach().clone(),
             'strategy_history': self.strategy_history,
             'fitness_history': self.fitness_history,
             'diversity_history': self.diversity_history,
@@ -613,6 +680,11 @@ class EGTLayer(nn.Module):
             # loading a checkpoint doesn't reset it to the constructor
             # default (0.5) before the first update() recomputes it.
             'lambda_param': float(self.lambda_param),
+            # Issue 2: also persist the phase anchor + blend so a checkpoint
+            # resumed mid-phase continues blending with the right anchor.
+            'lambda_anchor': (float(self.lambda_anchor)
+                              if self.lambda_anchor is not None else None),
+            'lambda_anchor_blend': float(self.lambda_anchor_blend),
             'config': {
                 'num_strategies': self.num_strategies,
                 'learning_rate': self.learning_rate,
@@ -624,8 +696,13 @@ class EGTLayer(nn.Module):
         """Load EGT layer state."""
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
 
-        self.payoff_matrix.load_state_dict(checkpoint['payoff_matrix_state'])
-        self.strategy_distribution.load_state_dict(checkpoint['strategy_distribution_state'])
+        # load_state_dict expects an nn.Module, but payoff_matrix /
+        # strategy_distribution are nn.Parameter. Use .data.copy_() instead.
+        with torch.no_grad():
+            self.payoff_matrix.data.copy_(checkpoint['payoff_matrix_state'].to(self.device))
+            self.strategy_distribution.data.copy_(
+                checkpoint['strategy_distribution_state'].to(self.device)
+            )
 
         self.strategy_history = checkpoint['strategy_history']
         self.fitness_history = checkpoint['fitness_history']
@@ -637,6 +714,11 @@ class EGTLayer(nn.Module):
         # (older checkpoints may not, so fall back to default 0.5).
         if 'lambda_param' in checkpoint:
             self.lambda_param = float(checkpoint['lambda_param'])
+        # Issue 2: restore phase anchor + blend weight.
+        if 'lambda_anchor' in checkpoint and checkpoint['lambda_anchor'] is not None:
+            self.lambda_anchor = float(checkpoint['lambda_anchor'])
+        if 'lambda_anchor_blend' in checkpoint:
+            self.lambda_anchor_blend = float(checkpoint['lambda_anchor_blend'])
         # P12 fix: restore learning_rate that was previously saved in
         # ``config`` but never read back.  This makes optimizer
         # reconstruction after a reload actually match the original run.

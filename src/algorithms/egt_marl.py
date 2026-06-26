@@ -108,10 +108,15 @@ class EGTMARL:
             'spoofing_detected': []
         }
         
-        # Replay buffer for testing
-        self.replay_buffer = []
+        # Replay buffer for testing.
+        # Issue 6: use collections.deque with maxlen so we get O(1) append
+        # and automatic eviction (was O(n) pop(0) per step on a list, which
+        # scaled badly once fairness_score / efficiency_score were added to
+        # every experience dict).
+        from collections import deque
         self.batch_size = self.config['marl'].get('batch_size', 32)
         self.buffer_size = self.config['marl'].get('buffer_size', 10000)
+        self.replay_buffer: deque = deque(maxlen=self.buffer_size)
     
     def _initialize_components(self) -> None:
         """Initialize all algorithm components."""
@@ -344,7 +349,8 @@ class EGTMARL:
         
         return actions
     
-    def store_experience(self, state, actions, rewards, next_state, done):
+    def store_experience(self, state, actions, rewards, next_state, done,
+                          info=None):
         """
         Store experience in replay buffer.
 
@@ -354,11 +360,26 @@ class EGTMARL:
             rewards: Rewards received (dict per-agent, list, or scalar)
             next_state: Next state
             done: Whether episode is done
+            info: Optional environment info dict. When provided, fairness_score
+                and efficiency_score are extracted and stored so the EGT layer's
+                replicator dynamics receives real per-step signals (P0 fix).
+                Issue 5: passing info=None is allowed for backwards
+                compatibility but emits a one-shot warning per episode so
+                silent misconfiguration is observable.
 
         The stored reward is always a *list* of length ``num_agents`` so
         the offline no-args ``update()`` path can stack it into a tensor
         without choking on dict values.
         """
+        # Issue 5: warn once per episode if a caller forgot to pass info.
+        if info is None and not getattr(self, '_info_warned_this_ep', False):
+            import logging
+            logging.warning(
+                "EGTMARL.store_experience called without info; "
+                "fairness_score/efficiency_score will fall back to 0.5 "
+                "for this episode. This weakens the EGT->MARL feedback loop."
+            )
+            self._info_warned_this_ep = True
         num_agents = self.config['marl']['num_agents']
 
         # Convert action dictionary to list of action indices
@@ -395,19 +416,69 @@ class EGTMARL:
         elif len(reward_list) > num_agents:
             reward_list = reward_list[:num_agents]
 
+        # P0 fix: extract per-step fairness/efficiency signals from env info
+        # so the EGT layer's replicator dynamics receives real feedback instead
+        # of falling back to neutral defaults (which previously locked λ=1.0).
+        fairness_score, efficiency_score = self._extract_fairness_efficiency(info)
+
         experience = {
             'state': state,
             'actions': action_indices,
             'rewards': reward_list,
             'next_state': next_state,
-            'done': done
+            'done': done,
+            'fairness_score': fairness_score,
+            'efficiency_score': efficiency_score,
         }
+        # deque(maxlen=...) automatically evicts the oldest item on append,
+        # so no manual pop is needed (Issue 6).
         self.replay_buffer.append(experience)
 
-        # Limit buffer size
-        if len(self.replay_buffer) > self.buffer_size:
-            self.replay_buffer.pop(0)
-    
+    @staticmethod
+    def _extract_fairness_efficiency(info):
+        """
+        P0 fix: pull real per-step fairness/efficiency signals from env info.
+
+        Returns:
+            (fairness_score, efficiency_score) tuple, both in [0, 1].
+            Falls back to (0.5, 0.5) when info is missing or malformed so the
+            EGT layer still gets a neutral signal (same as old behaviour).
+        """
+        if not isinstance(info, dict):
+            return 0.5, 0.5
+        try:
+            stats = info.get('statistics', {}) or {}
+            fairness_metrics = stats.get('fairness_metrics', {}) or {}
+
+            # Fairness: 1 - gini (gini 0 = perfectly equal = max fairness)
+            gini_list = fairness_metrics.get('gini') or []
+            if gini_list:
+                gini = float(gini_list[-1])
+                fairness_score = max(0.0, min(1.0, 1.0 - gini))
+            else:
+                fairness_score = 0.5
+
+            # Efficiency: rescued / total casualties
+            total_cas = int(info.get('num_casualties', 0) or 0)
+            rescued = int(stats.get('total_rescued', 0) or 0)
+            if total_cas > 0:
+                efficiency_score = max(0.0, min(1.0, rescued / total_cas))
+            else:
+                efficiency_score = 0.5
+
+            return fairness_score, efficiency_score
+        except (KeyError, TypeError, ValueError, IndexError) as exc:
+            # Issue 4: narrow the catch so real bugs (AttributeError etc.)
+            # surface instead of being silently swallowed into neutral
+            # fallback values. Only structural data problems trigger fallback.
+            import logging
+            logging.debug(
+                "EGTMARL._extract_fairness_efficiency: info malformed (%r); "
+                "falling back to neutral (0.5, 0.5)",
+                exc,
+            )
+            return 0.5, 0.5
+
     def update_parameters(self):
         """
         Update algorithm parameters (compatibility method).
@@ -887,6 +958,9 @@ class EGTMARL:
             Episode statistics
         """
         state, info = self.env.reset()
+        # Issue 5: reset per-episode warning latch so a missing-info call
+        # produces at most one warning per episode (instead of one per step).
+        self._info_warned_this_ep = False
         episode_reward = 0
         episode_steps = 0
         done = False
@@ -1186,6 +1260,8 @@ class EGTMARL:
             Episode results
         """
         state, info = self.env.reset()
+        # Issue 5: reset per-episode warning latch.
+        self._info_warned_this_ep = False
         episode_reward = 0
         episode_steps = 0
         done = False
