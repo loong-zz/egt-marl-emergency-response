@@ -15,9 +15,8 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # 添加项目根目录到路径
-project_root = Path(__file__).parent.parent.parent
+project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
-sys.path.insert(0, str(project_root / "src"))
 
 from environments.disaster_sim import DisasterSim
 from environments.config.constants import SimulationConfig, NUM_STRATEGIES

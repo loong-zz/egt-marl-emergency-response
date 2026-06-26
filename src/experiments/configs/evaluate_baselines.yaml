@@ -1,6 +1,6 @@
 # 基准算法比较配置文件
 
-output_dir: src/baseline_results
+output_dir: baseline_results
 
 # 评估配置 - 严格评估（论文标准）
 evaluation:
@@ -15,7 +15,7 @@ evaluation:
 # 环境配置 - 小规模快速测试
 environment:
   map_size: [1000, 1000]
-  num_agents: 20
+  num_agents: 17
   num_victims: 200
   num_resources: 10
   num_hospitals: 3

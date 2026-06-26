@@ -37,4 +37,4 @@ environment:
 # 预训练模型路径(根据实际训练产物修改)
 pretrained_model: src/experiment_results/egt_marl_TIMESTAMP/models/best_model.pt
 
-output_dir: src/ablation_results
+output_dir: ablation_results

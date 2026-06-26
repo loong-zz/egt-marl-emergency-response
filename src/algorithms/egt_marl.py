@@ -18,7 +18,7 @@ from .qmix_improved import ImprovedQMIX, create_improved_qmix
 from .egt_layer import EGTLayer
 from .anti_spoofing import AntiSpoofing
 from .dynamic_frontier import DynamicFrontier
-from ..environments.config.constants import NUM_STRATEGIES
+from environments.config.constants import NUM_STRATEGIES
 
 
 class EGTMARL:
@@ -81,10 +81,15 @@ class EGTMARL:
             if isinstance(state, tuple):
                 state = state[0]
             if hasattr(state, 'shape'):
-                self.config['marl']['state_dim'] = state.shape[1]
+                actual_state_dim = state.shape[1]
+                actual_num_agents = state.shape[0]
+                self.config['marl']['state_dim'] = actual_state_dim
                 # Update num_agents from environment state shape
-                self.config['marl']['num_agents'] = state.shape[0]
-                self.num_agents = state.shape[0]
+                self.config['marl']['num_agents'] = actual_num_agents
+                self.num_agents = actual_num_agents
+                # Sync anti_spoofing observation_dim with actual env state dimension
+                if 'anti_spoofing' in self.config and 'observation_dim' in self.config['anti_spoofing']:
+                    self.config['anti_spoofing']['observation_dim'] = actual_state_dim
         
         # Initialize components
         self._initialize_components()
@@ -161,7 +166,7 @@ class EGTMARL:
 
         # Anti-spoofing mechanism
         self.anti_spoofing = AntiSpoofing(
-            observation_dim=self.config['anti_spoofing']['observation_dim'],
+            observation_dim=self.config['marl']['state_dim'],
             action_dim=self.config['marl']['action_dim'],
             device=self.device,
             num_agents=self.config['marl']['num_agents']

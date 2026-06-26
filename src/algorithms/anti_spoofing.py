@@ -408,9 +408,22 @@ class AntiSpoofing:
             act = act.unsqueeze(0)
         
         input_tensor = torch.cat([obs, act], dim=-1)
-        
+        # 兜底修复：确保 spoofing_detector 第一层维度匹配
+        actual_dim = input_tensor.shape[-1]
+        if actual_dim != self.spoofing_detector[0].in_features:
+            old_layer = self.spoofing_detector[0]
+            new_layer = nn.Linear(actual_dim, old_layer.out_features, bias=old_layer.bias is not None)
+            new_layer.to(next(old_layer.parameters()).device)
+            with torch.no_grad():
+                m = min(old_layer.weight.shape[1], new_layer.weight.shape[1])
+                new_layer.weight.data[:, :m] = old_layer.weight.data[:, :m]
+                if old_layer.bias is not None:
+                    new_layer.bias.data.copy_(old_layer.bias.data)
+            self.spoofing_detector[0] = new_layer
+        self._ensure_input_dim(input_tensor.shape[-1])
+
         spoofing_score = self.spoofing_detector(input_tensor).squeeze().item()
-        
+
         # Use adaptive threshold
         is_legitimate = not self.spoofing_threshold.is_anomalous(spoofing_score)
         
@@ -466,6 +479,19 @@ class AntiSpoofing:
             act = act.unsqueeze(0)
         
         input_tensor = torch.cat([obs, act], dim=-1)
+        # 兜底修复：确保 spoofing_detector 第一层维度匹配
+        actual_dim = input_tensor.shape[-1]
+        if actual_dim != self.spoofing_detector[0].in_features:
+            old_layer = self.spoofing_detector[0]
+            new_layer = nn.Linear(actual_dim, old_layer.out_features, bias=old_layer.bias is not None)
+            new_layer.to(next(old_layer.parameters()).device)
+            with torch.no_grad():
+                m = min(old_layer.weight.shape[1], new_layer.weight.shape[1])
+                new_layer.weight.data[:, :m] = old_layer.weight.data[:, :m]
+                if old_layer.bias is not None:
+                    new_layer.bias.data.copy_(old_layer.bias.data)
+            self.spoofing_detector[0] = new_layer
+        self._ensure_input_dim(input_tensor.shape[-1])
         spoofing_score = self.spoofing_detector(input_tensor).squeeze()
         
         reputation = self.reputation_system.get_reputation(agent_id)
@@ -490,6 +516,73 @@ class AntiSpoofing:
         
         self.correction_history.append((agent_id, 'corrected' if spoofing_score > self.detection_threshold else 'unchanged'))
         return corrected_action
+
+    def _ensure_input_dim(self, actual_input_dim: int) -> None:
+        """Dynamically rebuild first layers of all networks if input dimension mismatches.
+        
+        This is a defense against configuration/coverage/timing inconsistencies between
+        config['anti_spoofing']['observation_dim'] / config['marl']['action_dim'] and the
+        actual state/action tensor dimensions at runtime.
+        """
+        expected_input_dim = self.observation_dim + self.action_dim
+
+        if actual_input_dim == expected_input_dim:
+            return
+
+        import logging
+        _logger = logging.getLogger(__name__)
+        _logger.warning(
+            f"AntiSpoofing: input dim mismatch! "
+            f"Expected {expected_input_dim}, got {actual_input_dim}. "
+            f"Rebuilding all first layers dynamically."
+        )
+
+        # Rebuild helper: replace Linear(OldDim, OutDim) with Linear(NewDim, OutDim),
+        # copying overlapping weights and Xavier-initializing extra dimensions.
+        def _rebuild_first_linear(module_list, old_in_dim, new_in_dim):
+            if not isinstance(module_list[0], nn.Linear):
+                return
+            old_linear = module_list[0]
+            out_features = old_linear.out_features
+            bias = old_linear.bias is not None
+            device = next(old_linear.parameters()).device
+
+            new_linear = nn.Linear(new_in_dim, out_features, bias=bias).to(device)
+
+            with torch.no_grad():
+                old_weight = old_linear.weight.data   # (out, old_in)
+                min_dim = min(old_in_dim, new_in_dim)
+                new_linear.weight.data[:, :min_dim] = old_weight[:, :min_dim]
+                if new_in_dim > old_in_dim:
+                    nn.init.xavier_uniform_(new_linear.weight.data[:, old_in_dim:])
+                if bias:
+                    new_linear.bias.data.copy_(old_linear.bias.data)
+
+            module_list[0] = new_linear
+
+        # 1. verifier: Linear(obs+act, 128) -> Linear(actual, 128)
+        _rebuild_first_linear(self.verifier, expected_input_dim, actual_input_dim)
+
+        # 2. spoofing_detector: Linear(obs+act, 128) -> Linear(actual, 128)
+        _rebuild_first_linear(self.spoofing_detector, expected_input_dim, actual_input_dim)
+
+        # 3. correction_network: Linear(obs+act, 128) -> Linear(actual, 128)
+        _rebuild_first_linear(self.correction_network, expected_input_dim, actual_input_dim)
+
+        # 4. demand_predictor: Linear(obs, 128) -> Linear(actual_obs, 128)
+        actual_obs_dim = actual_input_dim - self.action_dim
+        expected_obs_dim = self.observation_dim
+        _rebuild_first_linear(self.demand_predictor, expected_obs_dim, actual_obs_dim)
+
+        # Update stored dimensions so subsequent calls are no-ops
+        self.observation_dim = actual_obs_dim
+        self.action_dim = actual_input_dim - actual_obs_dim
+        self.expected_input_dim_verified = True
+
+        _logger.info(
+            f"AntiSpoofing: all first layers rebuilt. "
+            f"New dims: obs={self.observation_dim}, act={self.action_dim}."
+        )
 
     def update(self, batch: Dict[str, Any]) -> float:
         """
@@ -533,6 +626,36 @@ class AntiSpoofing:
                 actions_flat = actions_flat.unsqueeze(0)
 
             input_tensor = torch.cat([states_flat, actions_flat], dim=-1)
+
+            # ★ 兜底强制修复: 直接检测 spoofing_detector 第一层输入维度，不匹配就重建
+            actual_dim = input_tensor.shape[-1]
+            expected_dim = self.spoofing_detector[0].in_features
+            if actual_dim != expected_dim:
+                old_layer = self.spoofing_detector[0]
+                new_layer = nn.Linear(actual_dim, old_layer.out_features,
+                                      bias=old_layer.bias is not None)
+                new_layer.to(next(old_layer.parameters()).device)
+                with torch.no_grad():
+                    m = min(old_layer.weight.shape[1], new_layer.weight.shape[1])
+                    new_layer.weight.data[:, :m] = old_layer.weight.data[:, :m]
+                    if old_layer.bias is not None:
+                        new_layer.bias.data.copy_(old_layer.bias.data)
+                self.spoofing_detector[0] = new_layer
+
+            # 同样对 demand_predictor 的第一层做兜底修复
+            if states_flat.shape[-1] != self.demand_predictor[0].in_features:
+                old_dp = self.demand_predictor[0]
+                new_dp = nn.Linear(states_flat.shape[-1], old_dp.out_features,
+                                   bias=old_dp.bias is not None)
+                new_dp.to(next(old_dp.parameters()).device)
+                with torch.no_grad():
+                    m = min(old_dp.weight.shape[1], new_dp.weight.shape[1])
+                    new_dp.weight.data[:, :m] = old_dp.weight.data[:, :m]
+                    if old_dp.bias is not None:
+                        new_dp.bias.data.copy_(old_dp.bias.data)
+                self.demand_predictor[0] = new_dp
+
+            self._ensure_input_dim(input_tensor.shape[-1])
 
             # ---- 1. Spoofing detection loss with real / simulated labels ----
             spoofing_scores = self.spoofing_detector(input_tensor)

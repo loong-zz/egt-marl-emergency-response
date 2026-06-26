@@ -70,7 +70,7 @@ class BaselineEvaluator:
                 'severities': ['low', 'medium', 'high']
             },
             'algorithms': {
-                'egt_marl': {'enabled': False, 'model_path': None},  # 禁用EGT-MARL，先执行其他基线
+                'egt_marl': {'enabled': True, 'model_path': None},
                 'qmix': {'enabled': False, 'model_path': None},
                 'maddpg': {'enabled': False, 'model_path': None},
                 'mappo': {'enabled': False, 'model_path': None},
