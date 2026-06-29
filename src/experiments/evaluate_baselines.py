@@ -216,6 +216,13 @@ class BaselineEvaluator:
                                    f"num_strategies={checkpoint_config.get('egt', {}).get('num_strategies')}")
                 except Exception as e:
                     logger.warning(f"Failed to load checkpoint config: {e}")
+
+            # Issue 3 fix: if checkpoint_config is still None (model_path missing,
+            # load failed, or 'config' key absent), default to empty dict so the
+            # downstream ``checkpoint_config.get(...)`` chain does not raise
+            # AttributeError. Individual lookups already provide sensible defaults.
+            if checkpoint_config is None:
+                checkpoint_config = {}
             
             # 为EGT-MARL创建完整配置
             egt_config = {
