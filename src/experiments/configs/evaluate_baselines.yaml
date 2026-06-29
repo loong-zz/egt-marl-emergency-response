@@ -5,7 +5,7 @@ output_dir: baseline_results
 # 评估配置 - 严格评估（论文标准）
 evaluation:
   num_episodes: 30
-  max_steps_per_episode: 200
+  max_steps_per_episode: 1200
   num_runs: 3
   scenarios:
     - earthquake

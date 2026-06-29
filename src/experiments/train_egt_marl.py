@@ -776,9 +776,11 @@ class EGTMARLTrainer:
             'episode': episode_idx,
             'metrics': metrics,
             'config': self.config,
-            'algorithm_checkpoint_path': str(algorithm_checkpoint_path)
+            'algorithm_checkpoint_path': str(algorithm_checkpoint_path),
+            'best_rescue_rate': getattr(self, 'best_rescue_rate', 0.0),
+            'best_model_episode': getattr(self, '_best_model_episode', None),
         }
-        
+
         torch.save(checkpoint, checkpoint_path)
         logger.info(f"Checkpoint saved: {checkpoint_path}")
     
@@ -793,9 +795,18 @@ class EGTMARLTrainer:
             恢复时的episode编号
         """
         checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
-        
+
         episode = checkpoint.get('episode', 0)
         self.config = checkpoint.get('config', self.config)
+
+        # Restore best_rescue_rate so that resume does not overwrite
+        # the previously best model with a worse one (Issue 5 fix).
+        if 'best_rescue_rate' in checkpoint:
+            self.best_rescue_rate = checkpoint['best_rescue_rate']
+            logger.info(
+                f"Restored best_rescue_rate={self.best_rescue_rate:.4f} "
+                f"from checkpoint (best_model_episode={checkpoint.get('best_model_episode')})"
+            )
         
         # 加载算法权重（包括EGT层、MARL层等）
         if self.algorithm is not None:
@@ -899,8 +910,11 @@ class EGTMARLTrainer:
         num_eval_episodes = training_config['num_eval_episodes']
         save_best_model = training_config['save_best_model']
         
-        # 训练统计
-        best_rescue_rate = 0.0
+        # 训练统计（best_rescue_rate 改为实例属性以便 resume 时恢复）
+        if not hasattr(self, 'best_rescue_rate'):
+            self.best_rescue_rate = 0.0
+        if not hasattr(self, '_best_model_episode'):
+            self._best_model_episode = None
         training_history = {
             'episodes': [],
             'rescue_rate': [],
@@ -937,6 +951,11 @@ class EGTMARLTrainer:
         
         # 训练循环
         for episode in range(start_episode, num_episodes + 1):
+            # Issue 6 fix: sync algorithm's internal episode counter so the
+            # checkpoint records the real episode, not 0.
+            if self.algorithm is not None and hasattr(self.algorithm, 'set_external_episode'):
+                self.algorithm.set_external_episode(episode)
+
             # 检查是否需要切换phase
             current_phase_idx = -1
             for i, (start, end) in enumerate(zip(phase_starts, phase_ends)):
@@ -1062,10 +1081,14 @@ class EGTMARLTrainer:
                            f"Train Rescue Rate: {episode_metrics.get('rescue_rate', 0.0):.1f}% - "
                            f"Eval Rescue Rate: {eval_metrics.get('rescue_rate', 0.0):.1f}% ± {eval_metrics.get('rescue_rate_std', 0.0):.1f}")
                 
-                # 保存最佳模型
-                if save_best_model and eval_metrics.get('rescue_rate', 0.0) > best_rescue_rate:
-                    best_rescue_rate = eval_metrics.get('rescue_rate', 0.0)
+                # 保存最佳模型（Issue 5: 使用 self.best_rescue_rate 实例属性）
+                if save_best_model and eval_metrics.get('rescue_rate', 0.0) > self.best_rescue_rate:
+                    self.best_rescue_rate = eval_metrics.get('rescue_rate', 0.0)
+                    self._best_model_episode = episode
                     self.save_best_model(episode, eval_metrics)
+                    logger.info(
+                        f"New best model: RR={self.best_rescue_rate:.4f} at episode {episode}"
+                    )
             
             # 定期保存检查点
             if episode % checkpoint_interval == 0:

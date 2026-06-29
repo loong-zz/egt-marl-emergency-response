@@ -1165,6 +1165,16 @@ class EGTMARL:
         
         return metrics
     
+    def set_external_episode(self, episode: int) -> None:
+        """Allow the trainer to sync the algorithm's episode counter.
+
+        The trainer (train_egt_marl.py) drives its own episode loop and may
+        never invoke algorithm.train_episode(). Without this hook the
+        checkpoint's ``episode`` field would always be 0, breaking resume
+        semantics (Issue 6 fix).
+        """
+        self.episode = int(episode)
+
     def save_checkpoint(self, path: str) -> None:
         """Save model checkpoint."""
         # 保存 AntiSpoofing 中各个网络的状态

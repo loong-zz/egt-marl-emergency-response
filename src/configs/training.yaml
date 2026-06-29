@@ -24,21 +24,21 @@ schedule:
       episodes: 200
       learning_rate: 0.0001
       exploration_rate: 0.3
-      difficulty: 0.5
+      difficulty: 0.4
       lambda: 0.8  # Start balancing fairness
-      
+
     - name: "main_training"
       episodes: 500
       learning_rate: 0.0001
       exploration_rate: 0.1
-      difficulty: 0.7
+      difficulty: 0.5
       lambda: 0.7  # Balance efficiency and fairness
-      
+
     - name: "fine_tuning"
-      episodes: 400
-      learning_rate: 0.00001
-      exploration_rate: 0.01
-      difficulty: 1.0
+      episodes: 300
+      learning_rate: 0.00005
+      exploration_rate: 0.05
+      difficulty: 0.7
       lambda: 0.6  # More focus on fairness
   
   # Learning rate scheduling
@@ -52,7 +52,7 @@ schedule:
   exploration_schedule:
     type: "exponential"
     start: 0.8
-    end: 0.01
+    end: 0.05
     decay: 0.997  # Slower decay for better exploration
 
 # Environment configuration
