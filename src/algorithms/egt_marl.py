@@ -1210,6 +1210,65 @@ class EGTMARL:
         torch.save(checkpoint, path)
         print(f"Checkpoint saved to {path}")
     
+    def _load_state_dict_compat(self, module: nn.Module, state: dict) -> None:
+        """Load state_dict with shape-compatible weight copying.
+
+        For mismatched dimensions, copy overlapping weights and initialize
+        the new dimensions with Xavier. This handles legacy checkpoints
+        where AntiSpoofing networks had action_dim=1 (concat=807) but the
+        current model expects action_dim=32 (concat=838).
+
+        NOTE: module.load_state_dict(strict=False) STILL checks tensor shapes
+        and will raise RuntimeError on shape mismatch. Instead, we directly
+        copy overlapping weights into existing parameters via .data.copy_().
+        This bypasses PyTorch's shape validation.
+        """
+        current_state = module.state_dict()
+        loaded_state = state
+
+        for key in current_state:
+            if key not in loaded_state:
+                continue
+
+            ckpt_tensor = loaded_state[key]
+            cur_shape = current_state[key].shape
+
+            if ckpt_tensor.shape == cur_shape:
+                # Exact match: copy directly into existing parameter (bypass shape check)
+                param = None
+                if key in module._parameters:
+                    param = module._parameters[key]
+                elif key in module._buffers:
+                    param = module._buffers[key]
+                if param is not None:
+                    with torch.no_grad():
+                        param.data.copy_(ckpt_tensor)
+            else:
+                # Shape mismatch: copy overlapping portion, Xavier-init the rest.
+                # Only works when checkpoint is smaller than current (807 -> 838).
+                # Clone the current (correct-shape) tensor, copy overlapping, init new.
+                new_tensor = current_state[key].clone()
+                with torch.no_grad():
+                    n_dims = ckpt_tensor.ndim
+                    if n_dims == 1:
+                        new_tensor[:ckpt_tensor.numel()] = ckpt_tensor
+                    elif n_dims == 2:
+                        min_out = min(ckpt_tensor.shape[0], cur_shape[0])
+                        min_in = min(ckpt_tensor.shape[1], cur_shape[1])
+                        new_tensor[:min_out, :min_in] = ckpt_tensor[:min_out, :min_in]
+                        if new_tensor.shape[1] > min_in:
+                            nn.init.xavier_uniform_(new_tensor[:, min_in:])
+                        elif new_tensor.shape[0] > min_out:
+                            nn.init.xavier_uniform_(new_tensor[min_out:, :])
+                    # Write the corrected tensor directly into existing parameter
+                    param = None
+                    if key in module._parameters:
+                        param = module._parameters[key]
+                    elif key in module._buffers:
+                        param = module._buffers[key]
+                    if param is not None:
+                        param.data.copy_(new_tensor)
+
     def load_checkpoint(self, path: str) -> None:
         """Load model checkpoint."""
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
@@ -1227,16 +1286,20 @@ class EGTMARL:
             self.marl_layer.epsilon = checkpoint['marl_layer_state']['epsilon']
 
         # 加载 AntiSpoofing 中各个网络的状态
+        # Use _load_state_dict_compat to handle legacy checkpoints where
+        # AntiSpoofing networks had action_dim=1 (concat=807) but the current
+        # model expects action_dim=32 (concat=838). Overlapping weights are
+        # copied; new dimensions are Xavier-initialized.
         if 'anti_spoofing_state' in checkpoint:
             anti_spoofing_state = checkpoint['anti_spoofing_state']
             if hasattr(self.anti_spoofing, 'verifier') and anti_spoofing_state.get('verifier') is not None:
-                self.anti_spoofing.verifier.load_state_dict(anti_spoofing_state['verifier'])
+                self._load_state_dict_compat(self.anti_spoofing.verifier, anti_spoofing_state['verifier'])
             if hasattr(self.anti_spoofing, 'spoofing_detector') and anti_spoofing_state.get('spoofing_detector') is not None:
-                self.anti_spoofing.spoofing_detector.load_state_dict(anti_spoofing_state['spoofing_detector'])
+                self._load_state_dict_compat(self.anti_spoofing.spoofing_detector, anti_spoofing_state['spoofing_detector'])
             if hasattr(self.anti_spoofing, 'correction_network') and anti_spoofing_state.get('correction_network') is not None:
-                self.anti_spoofing.correction_network.load_state_dict(anti_spoofing_state['correction_network'])
+                self._load_state_dict_compat(self.anti_spoofing.correction_network, anti_spoofing_state['correction_network'])
             if hasattr(self.anti_spoofing, 'demand_predictor') and anti_spoofing_state.get('demand_predictor') is not None:
-                self.anti_spoofing.demand_predictor.load_state_dict(anti_spoofing_state['demand_predictor'])
+                self._load_state_dict_compat(self.anti_spoofing.demand_predictor, anti_spoofing_state['demand_predictor'])
             if hasattr(self.anti_spoofing, 'reputation_system') and anti_spoofing_state.get('reputation_system') is not None:
                 self.anti_spoofing.reputation_system = anti_spoofing_state['reputation_system']
         
@@ -1248,8 +1311,23 @@ class EGTMARL:
             if hasattr(self.dynamic_frontier, 'exploitation_frontier') and dynamic_frontier_state.get('exploitation_frontier') is not None:
                 self.dynamic_frontier.exploitation_frontier = dynamic_frontier_state['exploitation_frontier']
         
-        self.marl_optimizer.load_state_dict(checkpoint['marl_optimizer_state'])
-        self.egt_optimizer.load_state_dict(checkpoint['egt_optimizer_state'])
+        # Optimizer state may have shape mismatches if AntiSpoofing networks were
+        # rebuilt. Try to load; if shapes mismatch, skip and let the optimizer
+        # re-initialize (model weights are preserved, just learning rate schedule resets).
+        for opt_name, opt_state in [('marl_optimizer', checkpoint.get('marl_optimizer_state')),
+                                     ('egt_optimizer', checkpoint.get('egt_optimizer_state'))]:
+            if opt_state is None:
+                continue
+            try:
+                if opt_name == 'marl_optimizer':
+                    self.marl_optimizer.load_state_dict(opt_state)
+                else:
+                    self.egt_optimizer.load_state_dict(opt_state)
+            except RuntimeError as e:
+                if 'size mismatch' in str(e):
+                    print(f"  WARNING: {opt_name} state shape mismatch, re-initializing (model weights preserved)")
+                else:
+                    raise
         
         self.metrics_history = checkpoint['metrics_history']
         

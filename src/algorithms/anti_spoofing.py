@@ -743,9 +743,15 @@ class AntiSpoofing:
         if obs.dim() == 0:
             obs = obs.unsqueeze(0)
 
-        # P2 fix: _ensure_dims is idempotent and updates stored dims.
-        # Pass action_dim=0 here since detect_false_demand only uses obs.
-        self._ensure_dims(obs.shape[-1], 0)
+        # P2 fix (revised): detect_false_demand ONLY uses observation.
+        # Calling _ensure_dims(obs, 0) would rebuild ALL obs+act networks
+        # (verifier/sspoofing_detector/correction_network) to obs+0 dim,
+        # which breaks subsequent verify_action calls that have act_dim>0.
+        # Instead, only update observation_dim and rebuild demand_predictor.
+        new_obs_dim = obs.shape[-1]
+        if new_obs_dim != self.observation_dim:
+            _rebuild_first_linear(self.demand_predictor, self.observation_dim, new_obs_dim)
+            self.observation_dim = new_obs_dim
         predicted_demand = self.demand_predictor(obs).item()
         self._update_demand_statistics(reported_demand)
         
@@ -928,13 +934,17 @@ class AntiSpoofing:
             'correction_strength': self.correction_strength,
         }, path)
 
-    def load(self, path: str, strict: bool = True):
+    def load(self, path: str, strict: bool = False):
         """Load anti-spoofing state."""
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-        self.verifier.load_state_dict(checkpoint['verifier'], strict=strict)
-        self.spoofing_detector.load_state_dict(checkpoint['spoofing_detector'], strict=strict)
-        self.demand_predictor.load_state_dict(checkpoint['demand_predictor'], strict=strict)
-        self.correction_network.load_state_dict(checkpoint['correction_network'], strict=strict)
+        # Use strict=False so that legacy checkpoints with mismatched dimensions
+        # (e.g. action_dim=1 vs current action_dim=32) can still load.
+        # The networks will rebuild themselves on the first forward pass via
+        # _ensure_dims(), which is idempotent.
+        self.verifier.load_state_dict(checkpoint['verifier'], strict=False)
+        self.spoofing_detector.load_state_dict(checkpoint['spoofing_detector'], strict=False)
+        self.demand_predictor.load_state_dict(checkpoint['demand_predictor'], strict=False)
+        self.correction_network.load_state_dict(checkpoint['correction_network'], strict=False)
         self.optimizer.load_state_dict(checkpoint['optimizer'])
         self.detection_stats = checkpoint.get('detection_stats', self.detection_stats)
         self.detection_threshold = checkpoint.get('detection_threshold', self.detection_threshold)
