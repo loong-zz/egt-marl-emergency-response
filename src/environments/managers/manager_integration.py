@@ -366,12 +366,24 @@ class ManagerIntegration:
         reputation = self.reputation_manager.get_reputation(agent_id)
         reputation_bonus = 0.1 * reputation
 
-        # Combine adjustments
-        shaped_reward = base_reward * (0.8 + 0.2 * reputation) + reputation_bonus
+        # P0 fix: previously lambda_t, fairness_factor, efficiency_weight,
+        # fairness_weight were read but never used, making the environment-
+        # level EGT/Pareto signals dead code. Now they actually shape reward.
+        # - lambda_t high (inequality severe) -> amplify reward to encourage rescue
+        # - efficiency_weight > 0.5 (early phase) -> efficiency bias
+        egt_fairness_bonus = 0.05 * lambda_t * base_reward
+        pareto_bias = 0.03 * (efficiency_weight - 0.5) * base_reward
+        shaped_reward = (
+            base_reward * (0.8 + 0.2 * reputation)
+            + reputation_bonus
+            + egt_fairness_bonus
+            + pareto_bias
+        )
 
         logger.debug(f"[REWARD SHAPING] Agent{agent_id} - "
                     f"Base={base_reward:.2f}, Shaped={shaped_reward:.2f}, "
-                    f"λ={lambda_t:.2f}, Reputation={reputation:.2f}")
+                    f"λ={lambda_t:.2f}, Eff={efficiency_weight:.2f}, "
+                    f"Fair={fairness_weight:.2f}, Reputation={reputation:.2f}")
 
         return shaped_reward
 

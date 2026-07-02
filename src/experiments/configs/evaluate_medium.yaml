@@ -19,7 +19,7 @@ environment:
   num_agents: 20             # 中等数量智能体
   num_victims: 100           # 中等数量受害者
   num_resources: 20          # 中等数量资源
-  num_hospitals: 5           # 中等数量医院
+  num_areas: 5
   disaster_type: earthquake
   severity: medium
 

@@ -30,7 +30,7 @@ environment:
   num_agents: 20
   num_victims: 200
   num_resources: 10
-  num_hospitals: 3
+  num_areas: 3
   disaster_type: earthquake
   severity: medium
 

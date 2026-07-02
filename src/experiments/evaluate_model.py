@@ -41,7 +41,7 @@ def load_model(config: Dict, checkpoint_path: str):
     sim_config.num_agents = env_config.get('num_agents', 20)
     sim_config.num_victims = env_config.get('num_victims', 200)
     sim_config.num_resources = env_config.get('num_resources', 10)
-    sim_config.num_hospitals = env_config.get('num_hospitals', 3)
+    sim_config.num_areas = env_config.get('num_areas', 3)
     sim_config.map_size = env_config.get('map_size', (1000, 1000))
     sim_config.disaster_type = env_config.get('disaster_type', 'earthquake')
     sim_config.severity = env_config.get('severity', 'medium')
@@ -53,7 +53,7 @@ def load_model(config: Dict, checkpoint_path: str):
         num_agents=sim_config.num_agents,
         num_victims=sim_config.num_victims,
         num_resources=sim_config.num_resources,
-        num_hospitals=sim_config.num_hospitals,
+        num_areas=sim_config.num_areas,
         disaster_type=sim_config.disaster_type,
         severity=sim_config.severity,
         config=sim_config

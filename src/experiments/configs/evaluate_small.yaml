@@ -18,7 +18,7 @@ environment:
   num_agents: 3              # 少量智能体
   num_victims: 10            # 少量受害者
   num_resources: 5           # 少量资源
-  num_hospitals: 2           # 少量医院
+  num_areas: 2
   disaster_type: earthquake
   severity: low
 

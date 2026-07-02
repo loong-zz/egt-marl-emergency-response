@@ -32,7 +32,7 @@ class DisasterSim:
         num_agents: int = 5, 
         num_victims: int = 100, 
         num_resources: int = 4, 
-        num_hospitals: int = 2, 
+        num_areas: Optional[int] = None,
         disaster_type: str = 'earthquake', 
         severity: str = 'medium',
         config: Optional[SimulationConfig] = None
@@ -47,7 +47,7 @@ class DisasterSim:
         self.config.num_agents = num_agents
         self.config.num_victims = num_victims
         self.config.num_resources = num_resources
-        self.config.num_hospitals = num_hospitals
+        self.config.num_areas = num_areas if num_areas is not None else self.config.num_areas
         self.config.disaster_type = disaster_type
         self.config.severity = severity
         
@@ -118,8 +118,12 @@ class DisasterSim:
         self.severity_difficulty = float(max(0.0, min(1.0, difficulty)))
 
     def _initialize_affected_areas(self) -> None:
-        """Initialize affected areas based on scenario."""
-        num_areas = max(3, self.config.num_hospitals)
+        """Initialize affected areas based on num_areas configuration.
+
+        The number of areas is ``max(3, self.config.num_areas)``, ensuring at
+        least 3 areas even when a smaller value is configured plausibility.
+        """
+        num_areas = max(3, self.config.num_areas)
         map_size = self.map_size[0] if isinstance(self.map_size, (tuple, list)) else self.map_size
         
         for i in range(num_areas):
@@ -141,17 +145,41 @@ class DisasterSim:
             self.affected_areas[i] = area
     
     def _initialize_resource_depots(self) -> None:
-        """Initialize resource depots with dynamic resource calculation based on num_victims."""
+        """Initialize resource depots with dynamic resource calculation based on num_victims.
+
+        Bug fix: depot_positions was previously hard-coded to 2 positions, ignoring
+        ``self.config.num_resources`` from the YAML. Now we generate one depot per
+        configured resource slot, evenly distributed in the four quadrants of the
+        map (with the legacy 2-depot fallback when num_resources <= 2).
+        """
         from environments.config.constants import (
             RESOURCE_SUPPLY_RATIO, EXPECTED_SEVERITY_DISTRIBUTION,
             RESOURCES_NEEDED, ResourceType, CasualtySeverity
         )
-        
+
         map_size = self.map_size[0] if isinstance(self.map_size, (tuple, list)) else self.map_size
-        depot_positions = [
-            np.array([map_size * 0.2, map_size * 0.2]),
-            np.array([map_size * 0.8, map_size * 0.8])
-        ]
+
+        num_depots = max(1, int(self.config.num_resources))
+
+        # Generate evenly distributed depot positions in a grid.
+        # For <=2 depots, preserve the legacy corner layout for backward
+        # compatibility with logs / reward shaping assumptions.
+        if num_depots <= 2:
+            depot_positions = [
+                np.array([map_size * 0.2, map_size * 0.2]),
+                np.array([map_size * 0.8, map_size * 0.8]),
+            ][:num_depots]
+        else:
+            # Place depots on a roughly square grid centred on the map.
+            cols = int(np.ceil(np.sqrt(num_depots)))
+            rows = int(np.ceil(num_depots / cols))
+            depot_positions = []
+            for i in range(num_depots):
+                r, c = divmod(i, cols)
+                # Use 0.2..0.8 range so depots are inside the playable area.
+                x = map_size * (0.2 + 0.6 * (c / max(1, cols - 1))) if cols > 1 else map_size * 0.5
+                y = map_size * (0.2 + 0.6 * (r / max(1, rows - 1))) if rows > 1 else map_size * 0.5
+                depot_positions.append(np.array([x, y]))
         
         # Calculate total expected resource demand based on num_victims
         num_victims = getattr(self.config, 'num_victims', 100)

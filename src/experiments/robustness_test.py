@@ -81,7 +81,7 @@ class RobustnessTester:
                 'num_agents': 5,
                 'num_victims': 20,
                 'num_resources': 10,
-                'num_hospitals': 3
+                'num_areas': 3
             },
             'algorithm': {
                 'model_path': None,  # 预训练模型路径
@@ -161,7 +161,7 @@ class RobustnessTester:
             num_agents=env_config['num_agents'],
             num_victims=env_config['num_victims'],
             num_resources=env_config['num_resources'],
-            num_hospitals=env_config['num_hospitals'],
+            num_areas=env_config['num_areas'],
             disaster_type=robustness_config['scenario'],
             severity=robustness_config['severity']
         )

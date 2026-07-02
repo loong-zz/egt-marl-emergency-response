@@ -18,7 +18,7 @@ environment:
   num_agents: 100            # 与训练一致
   num_victims: 1000          # 与训练一致
   num_resources: 48          # 与训练一致
-  num_hospitals: 16          # 与训练一致
+  num_areas: 16
   disaster_type: earthquake  # 与训练一致
   severity: medium
 

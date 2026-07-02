@@ -28,7 +28,7 @@ environment:
   num_agents: 17  # 10 drones + 5 ambulances + 2 hospitals (matches training)
   num_victims: 200
   num_resources: 10
-  num_hospitals: 3
+  num_areas: 3
   disaster_type: earthquake
   severity: medium
 

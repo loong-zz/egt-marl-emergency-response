@@ -62,7 +62,7 @@ class DecisionTimeEvaluator:
                 'num_agents': 20,
                 'num_victims': 200,
                 'num_resources': 10,
-                'num_hospitals': 3,
+                'num_areas': 3,
                 'disaster_type': 'earthquake',
                 'severity': 'medium'
             },
@@ -100,7 +100,7 @@ class DecisionTimeEvaluator:
             num_agents=env_config['num_agents'],
             num_victims=env_config['num_victims'],
             num_resources=env_config['num_resources'],
-            num_hospitals=env_config['num_hospitals'],
+            num_areas=env_config['num_areas'],
             disaster_type=env_config['disaster_type'],
             severity=env_config['severity']
         )

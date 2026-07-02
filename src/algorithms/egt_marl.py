@@ -127,9 +127,11 @@ class EGTMARL:
         num_agents = self.config['marl']['num_agents']
 
         if use_improved and num_agents >= 17:
-            # Map the 17-agent configuration (10 drones + 5 ambulances + 2 hospitals)
-            # onto the ImprovedQMIX agent types.
-            n_drones, n_ambulances, n_hospitals = 10, 5, 2
+            # Critical fix: match paper section 5.1.3 spec (20 agents = 6+8+6).
+            # Was hardcoded 10+5+2=17, causing agent_types/action_dims length
+            # mismatch with ImprovedQMIX(num_agents=20). Last 3 agents had no
+            # type/action_dim config, leading to silent behavior degradation.
+            n_drones, n_ambulances, n_hospitals = 6, 8, 6
             agent_types = (['drone'] * n_drones
                            + ['ambulance'] * n_ambulances
                            + ['hospital'] * n_hospitals)
@@ -170,9 +172,13 @@ class EGTMARL:
         )
 
         # Anti-spoofing mechanism
+        # Critical fix: align action_dim with actual action representation.
+        # Agent actions arrive as a 2-dim dict tensor [tactical/8, communication/4]
+        # (see _extract_actions path below); using action_dim=32 caused the
+        # AntiSpoofing input layer to be rebuilt every training step.
         self.anti_spoofing = AntiSpoofing(
             observation_dim=self.config['marl']['state_dim'],
-            action_dim=self.config['marl']['action_dim'],
+            action_dim=2,
             device=self.device,
             num_agents=self.config['marl']['num_agents']
         )
@@ -889,12 +895,16 @@ class EGTMARL:
         # access to per-agent signals.  The scalar `lambda_param` is
         # still propagated to MARLLayer.update() (when not using
         # ImprovedQMIX) and to the auxiliary callbacks.
+        # P2 fix: previously `egt_boost = fairness_weight - 0.5`, which vanishes
+        # when fairness_weight ≈ 0.5 (the common balanced case), making the
+        # EGT macro signal a no-op. Amplify 2x so balanced case still biases,
+        # and add a small additive floor from lambda_param so the signal never
+        # disappears entirely.
         egt_boost = 0.0
         if egt_weights is not None and 'fairness_weight' in egt_weights:
-            egt_boost = float(egt_weights['fairness_weight']) - 0.5
-        shaped_rewards = rewards * (1.0 + egt_boost)
-        # Stash lambda for downstream consumers; no additive bias here.
+            egt_boost = 2.0 * (float(egt_weights['fairness_weight']) - 0.5)
         lam = float(max(0.0, min(1.0, lambda_param)))
+        shaped_rewards = rewards * (1.0 + egt_boost) + 0.01 * lam
         # Reduce to per-step scalar (mean across the 17 agents) so we can
         # index it inside the per-timestep loop below.
         if shaped_rewards.dim() == 2:
@@ -984,8 +994,10 @@ class EGTMARL:
         while not done:
             # Select action
             action = self.select_action(state, training=True)
-            
+
             # Apply anti-spoofing: detect and correct strategic behavior
+            # Critical fix: penalty now enters reward chain (was internal-only)
+            anti_spoofing_penalty = 0.0
             if self.config.get('anti_spoofing', {}).get('enabled', True):
                 try:
                     # Convert state to tensor for anti-spoofing
@@ -993,12 +1005,12 @@ class EGTMARL:
                         state_for_check = state[0]
                     else:
                         state_for_check = state
-                    
+
                     if isinstance(state_for_check, np.ndarray):
                         state_tensor = torch.tensor(state_for_check, dtype=torch.float32, device=self.device)
                     else:
                         state_tensor = state_for_check
-                    
+
                     # Check each agent's action
                     for agent_id in range(self.num_agents):
                         if agent_id in action:
@@ -1006,30 +1018,44 @@ class EGTMARL:
                             # Convert action to tensor
                             if isinstance(agent_action, dict):
                                 action_tensor = torch.tensor(
-                                    [agent_action.get('tactical', 0) / 8.0, 
+                                    [agent_action.get('tactical', 0) / 8.0,
                                      agent_action.get('communication', 0) / 4.0],
                                     dtype=torch.float32, device=self.device
                                 )
                             else:
                                 action_tensor = torch.tensor(agent_action, dtype=torch.float32, device=self.device)
-                            
+
                             # Detect strategic behavior
                             strategic_result = self.anti_spoofing.detect_strategic_behavior(
                                 agent_id, state_tensor[agent_id], action_tensor
                             )
-                            
+
                             if strategic_result['is_strategic']:
                                 # Apply punishment
                                 self.anti_spoofing.apply_punishment(
                                     agent_id, strategic_result['strategic_score']
                                 )
+                                # Critical fix: penalty now enters reward chain
+                                # (previously apply_punishment only updated internal
+                                # reputation, reward stayed unchanged -> model never
+                                # learned to avoid strategic behavior)
+                                anti_spoofing_penalty -= 0.1 * float(strategic_result['strategic_score'])
                 except Exception:
                     pass  # Anti-spoofing is non-critical during training
-            
+
             # Take step in environment
             next_state, reward, terminated, truncated, info = self.env.step(action)
             done = terminated or truncated
-            
+
+            # Apply anti-spoofing penalty to reward
+            if anti_spoofing_penalty != 0.0:
+                if isinstance(reward, (int, float)):
+                    reward += anti_spoofing_penalty
+                elif isinstance(reward, dict):
+                    # Distribute penalty equally across agents
+                    per_agent_penalty = anti_spoofing_penalty / max(len(reward), 1)
+                    reward = {k: v + per_agent_penalty for k, v in reward.items()}
+
             # Store experience
             episode_buffer['states'].append(state)
             episode_buffer['actions'].append(action)

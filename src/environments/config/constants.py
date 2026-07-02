@@ -256,7 +256,9 @@ class SimulationConfig:
 
     # Resource depot configuration
     num_resources: int = 4
-    num_hospitals: int = 2
+    # num_areas: count of affected disaster areas.
+    # Used to bound the number of affected areas (``max(3, num_areas)`` in DisasterSim).
+    num_areas: int = 3
 
     # Disaster configuration
     disaster_type: str = 'earthquake'

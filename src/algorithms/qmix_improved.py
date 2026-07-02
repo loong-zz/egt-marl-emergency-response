@@ -125,12 +125,18 @@ class EnhancedRewardStructure:
         self.config = config
         
         # Reward weights (can be dynamically adjusted)
+        # Critical fix: add reputation + anti_spoofing_penalty to match
+        # paper section 4.4 (Bayesian truthfulness + incentive compatibility).
+        # Previously missing these 2 components, making anti-spoofing rewards
+        # a no-op in the EnhancedRewardStructure.
         self.weights = {
-            'efficiency': 0.35,
-            'fairness': 0.25,
-            'robustness': 0.15,
+            'efficiency': 0.30,
+            'fairness': 0.20,
+            'robustness': 0.10,
             'communication': 0.10,
-            'resource_efficiency': 0.15
+            'resource_efficiency': 0.10,
+            'reputation': 0.10,
+            'anti_spoofing_penalty': 0.10
         }
         
         # Normalization factors
@@ -167,6 +173,14 @@ class EnhancedRewardStructure:
         # 5. Resource efficiency reward
         resource_reward = self._calculate_resource_reward(metrics, previous_metrics)
         rewards['resource_efficiency'] = resource_reward
+
+        # 6. Reputation reward (paper section 4.4)
+        reputation_reward = self._calculate_reputation_reward(metrics, previous_metrics)
+        rewards['reputation'] = reputation_reward
+
+        # 7. Anti-spoofing penalty (paper section 4.4)
+        anti_spoofing_penalty = self._calculate_anti_spoofing_penalty(metrics, previous_metrics)
+        rewards['anti_spoofing_penalty'] = anti_spoofing_penalty
         
         # Weighted sum
         total_reward = sum(weight * rewards[component] 
@@ -311,8 +325,42 @@ class EnhancedRewardStructure:
         )
         
         return resource_reward
-    
-    def update_weights(self, 
+
+    def _calculate_reputation_reward(self,
+                                     metrics: Dict[str, Any],
+                                     previous_metrics: Optional[Dict[str, Any]]) -> float:
+        """Calculate reputation component of reward (paper section 4.4).
+
+        Higher average reputation -> higher reward, incentivizing honest behavior.
+        Reputation is maintained by the anti-spoofing / reputation manager.
+        """
+        avg_reputation = metrics.get('avg_reputation', 0.5)
+        # Linear mapping: reputation 0 -> reward 0, reputation 1 -> reward 1
+        reputation_reward = float(avg_reputation)
+        # Bonus for reputation improvement
+        if previous_metrics:
+            prev_rep = previous_metrics.get('avg_reputation', 0.5)
+            improvement = avg_reputation - prev_rep
+            if improvement > 0:
+                reputation_reward += 0.1 * improvement
+        return reputation_reward
+
+    def _calculate_anti_spoofing_penalty(self,
+                                          metrics: Dict[str, Any],
+                                          previous_metrics: Optional[Dict[str, Any]]) -> float:
+        """Calculate anti-spoofing penalty component (paper section 4.4).
+
+        More detected strategic behavior -> more negative reward.
+        This closes the incentive-compatibility loop: agents that try to
+        game the system get penalized in reward, not just in internal state.
+        """
+        spoofing_rate = metrics.get('spoofing_rate', 0.0)
+        num_strategic = metrics.get('num_strategic_agents', 0)
+        # Penalty proportional to spoofing rate and count
+        penalty = -1.0 * float(spoofing_rate) - 0.05 * float(num_strategic)
+        return penalty
+
+    def update_weights(self,
                       performance_feedback: Dict[str, float],
                       learning_rate: float = 0.01):
         """Dynamically update reward weights based on performance."""

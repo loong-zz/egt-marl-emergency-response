@@ -120,7 +120,7 @@ class EGTMARLTrainer:
                 'num_agents': 20,
                 'num_victims': 200,
                 'num_resources': 10,
-                'num_hospitals': 3,
+                'num_areas': 3,
                 'disaster_type': 'earthquake',
                 'severity': 'medium'
             },
@@ -253,7 +253,7 @@ class EGTMARLTrainer:
             num_agents=env_config['num_agents'],
             num_victims=env_config['num_victims'],
             num_resources=env_config['num_resources'],
-            num_hospitals=env_config['num_hospitals'],
+            num_areas=env_config['num_areas'],
             disaster_type=env_config['disaster_type'],
             severity=env_config['severity']
         )
@@ -367,7 +367,11 @@ class EGTMARLTrainer:
         while not done and step < max_steps:
             # Manager集成：Step开始回调
             if self.manager_integration is not None:
-                hours_elapsed = step * 0.1 / 3600.0  # 假设每步0.1秒
+                # P1 fix: was `step * 0.1 / 3600.0` (每步0.1秒), which made
+                # max hours = 1200*0.1/3600 ≈ 0.033h,永远 < phase1_threshold=24h,
+                # 导致 pareto_manager 永远停在 'early' 阶段. 现每步=0.1小时(6分钟),
+                # 1200步=120小时,能覆盖 early(0-24h)/mid(24-72h)/recovery(72h+) 三阶段.
+                hours_elapsed = step * 0.1
                 aftershock = info.get('aftershock_happening', False)
                 self.manager_integration.on_step_start(hours_elapsed, aftershock)
             

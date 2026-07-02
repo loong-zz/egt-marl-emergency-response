@@ -62,7 +62,18 @@ environment:
   render_frequency: 200
   save_replays: false  # Disable for speed
   replay_frequency: 1000
-  
+
+  # Critical fix: explicit environment params. Without these, train_egt_marl.py
+  # falls back to defaults (num_agents=20, num_resources=10). With num_resources
+  # > 2, DisasterSim now spreads depots on a grid (see _initialize_resource_depots).
+  map_size: [1000, 1000]
+  num_agents: 20
+  num_victims: 200
+  num_resources: 4
+  num_areas: 3
+  disaster_type: "earthquake"
+  severity: "medium"
+
   variations:
     enabled: true
     types:

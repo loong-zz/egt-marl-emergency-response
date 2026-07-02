@@ -53,7 +53,7 @@ class DynamicFrontierTuner:
             num_victims=env_config['num_victims'],
             map_size=tuple(env_config['map_size']),
             num_resources=env_config.get('num_resources', 10),
-            num_hospitals=env_config.get('num_hospitals', 3),
+            num_areas=env_config.get('num_areas', 3),
             disaster_type=env_config.get('disaster_type', 'earthquake'),
             severity=env_config.get('severity', 'medium')
         )
@@ -248,7 +248,7 @@ def main():
             'num_victims': 20,
             'map_size': [100, 100],
             'num_resources': 10,
-            'num_hospitals': 3,
+            'num_areas': 3,
             'disaster_type': 'earthquake',
             'severity': 'medium'
         }
