@@ -169,8 +169,10 @@ def visualize_disaster_scenario(
             agent_type = agent.get('type', 'unknown')
             if agent_type == 'drone':
                 color = 'blue'
-            elif agent_type == 'ambulance':
+            elif agent_type == 'vehicle' or agent_type == 'ambulance':
                 color = 'red'
+            elif agent_type == 'personnel' or agent_type == 'hospital':
+                color = 'green'
             else:
                 color = 'purple'
             ax.scatter(x, y, s=80, marker='*', color=color, label=f'{agent_type} {agent.get("id", "")}')

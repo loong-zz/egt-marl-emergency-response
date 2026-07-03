@@ -6,7 +6,7 @@ marl:
   # Network architecture
   state_dim: 256
   action_dim: 64
-  num_agents: 17  # 10 drones + 5 ambulances + 2 hospitals
+  num_agents: 17  # DRONE=1, VEHICLE=3, PERSONNEL=13 (dynamic allocation: num//10, num//5, remaining)
   hidden_dim: 128
   mixing_hidden_dim: 64
 

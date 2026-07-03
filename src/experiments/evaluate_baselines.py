@@ -506,7 +506,7 @@ class BaselineEvaluator:
                 role_id = 0
                 try:
                     role = getattr(agent, 'role', None) or getattr(agent, 'agent_type', None)
-                    role_id = {'drone': 0, 'ambulance': 1, 'personnel': 2, 'vehicle': 3, 'hospital': 4}.get(str(role).lower(), 5)
+                    role_id = {'drone': 0, 'vehicle': 1, 'personnel': 2, 'ambulance': 1, 'hospital': 2}.get(str(role).lower(), 3)
                 except Exception:
                     role_id = 5
                 return np.array([role_id / 5.0,
@@ -604,7 +604,7 @@ class BaselineEvaluator:
 
             def _agent_feat(self, agent):
                 role = getattr(agent, 'role', None) or getattr(agent, 'agent_type', None)
-                role_id = {'drone': 0, 'ambulance': 1, 'personnel': 2, 'vehicle': 3, 'hospital': 4}.get(str(role).lower(), 5)
+                role_id = {'drone': 0, 'vehicle': 1, 'personnel': 2, 'ambulance': 1, 'hospital': 2}.get(str(role).lower(), 3)
                 cap_total = 0.0
                 try:
                     cap_total = float(sum(agent.capacity.values())) if agent.capacity else 1.0

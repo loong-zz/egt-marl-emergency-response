@@ -46,8 +46,8 @@ class DisasterVisualizer:
             'compound': '#DDA0DD',     # 复合灾害 - 紫色
             
             'drone': '#1F77B4',        # 无人机 - 蓝色
-            'ambulance': '#FF7F0E',    # 救护车 - 橙色
-            'mobile_hospital': '#2CA02C',  # 移动医院 - 绿色
+            'vehicle': '#FF7F0E',      # 车辆 - 橙色
+            'personnel': '#2CA02C',    # 人员 - 绿色
             
             'low': '#98DF8A',          # 低风险 - 浅绿
             'medium': '#FFBB78',       # 中风险 - 橙色
@@ -226,7 +226,7 @@ class DisasterVisualizer:
         self._plot_base_scenario(ax, scenario_data)
         
         # 绘制智能体轨迹
-        agent_types = ['drone', 'ambulance', 'mobile_hospital']
+        agent_types = ['drone', 'vehicle', 'personnel']
         
         for agent_id, trajectory in agent_data.items():
             if not trajectory:

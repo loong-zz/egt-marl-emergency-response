@@ -17,8 +17,8 @@ from enum import Enum
 class AgentType(Enum):
     """Enumeration of agent types in the disaster simulation."""
     DRONE = "drone"           # Fast reconnaissance, small-scale rescue
-    AMBULANCE = "ambulance"   # Medium-scale rescue, transportation
-    HOSPITAL = "hospital"     # Large-scale rescue, on-site treatment
+    VEHICLE = "vehicle"       # Medium-scale rescue, transportation
+    PERSONNEL = "personnel"   # Large-scale rescue, on-site treatment
     MALICIOUS = "malicious"   # Malicious agent for robustness testing
 
 
@@ -343,8 +343,8 @@ class BaseAgent(ABC, nn.Module):
         """Encode agent type as a numerical value."""
         type_mapping = {
             'drone': 0.0,
-            'ambulance': 0.33,
-            'hospital': 0.66,
+            'vehicle': 0.33,
+            'personnel': 0.66,
             'malicious': 1.0,
             'unknown': 0.5
         }

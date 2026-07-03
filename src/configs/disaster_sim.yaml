@@ -48,7 +48,7 @@ agents:
       communication_range: 200.0
       payload_capacity: 10.0
       
-  ambulance:
+  vehicle:
     count: 5
     initial_resources:
       medical_kits: 20.0
@@ -61,7 +61,7 @@ agents:
       road_dependency: 0.8
       treatment_capability: 0.7
       
-  hospital:
+  personnel:
     count: 2
     initial_resources:
       medical_kits: 100.0

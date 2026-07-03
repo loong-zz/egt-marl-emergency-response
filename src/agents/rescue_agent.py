@@ -998,7 +998,7 @@ def create_rescue_agent(
     Factory function to create rescue agents by type.
     
     Args:
-        agent_type: Type of agent ('drone', 'ambulance', 'hospital')
+        agent_type: Type of agent ('drone', 'vehicle', 'personnel')
         agent_id: Unique identifier for the agent
         initial_position: Initial [x, y] position
         initial_resources: Initial resources dictionary
@@ -1011,10 +1011,10 @@ def create_rescue_agent(
     
     if agent_type == 'drone':
         return DroneAgent(agent_id, initial_position, initial_resources, config)
-    elif agent_type == 'ambulance':
+    elif agent_type == 'vehicle' or agent_type == 'ambulance':
         return AmbulanceAgent(agent_id, initial_position, initial_resources, config)
-    elif agent_type == 'hospital':
+    elif agent_type == 'personnel' or agent_type == 'hospital':
         return HospitalAgent(agent_id, initial_position, initial_resources, config)
     else:
         raise ValueError(f"Unknown agent type: {agent_type}. "
-                         f"Supported types: 'drone', 'ambulance', 'hospital'")
+                         f"Supported types: 'drone', 'vehicle', 'personnel'")

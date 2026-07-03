@@ -36,12 +36,12 @@ class HierarchicalActionSpace:
                 'tactical': 8,   # Resource allocation, task prioritization
                 'operational': 12  # Movement, sensor usage, communication actions
             },
-            'ambulance': {
+            'vehicle': {
                 'strategic': 3,  # Patient care, Transport, Resource management
                 'tactical': 10,  # Patient triage, route planning, resource allocation
                 'operational': 8   # Driving, loading/unloading, treatment
             },
-            'hospital': {
+            'personnel': {
                 'strategic': 4,  # Treatment focus, Resource allocation, Coordination, Expansion
                 'tactical': 12,  # Patient management, staff allocation, resource distribution
                 'operational': 6   # Facility operations, communication, logistics
@@ -51,8 +51,8 @@ class HierarchicalActionSpace:
         # Action hierarchies
         self.hierarchies = {
             'drone': ['strategic', 'tactical', 'operational'],
-            'ambulance': ['strategic', 'tactical', 'operational'],
-            'hospital': ['strategic', 'tactical', 'operational']
+            'vehicle': ['strategic', 'tactical', 'operational'],
+            'personnel': ['strategic', 'tactical', 'operational']
         }
     
     def get_total_dim(self, agent_type: str) -> int:
@@ -1508,32 +1508,33 @@ class ImprovedQMIX:
 def create_improved_qmix(config: Dict[str, Any]) -> ImprovedQMIX:
     """Factory function to create improved QMIX algorithm."""
     # Parse configuration
-    num_agents = config.get('num_agents', 17)  # 10 drones + 5 ambulances + 2 hospitals
+    num_agents = config.get('num_agents', 17)  # DRONE=num//10, VEHICLE=num//5, PERSONNEL=remaining
     obs_dim = config.get('obs_dim', 256)
     state_dim = config.get('state_dim', 512)
     
-    # Define agent types and action dimensions
+    # Define agent types and action dimensions (match disaster_sim.py's dynamic allocation)
     agent_types = []
     action_dims = []
     
-    # Drones (10 agents)
-    for _ in range(10):
+    action_space = HierarchicalActionSpace(config)
+    
+    # Drones (num_agents // 10)
+    n_drones = max(1, num_agents // 10)
+    for _ in range(n_drones):
         agent_types.append('drone')
-        # Hierarchical action space total dimension
-        action_space = HierarchicalActionSpace(config)
         action_dims.append(action_space.get_total_dim('drone'))
     
-    # Ambulances (5 agents)
-    for _ in range(5):
-        agent_types.append('ambulance')
-        action_space = HierarchicalActionSpace(config)
-        action_dims.append(action_space.get_total_dim('ambulance'))
+    # Vehicles (num_agents // 5)
+    n_vehicles = max(1, num_agents // 5)
+    for _ in range(n_vehicles):
+        agent_types.append('vehicle')
+        action_dims.append(action_space.get_total_dim('vehicle'))
     
-    # Hospitals (2 agents)
-    for _ in range(2):
-        agent_types.append('hospital')
-        action_space = HierarchicalActionSpace(config)
-        action_dims.append(action_space.get_total_dim('hospital'))
+    # Personnel (remaining)
+    n_personnel = num_agents - n_drones - n_vehicles
+    for _ in range(n_personnel):
+        agent_types.append('personnel')
+        action_dims.append(action_space.get_total_dim('personnel'))
     
     # Create improved QMIX
     qmix = ImprovedQMIX(

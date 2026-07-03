@@ -25,7 +25,7 @@ algorithms:
 
 environment:
   map_size: [1000, 1000]
-  num_agents: 17  # 10 drones + 5 ambulances + 2 hospitals (matches training)
+  num_agents: 17  # DRONE=1, VEHICLE=3, PERSONNEL=13 (dynamic allocation: num//10, num//5, remaining)
   num_victims: 200
   num_resources: 10
   num_areas: 3

@@ -127,14 +127,14 @@ class EGTMARL:
         num_agents = self.config['marl']['num_agents']
 
         if use_improved and num_agents >= 17:
-            # Critical fix: match paper section 5.1.3 spec (20 agents = 6+8+6).
-            # Was hardcoded 10+5+2=17, causing agent_types/action_dims length
-            # mismatch with ImprovedQMIX(num_agents=20). Last 3 agents had no
-            # type/action_dim config, leading to silent behavior degradation.
-            n_drones, n_ambulances, n_hospitals = 6, 8, 6
+            # Match disaster_sim.py's dynamic allocation logic:
+            # DRONE = num_agents // 10, VEHICLE = num_agents // 5, PERSONNEL = remaining
+            n_drones = max(1, num_agents // 10)
+            n_vehicles = max(1, num_agents // 5)
+            n_personnel = num_agents - n_drones - n_vehicles
             agent_types = (['drone'] * n_drones
-                           + ['ambulance'] * n_ambulances
-                           + ['hospital'] * n_hospitals)
+                           + ['vehicle'] * n_vehicles
+                           + ['personnel'] * n_personnel)
             action_dims = []
             from .qmix_improved import HierarchicalActionSpace
             action_space = HierarchicalActionSpace(self.config['marl'])
@@ -1017,11 +1017,34 @@ class EGTMARL:
                             agent_action = action[agent_id]
                             # Convert action to tensor
                             if isinstance(agent_action, dict):
+                                # Extract tactical+communication as the 2-D action
+                                # representation that anti_spoofing expects. The
+                                # ``strategic`` field is a list of EGT strategy
+                                # weights, NOT a compact action encoding — feeding
+                                # it into the verifier would either be semantically
+                                # wrong or, if it happens to be length 1, trigger
+                                # a persistent dimension-mismatch rebuild.
                                 action_tensor = torch.tensor(
                                     [agent_action.get('tactical', 0) / 8.0,
                                      agent_action.get('communication', 0) / 4.0],
                                     dtype=torch.float32, device=self.device
                                 )
+                            elif isinstance(agent_action, (list, tuple)):
+                                # legacy / 1-D fallback: keep tensor 1-D only
+                                # when the source is genuinely 1-D; pad to 2-D
+                                # so the verifier stops rebuilding.
+                                if len(agent_action) == 1:
+                                    action_tensor = torch.tensor(
+                                        [float(agent_action[0]), 0.0],
+                                        dtype=torch.float32, device=self.device
+                                    )
+                                elif len(agent_action) >= 2:
+                                    action_tensor = torch.tensor(
+                                        [float(agent_action[0]), float(agent_action[1])],
+                                        dtype=torch.float32, device=self.device
+                                    )
+                                else:
+                                    action_tensor = torch.zeros(2, dtype=torch.float32, device=self.device)
                             else:
                                 action_tensor = torch.tensor(agent_action, dtype=torch.float32, device=self.device)
 
@@ -1065,7 +1088,10 @@ class EGTMARL:
             
             # Update
             state = next_state
-            episode_reward += reward
+            if isinstance(reward, dict):
+                episode_reward += sum(reward.values())
+            else:
+                episode_reward += reward
             episode_steps += 1
             
             # Update if buffer is full
@@ -1084,7 +1110,25 @@ class EGTMARL:
         
         # Calculate metrics
         metrics = self._calculate_episode_metrics(episode_reward, info)
-        
+
+        # Log loss summary every episode so we can confirm the QMIX/anti_spoofing
+        # learning loops are actually receiving gradient signal. Without this
+        # printout, "marl_loss" can silently stay at 0.0 for the whole training
+        # run and the user only finds out when the rescue rate plateaus.
+        if losses:
+            import logging as _logging
+            _logging.getLogger(__name__).info(
+                "Episode %d losses | marl=%.4f mixing=%.4f q=%.4f value=%.4f "
+                "spoofing=%.4f frontier=%.4f",
+                self.episode,
+                float(losses.get('marl_loss', 0.0) or 0.0),
+                float(losses.get('mixing_loss', 0.0) or 0.0),
+                float(losses.get('q_loss', 0.0) or 0.0),
+                float(losses.get('value_loss', 0.0) or 0.0),
+                float(losses.get('spoofing_loss', 0.0) or 0.0),
+                float(losses.get('frontier_loss', 0.0) or 0.0),
+            )
+
         # Update episode counter
         self.episode += 1
         
@@ -1126,10 +1170,18 @@ class EGTMARL:
             row: list = []
             for agent_id, action in action_dict.items():
                 if isinstance(action, dict):
-                    # Handle resource allocation
-                    row.extend(
-                        action.get('resource_allocation', {}).values()
-                    )
+                    # Extract meaningful components for MARL training.
+                    # Priority: resource_allocation (most info) > tactical+communication
+                    # (actual action) > strategic distribution.
+                    if action.get('resource_allocation'):
+                        row.extend(action['resource_allocation'].values())
+                    else:
+                        # Tactical (0-7) and communication (0-3) as float ratios.
+                        # Using the normalized [0,1) range matches what the
+                        # anti-spoofing verifier expects for its 2-D action dim.
+                        tactical = action.get('tactical', 0)
+                        comm = action.get('communication', 0)
+                        row.extend([tactical / 8.0, comm / 4.0])
                 else:
                     row.append(action)
             per_step_lengths.append(len(row))
