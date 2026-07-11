@@ -177,7 +177,7 @@ class EGTMARL:
         # (see _extract_actions path below); using action_dim=32 caused the
         # AntiSpoofing input layer to be rebuilt every training step.
         self.anti_spoofing = AntiSpoofing(
-            observation_dim=self.config['marl']['state_dim'],
+            observation_dim=self.config.get('anti_spoofing', {}).get('observation_dim', self.config['marl']['state_dim']),
             action_dim=2,
             device=self.device,
             num_agents=self.config['marl']['num_agents']
@@ -905,12 +905,6 @@ class EGTMARL:
             egt_boost = 2.0 * (float(egt_weights['fairness_weight']) - 0.5)
         lam = float(max(0.0, min(1.0, lambda_param)))
         shaped_rewards = rewards * (1.0 + egt_boost) + 0.01 * lam
-        # Reduce to per-step scalar (mean across the 17 agents) so we can
-        # index it inside the per-timestep loop below.
-        if shaped_rewards.dim() == 2:
-            step_rewards = shaped_rewards.mean(dim=1)
-        else:
-            step_rewards = shaped_rewards
 
         # ImprovedQMIX expects per-agent transitions, with the observation/state
         # being a single vector per agent.  We treat the env state as the
@@ -936,9 +930,14 @@ class EGTMARL:
                 per_agent_actions = [int(actions[b].item())
                                      for _ in range(self.marl_layer.num_agents)]
 
-            # Per-agent rewards: distribute the shaped reward evenly, scaled by lambda
-            per_agent_rewards = [float(step_rewards[b].item())
-                                 for _ in range(self.marl_layer.num_agents)]
+            # Per-agent rewards: preserve individual agent rewards (including anti-spoofing penalties)
+            if shaped_rewards.dim() == 2:  # [B, N] - per-agent rewards
+                per_agent_rewards = [float(shaped_rewards[b, i].item())
+                                     for i in range(self.marl_layer.num_agents)]
+            else:  # [B] - scalar reward per step
+                step_reward = float(shaped_rewards[b].item())
+                per_agent_rewards = [step_reward
+                                     for _ in range(self.marl_layer.num_agents)]
 
             per_agent_dones = [bool(dones[b].item())
                                for _ in range(self.marl_layer.num_agents)]
@@ -1145,11 +1144,33 @@ class EGTMARL:
         batch = {}
         for key, value in buffer.items():
             if key == 'actions':
-                # Convert actions to tensor format
                 batch[key] = self._actions_to_tensor(value)
+            elif key == 'rewards':
+                batch[key] = self._rewards_to_tensor(value)
             else:
                 batch[key] = torch.tensor(value, device=self.device)
         return batch
+    
+    def _rewards_to_tensor(self, rewards: List) -> torch.Tensor:
+        """Convert rewards (which may be dict or scalar) to tensor.
+        
+        Handles both scalar rewards and per-agent dict rewards, ensuring
+        anti-spoofing penalties applied in train_episode are preserved.
+        """
+        if len(rewards) == 0:
+            return torch.tensor([], device=self.device)
+        
+        first_reward = rewards[0]
+        if isinstance(first_reward, dict):
+            agent_ids = sorted(first_reward.keys())
+            num_agents = len(agent_ids)
+            result = []
+            for r in rewards:
+                row = [float(r.get(agent_id, 0.0)) for agent_id in agent_ids]
+                result.append(row)
+            return torch.tensor(result, dtype=torch.float32, device=self.device)
+        else:
+            return torch.tensor(rewards, dtype=torch.float32, device=self.device)
     
     def _actions_to_tensor(self, actions: List[Dict]) -> torch.Tensor:
         """Convert list of action dictionaries to tensor.
@@ -1282,7 +1303,13 @@ class EGTMARL:
             'marl_optimizer_state': self.marl_optimizer.state_dict(),
             'egt_optimizer_state': self.egt_optimizer.state_dict(),
             'metrics_history': self.metrics_history,
-            'config': self.config
+            'config': self.config,
+            # 保存环境维度供 evaluate_model.py 一致性检查
+            'env_dims': {
+                'map_size': self.env.map_size if hasattr(self, 'env') and self.env is not None else None,
+                'num_agents': self.env.num_agents if hasattr(self, 'env') and self.env is not None else None,
+                'num_victims': len(self.env.casualties) if hasattr(self, 'env') and self.env is not None and hasattr(self.env, 'casualties') else None,
+            } if hasattr(self, 'env') and self.env is not None else None,
         }
 
         torch.save(checkpoint, path)

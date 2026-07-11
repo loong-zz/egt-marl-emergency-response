@@ -627,6 +627,13 @@ class AntiSpoofing:
                 states_flat = states_flat.unsqueeze(0)
             if actions_flat.dim() == 1:
                 actions_flat = actions_flat.unsqueeze(0)
+            
+            # Convert single action index (0-31) to 2-D action representation (tactical/8, communication/4)
+            # This matches the action format used in detect_strategic_behavior
+            if actions_flat.shape[-1] == 1:
+                tactical = actions_flat[:, 0] % 8 / 8.0
+                communication = (actions_flat[:, 0] // 8) % 4 / 4.0
+                actions_flat = torch.stack([tactical, communication], dim=-1)
 
             input_tensor = torch.cat([states_flat, actions_flat], dim=-1)
 

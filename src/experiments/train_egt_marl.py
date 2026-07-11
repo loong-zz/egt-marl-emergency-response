@@ -34,6 +34,7 @@ from algorithms.qmix_improved import ImprovedQMIX
 from algorithms.dynamic_frontier import DynamicParetoFrontier
 from utils.metrics import MetricsCollector
 from environments.visualization import DisasterVisualizer
+from utils.visualization import plot_egt_strategy_evolution, plot_egt_strategy_recommendation
 from environments.managers.manager_integration import ManagerIntegration
 from torch.utils.tensorboard import SummaryWriter
 import logging
@@ -282,8 +283,14 @@ class EGTMARLTrainer:
             },
 
             'egt': {
-                'num_strategies': NUM_STRATEGIES,
-                'learning_rate': 0.01
+                'num_strategies': self.config.get('egt', {}).get('num_strategies', NUM_STRATEGIES),
+                'learning_rate': self.config.get('egt', {}).get('learning_rate', 0.01),
+                'mutation_rate': self.config.get('egt', {}).get('mutation_rate', 0.05),
+                'selection_pressure': self.config.get('egt', {}).get('selection_pressure', 2.0),
+                'population_size': self.config.get('egt', {}).get('population_size', 100),
+                'tradeoff_adaptation_rate': self.config.get('egt', {}).get('tradeoff_adaptation_rate', 0.1),
+                'min_fairness_weight': self.config.get('egt', {}).get('min_fairness_weight', 0.2),
+                'max_fairness_weight': self.config.get('egt', {}).get('max_fairness_weight', 0.8),
             },
             'anti_spoofing': {
                 'observation_dim': self.env.get_state_dimension(),
@@ -783,6 +790,15 @@ class EGTMARLTrainer:
             'algorithm_checkpoint_path': str(algorithm_checkpoint_path),
             'best_rescue_rate': getattr(self, 'best_rescue_rate', 0.0),
             'best_model_episode': getattr(self, '_best_model_episode', None),
+            # 保存训练时的环境维度，evaluate_model.py 据此检测
+            # "训练/评估环境不一致"导致的 RR 下降。
+            'env_dims': {
+                'map_size': self.config.get('environment', {}).get('map_size'),
+                'num_agents': self.config.get('environment', {}).get('num_agents'),
+                'num_victims': self.config.get('environment', {}).get('num_victims'),
+                'num_resources': self.config.get('environment', {}).get('num_resources'),
+                'num_areas': self.config.get('environment', {}).get('num_areas'),
+            },
         }
 
         torch.save(checkpoint, checkpoint_path)
@@ -882,12 +898,20 @@ class EGTMARLTrainer:
             # (Warmup / Transition / Main / FineTune) when no explicit phases
             # are configured.  Stages progress from random exploration to
             # fairness-aware fine-tuning.
+            #
+            # base_lr default = 0.0001 matches transition stage. With the
+            # 2.0/1.0/0.5/0.1 multiplier schedule this yields:
+            #   Warmup    = 0.0002
+            #   Transition= 0.0001
+            #   Main      = 0.00005
+            #   FineTune  = 0.00001
+            # which is identical to the explicit phases in training.yaml.
             num_episodes = training_config['num_episodes']
             warmup = int(num_episodes * 0.10)
             transition = int(num_episodes * 0.20)
             main = int(num_episodes * 0.55)
             finetune = num_episodes - warmup - transition - main
-            base_lr = training_config.get('learning_rate', 0.0005)
+            base_lr = training_config.get('learning_rate', 0.0001)
             phases = [
                 {'name': 'Warmup',     'episodes': warmup,
                  'learning_rate': base_lr * 2.0,   'epsilon_scale': 1.0},
@@ -1123,10 +1147,48 @@ class EGTMARLTrainer:
                     mission = getattr(agent, 'current_mission', 'None')
                     resources = {resource_abbr.get(rt.name, rt.name[:4]): round(agent.capacity[rt], 1) for rt in ResourceType}
                     logger.info(f"  [AGENT {agent_id}/{agent.agent_type}] Status={mission} | Position=[{agent.position[0]:.1f}, {agent.position[1]:.1f}] | KNOWN CASUALTIES={known_count} | Rescued={rescued_count} | Resources={resources}")
-        
+
+            # EGT策略建议：每100个episode输出一次
+            if episode % 100 == 0 and hasattr(self.algorithm, 'egt_layer'):
+                rec = self.algorithm.egt_layer.get_strategy_recommendation()
+                logger.info(
+                    f"[EGT-Strategy] Episode {episode} | "
+                    f"Dominant={rec['dominant_strategy']} | "
+                    f"Dist=[{', '.join(f'{x:.2f}' for x in rec['strategy_distribution'])}] | "
+                    f"F={rec['fairness_weight']:.2f}, E={rec['efficiency_weight']:.2f} | "
+                    f"Conv={rec['convergence_status']} | "
+                    f"Rec={rec['recommendation'][:50]}..."
+                )
+                # 记录到训练历史
+                training_history.setdefault('strategy_recommendations', []).append({
+                    'episode': episode,
+                    'dominant_strategy': rec['dominant_strategy'],
+                    'strategy_distribution': rec['strategy_distribution'],
+                    'fairness_weight': rec['fairness_weight'],
+                    'efficiency_weight': rec['efficiency_weight'],
+                    'convergence_status': rec['convergence_status'],
+                    'avg_fitness': rec['avg_fitness'],
+                    'diversity': rec['diversity']
+                })
+
         # 训练完成
         logger.info("Training completed!")
-        
+
+        # 最终EGT策略报告
+        if hasattr(self.algorithm, 'egt_layer'):
+            final_rec = self.algorithm.egt_layer.get_strategy_recommendation()
+            logger.info("=" * 60)
+            logger.info("Final EGT Strategy Report:")
+            logger.info(f"  Dominant Strategy: {final_rec['dominant_strategy']}")
+            logger.info(f"  Strategy Distribution: {final_rec['strategy_distribution']}")
+            logger.info(f"  Fairness Weight: {final_rec['fairness_weight']:.3f}")
+            logger.info(f"  Efficiency Weight: {final_rec['efficiency_weight']:.3f}")
+            logger.info(f"  Convergence Status: {final_rec['convergence_status']}")
+            logger.info(f"  Avg Fitness: {final_rec['avg_fitness']:.3f}")
+            logger.info(f"  Diversity: {final_rec['diversity']:.3f}")
+            logger.info(f"  Recommendation: {final_rec['recommendation']}")
+            logger.info("=" * 60)
+
         # 最终评估
         final_metrics = self.evaluate(num_eval_episodes * 2)
         logger.info(f"Final Evaluation - "
@@ -1197,8 +1259,31 @@ class EGTMARLTrainer:
                 if valid_losses:
                     f.write(f"Final Loss: {valid_losses[-1]:.4f}\n")
                     f.write(f"Average Loss: {np.mean(valid_losses):.4f}\n")
-            
-            f.write("\n5. Files Generated\n")
+
+            # 新增：EGT策略推荐报告
+            if hasattr(self.algorithm, 'egt_layer'):
+                f.write("\n5. EGT Strategy Recommendation\n")
+                f.write("-" * 40 + "\n")
+                rec = self.algorithm.egt_layer.get_strategy_recommendation()
+                f.write(f"Dominant Strategy: {rec['dominant_strategy']}\n")
+                f.write(f"Strategy Distribution: "
+                       f"[{', '.join(f'{x:.4f}' for x in rec['strategy_distribution'])}]\n")
+                f.write(f"Fairness Weight: {rec['fairness_weight']:.4f}\n")
+                f.write(f"Efficiency Weight: {rec['efficiency_weight']:.4f}\n")
+                f.write(f"Convergence Status: {rec['convergence_status']}\n")
+                f.write(f"Average Fitness: {rec['avg_fitness']:.4f}\n")
+                f.write(f"Diversity (Entropy): {rec['diversity']:.4f}\n")
+                f.write(f"Recommendation: {rec['recommendation']}\n")
+                # 记录演化历史摘要
+                if 'strategy_recommendations' in training_history:
+                    f.write(f"\nStrategy Evolution Milestones:\n")
+                    for milestone in training_history['strategy_recommendations']:
+                        f.write(f"  Episode {milestone['episode']}: "
+                               f"{milestone['dominant_strategy']} "
+                               f"(F={milestone['fairness_weight']:.2f}, "
+                               f"E={milestone['efficiency_weight']:.2f})\n")
+
+            f.write("\n6. Files Generated\n")
             f.write("-" * 40 + "\n")
             f.write(f"Config: {self.experiment_dir}/config.yaml\n")
             f.write(f"Best Model: {self.experiment_dir}/models/best_model.pt\n")
@@ -1221,7 +1306,7 @@ class EGTMARLTrainer:
         try:
             # 创建可视化器
             visualizer = DisasterVisualizer(self.config['environment'])
-            
+
             # 准备指标数据
             metrics_data = {
                 'rescue_rate': training_history['rescue_rate'],
@@ -1229,13 +1314,35 @@ class EGTMARLTrainer:
                 'resource_utilization': training_history['resource_utilization'],
                 'total_reward': training_history['total_reward']
             }
-            
+
             # 绘制性能仪表盘
             dashboard_path = self.experiment_dir / 'visualizations' / 'training_dashboard.png'
             visualizer.plot_performance_dashboard(metrics_data, str(dashboard_path))
-            
+
+            # EGT策略演化图
+            if 'strategy_recommendations' in training_history and training_history['strategy_recommendations']:
+                strategy_names = getattr(self.algorithm.egt_layer, 'strategy_names',
+                                         ['Strategy-' + str(i) for i in range(self.algorithm.egt_layer.num_strategies)])
+                evolution_path = self.experiment_dir / 'visualizations' / 'egt_strategy_evolution.png'
+                plot_egt_strategy_evolution(
+                    training_history['strategy_recommendations'],
+                    strategy_names,
+                    str(evolution_path),
+                    show=False
+                )
+                # 最终策略推荐饼图
+                if hasattr(self.algorithm, 'egt_layer'):
+                    final_rec = self.algorithm.egt_layer.get_strategy_recommendation()
+                    pie_path = self.experiment_dir / 'visualizations' / 'egt_final_recommendation.png'
+                    plot_egt_strategy_recommendation(
+                        final_rec,
+                        strategy_names,
+                        str(pie_path),
+                        show=False
+                    )
+
             logger.info(f"Training visualizations saved to {self.experiment_dir}/visualizations/")
-            
+
         except Exception as e:
             logger.warning(f"Failed to generate visualizations: {e}")
 

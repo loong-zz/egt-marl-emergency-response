@@ -411,7 +411,7 @@ class AmbulanceAgent(BaseAgent):
         
         super().__init__(
             agent_id=agent_id,
-            agent_type=AgentType.AMBULANCE,
+            agent_type=AgentType.VEHICLE,
             initial_position=initial_position,
             initial_resources=initial_resources,
             config=config
@@ -579,7 +579,7 @@ class HospitalAgent(BaseAgent):
         
         super().__init__(
             agent_id=agent_id,
-            agent_type=AgentType.HOSPITAL,
+            agent_type=AgentType.PERSONNEL,
             initial_position=initial_position,
             initial_resources=initial_resources,
             config=config

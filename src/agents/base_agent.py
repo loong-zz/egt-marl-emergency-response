@@ -145,7 +145,7 @@ class BaseAgent(ABC, nn.Module):
                 'fuel': 20.0,
                 'battery': 100.0
             }
-        elif self.agent_type == AgentType.AMBULANCE:
+        elif self.agent_type == AgentType.VEHICLE:
             return {
                 'medical_kits': 20.0,
                 'water': 50.0,
@@ -153,7 +153,7 @@ class BaseAgent(ABC, nn.Module):
                 'fuel': 100.0,
                 'patient_capacity': 4.0
             }
-        elif self.agent_type == AgentType.HOSPITAL:
+        elif self.agent_type == AgentType.PERSONNEL:
             return {
                 'medical_kits': 100.0,
                 'water': 500.0,

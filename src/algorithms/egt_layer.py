@@ -235,9 +235,14 @@ class EGTLayer(nn.Module):
         avg_fitness = torch.sum(fitnesses * distribution)
         
         # Replicator dynamics equation: dx_i/dt = x_i * (f_i - f_avg)
-        if avg_fitness > 0:
-            growth_rates = (fitnesses - avg_fitness) / avg_fitness
+        # Use abs(avg_fitness) for divisor so that negative avg_fitness
+        # (rare but possible under poor-performance regimes) doesn't produce
+        # NaN/Inf. The epsilon guard prevents division-by-near-zero.
+        eps_guard = 1e-8
+        if abs(avg_fitness) > eps_guard:
+            growth_rates = (fitnesses - avg_fitness) / abs(avg_fitness)
         else:
+            # Fallback: use absolute difference when avg_fitness is ~0
             growth_rates = fitnesses - avg_fitness
         
         # Update distribution
@@ -280,7 +285,23 @@ class EGTLayer(nn.Module):
                     elif i == 2:  # Balanced
                         adjustment = (fairness_score + efficiency_score) / 2 - 0.5
                     else:  # Adaptive (i == 3)
-                        adjustment = total_reward * 0.1
+                        # Adaptive scaling: normalise total_reward by the recent
+                        # reward standard deviation. This makes the adjustment
+                        # invariant to reward magnitude (e.g. 0.1 raw scaling
+                        # would otherwise produce wildly different adjustments
+                        # for rewards in [-10, 10] vs rewards in [-1, 1]).
+                        reward_window = list(self.fitness_history)[-100:]
+                        if reward_window:
+                            reward_std = max(float(np.std(reward_window)), 1e-6)
+                            # Bound to [-1, 1] then scale by 0.3 to match the
+                            # magnitude of other strategies' adjustments
+                            # (which are in [-0.5, 0.5] range).
+                            adjustment = float(total_reward) / reward_std * 0.3
+                            # Clamp to [-0.5, 0.5] for safety
+                            adjustment = max(-0.5, min(0.5, adjustment))
+                        else:
+                            # No history yet: fall back to simple scaled adjustment
+                            adjustment = float(total_reward) * 0.1
                     
                     # Update payoff
                     new_payoff = current_payoff + self.learning_rate * adjustment

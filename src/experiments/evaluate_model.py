@@ -73,8 +73,14 @@ def load_model(config: Dict, checkpoint_path: str):
             'buffer_size': training_config.get('buffer_size', 10000)
         },
         'egt': {
-            'num_strategies': NUM_STRATEGIES,
-            'learning_rate': 0.01
+            'num_strategies': config.get('egt', {}).get('num_strategies', NUM_STRATEGIES),
+            'learning_rate': config.get('egt', {}).get('learning_rate', 0.01),
+            'mutation_rate': config.get('egt', {}).get('mutation_rate', 0.05),
+            'selection_pressure': config.get('egt', {}).get('selection_pressure', 2.0),
+            'population_size': config.get('egt', {}).get('population_size', 100),
+            'tradeoff_adaptation_rate': config.get('egt', {}).get('tradeoff_adaptation_rate', 0.1),
+            'min_fairness_weight': config.get('egt', {}).get('min_fairness_weight', 0.2),
+            'max_fairness_weight': config.get('egt', {}).get('max_fairness_weight', 0.8),
         },
         'anti_spoofing': {
             'observation_dim': env.get_state_dimension(),
@@ -89,10 +95,33 @@ def load_model(config: Dict, checkpoint_path: str):
     
     # 初始化算法
     algorithm = EGTMARL(env=env, config=algo_config_dict, hidden_dim=algo_config.get('hidden_dim', 64))
-    
+
     # 加载检查点（设置weights_only=False以支持numpy对象）
     checkpoint = torch.load(checkpoint_path, map_location=torch.device('cpu'), weights_only=False)
-    
+
+    # 一致性检查：如果 checkpoint 中保存了训练时的环境参数，则与当前评估
+    # 环境对比；不一致时记录 WARNING（不会中断评估），便于定位
+    # "训练/评估环境不一致"导致的 RR 下降问题。
+    checkpoint_dims = None
+    try:
+        checkpoint_dims = checkpoint.get('env_dims') or checkpoint.get('environment_dims')
+    except Exception:
+        checkpoint_dims = None
+    if checkpoint_dims:
+        mismatches = []
+        for key in ('map_size', 'num_agents', 'num_victims', 'num_resources', 'num_areas'):
+            if key in checkpoint_dims and str(checkpoint_dims[key]) != str(env_config.get(key)):
+                mismatches.append(
+                    f"{key}: trained={checkpoint_dims[key]} vs eval={env_config.get(key)}"
+                )
+        if mismatches:
+            logger.warning(
+                "Evaluation environment differs from training environment. "
+                "This typically causes large drops in RR because checkpoint "
+                "weights were learned on a different state_dim / num_agents.\n"
+                "  Mismatches: " + "; ".join(mismatches)
+            )
+
     # 加载模型参数（使用strict=False处理可能的参数不匹配）
     if 'marl_layer_state' in checkpoint:
         try:

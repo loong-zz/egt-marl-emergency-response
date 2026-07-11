@@ -41,3 +41,18 @@ algorithm:
   pareto_weight_gamma: 0.3
   anti_spoofing_enabled: true  # 启用抗欺骗模块
   egt_enabled: true            # 启用EGT层
+
+# EGT 演化博弈层配置（被 algo_config['egt'] 读取）
+# 注意：与 src/environments/config/constants.py 的 NUM_STRATEGIES (== 3) 保持一致
+egt:
+  num_strategies: 3
+  learning_rate: 0.01
+  mutation_rate: 0.05
+  selection_pressure: 2.0
+  population_size: 100
+  tradeoff_adaptation_rate: 0.1
+  min_fairness_weight: 0.2
+  max_fairness_weight: 0.8
+  replicator_dynamics: true
+  fitness_sharing: true
+  niching_radius: 0.1

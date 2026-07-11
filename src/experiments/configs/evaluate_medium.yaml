@@ -5,7 +5,7 @@ output_dir: src/evaluation_results
 # 评估配置
 evaluation:
   num_episodes: 50           # 中等数量episode
-  max_steps_per_episode: 200 # 标准步数限制
+  max_steps_per_episode: 800 # 与 quick_train.yaml 保持一致
   num_runs: 3                # 3轮运行取平均
   scenarios:
     - earthquake
@@ -13,13 +13,14 @@ evaluation:
   severities:
     - medium
 
-# 环境配置 - 中等规模场景
+# 环境配置 - 与 quick_train.yaml 保持一致（1500×1500, 25 agents, 250 victims）
+# 这是修复"训练/评估环境不一致 → 评估 RR 下降"的关键
 environment:
-  map_size: [200, 200]       # 中等地图
-  num_agents: 20             # 中等数量智能体
-  num_victims: 100           # 中等数量受害者
-  num_resources: 20          # 中等数量资源
-  num_areas: 5
+  map_size: [1500, 1500]     # 与 quick_train.yaml 一致
+  num_agents: 25             # 与 quick_train.yaml 一致
+  num_victims: 250           # 与 quick_train.yaml 一致
+  num_resources: 12          # 与 quick_train.yaml 一致
+  num_areas: 4               # 与 quick_train.yaml 一致
   disaster_type: earthquake
   severity: medium
 
@@ -46,3 +47,23 @@ algorithms:
     enabled: true
   game_theoretic:
     enabled: true
+
+# EGT 演化博弈层配置（与 training.yaml / quick_train.yaml 保持一致）
+egt:
+  num_strategies: 3
+  learning_rate: 0.01
+  mutation_rate: 0.05
+  selection_pressure: 2.0
+  population_size: 100
+
+# 算法配置（与 quick_train.yaml 一致 —— hidden_dim 必须匹配才能加载 checkpoint）
+algorithm:
+  hidden_dim: 256              # 与 quick_train.yaml 一致
+  mixing_hidden_dim: 128       # 与 quick_train.yaml 一致
+  attention_heads: 4
+  egt_lambda: 0.5
+  pareto_weight_alpha: 0.3
+  pareto_weight_beta: 0.4
+  pareto_weight_gamma: 0.3
+  anti_spoofing_enabled: true
+  egt_enabled: true
