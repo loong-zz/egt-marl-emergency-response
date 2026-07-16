@@ -37,11 +37,12 @@ class AgentType(Enum):
 # ==================== Simulation Constants ====================
 
 # Weibull distribution parameters for survival probability
+# 修复3+：压缩生存时间；MILD 也设上限确保 episode 可自然终止
 WEIBULL_PARAMS = {
-    CasualtySeverity.CRITICAL: {"theta": 200, "kappa": 1.0},   # ~6 hours (200 steps), 50% survival at ~139 steps
-    CasualtySeverity.SEVERE: {"theta": 600, "kappa": 1.2},     # ~24 hours (600 steps), 50% survival at ~442 steps
-    CasualtySeverity.MODERATE: {"theta": 1800, "kappa": 1.5},  # ~48 hours (1800 steps), 50% survival at ~1410 steps
-    CasualtySeverity.MILD: {"theta": 4800, "kappa": 2.0},      # ~120 hours (4800 steps), 50% survival at ~3996 steps
+    CasualtySeverity.CRITICAL: {"theta": 200, "kappa": 1.0},   # max≈140步
+    CasualtySeverity.SEVERE: {"theta": 240, "kappa": 1.2},     # max≈168步
+    CasualtySeverity.MODERATE: {"theta": 420, "kappa": 1.5},   # max≈294步
+    CasualtySeverity.MILD: {"theta": 800, "kappa": 2.0},       # max≈560步 (episode ≤800 步内可自然终止)
 }
 
 # Treatment duration in seconds

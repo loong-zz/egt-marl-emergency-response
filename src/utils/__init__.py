@@ -36,6 +36,22 @@ from .data_processing import (
     save_results,
 )
 
+# Env spec (designed for the 12-dim / K_max refactor; safe to import
+# alongside the existing 32-dim code path).
+from .env_spec import (
+    ACTION_DIM,
+    NUM_TASKS,
+    NUM_COMMS,
+    K_MAX_CASUALTIES,
+    K_MAX_AGENTS,
+    K_MAX_DEPOTS,
+    ObservationSpec,
+    ActionSpec,
+    DEFAULT_OBS_SPEC,
+    DEFAULT_ACTION_SPEC,
+    assert_action_dim,
+)
+
 __all__ = [
     # Metrics
     "calculate_efficiency_metrics",
