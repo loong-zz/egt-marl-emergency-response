@@ -199,8 +199,11 @@ class DisasterSim:
                 total_demand[kind] = total_demand.get(kind, 0.0) + qty * count
 
         # 2. 应用供给比例（设计文档 §4.5.4：构造"资源约束"场景）
+        #    blood 用 1.0（保证 CRITICAL/SEVERE 不会因 blood 不足而死亡）
+        #    medkit 用 0.75（保留适度资源约束）
+        RESOURCE_SUPPLY_RATIO = {"blood": 1.0, "medkit": DEPOT_SUPPLY_RATIO}
         total_supply = {
-            kind: qty * DEPOT_SUPPLY_RATIO
+            kind: qty * RESOURCE_SUPPLY_RATIO.get(kind, DEPOT_SUPPLY_RATIO)
             for kind, qty in total_demand.items()
         }
 
